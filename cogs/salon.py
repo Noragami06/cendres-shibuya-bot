@@ -48,6 +48,7 @@ class Salon(commands.Cog):
 
         category = interaction.guild.get_channel(int(category_id_text))
         if category is None or not isinstance(category, discord.CategoryChannel):
+            print(f"❌ [salon.py] Catégorie introuvable pour l'ID {category_id_text}")
             await interaction.followup.send("❌ Aucune catégorie trouvée avec cet ID. Relance la commande.", ephemeral=True)
             return
 
@@ -83,6 +84,9 @@ class Salon(commands.Cog):
                 name = match.group(2).strip()
                 parsed.append((number, name))
 
+        print(f"🔍 [salon.py] Lignes reçues : {raw_lines}")
+        print(f"🔍 [salon.py] Salons parsés : {parsed}")
+
         if not parsed:
             await interaction.followup.send("❌ Aucun salon valide détecté. Format attendu : `1 ❘・nom-du-salon`", ephemeral=True)
             return
@@ -96,10 +100,39 @@ class Salon(commands.Cog):
         )
         await interaction.followup.send(embed=building_embed, ephemeral=True)
 
+        # Vérification des permissions du bot sur la catégorie
+        bot_perms = category.permissions_for(interaction.guild.me)
+        print(f"🔍 [salon.py] Permission 'manage_channels' du bot sur la catégorie : {bot_perms.manage_channels}")
+        if not bot_perms.manage_channels:
+            print(f"❌ [salon.py] Le bot n'a pas la permission 'Gérer les salons' sur la catégorie {category.name} ({category.id})")
+            await interaction.followup.send(
+                "❌ Je n'ai pas la permission **Gérer les salons** sur cette catégorie. Vérifie mes permissions et réessaie.",
+                ephemeral=True,
+            )
+            return
+
         created = []
         for number, name in parsed:
-            channel = await category.create_text_channel(name=name, sync_permissions=True)
-            created.append(channel.mention)
+            try:
+                channel = await category.create_text_channel(name=name, overwrites=category.overwrites)
+                created.append(channel.mention)
+                print(f"✅ [salon.py] Salon créé : {name} (n°{number})")
+            except discord.Forbidden as e:
+                print(f"❌ [salon.py] Permission refusée lors de la création de '{name}' : {e}")
+                await interaction.followup.send(f"❌ Permission refusée pour créer le salon **{name}**.", ephemeral=True)
+                return
+            except discord.HTTPException as e:
+                print(f"❌ [salon.py] Erreur Discord lors de la création de '{name}' : {e}")
+                await interaction.followup.send(f"❌ Erreur Discord lors de la création de **{name}** : {e}", ephemeral=True)
+                return
+            except Exception as e:
+                print(f"❌ [salon.py] Erreur inattendue lors de la création de '{name}' : {e}")
+                await interaction.followup.send(f"❌ Erreur inattendue : {e}", ephemeral=True)
+                return
+
+        if not created:
+            await interaction.followup.send("❌ Aucun salon n'a pu être créé.", ephemeral=True)
+            return
 
         result_embed = discord.Embed(
             title="✅ Salons créés avec succès",
