@@ -1,60 +1,289 @@
 import discord
-from discord.ext import commands, tasks
-from dotenv import load_dotenv
+from discord.ext import commands
+from discord import app_commands
+import json
 import os
+from datetime import datetime
 
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
+# ---------- IDs ----------
+STAFF_ROLE_ID = 1521228799302307967          # Peut utiliser /ticket + accepter/refuser
+TICKET_ACCESS_ROLE_ID = 1521229332075512039  # A accès aux salons de tickets créés
+PANEL_CHANNEL_ID = 1523648386878672982        # Salon où le panel est envoyé
+CONFIRM_CHANNEL_ID = 1523649007753236491      # Salon des demandes de confirmation
+TICKET_CATEGORY_ID = 1523648386052653056      # Catégorie des salons de tickets
+OWNER_DM_ID = 396615332346855428              # Toi - reçoit le MP à la suppression
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-intents.presences = True
+DATA_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "tickets.json")
 
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-
-@bot.event
-async def setup_hook():
-    await bot.load_extension("cogs.ticket")
-
-
-@bot.event
-async def on_ready():
-    await bot.tree.sync()
-    if not status_loop.is_running():
-        status_loop.start()
+REASONS = {
+    "fiche": {"label": "Fiche", "color": discord.Color.green(), "emoji": "📄"},
+    "partenariat": {"label": "Partenariat", "color": discord.Color.red(), "emoji": "🤝"},
+    "autre": {"label": "Autre", "color": discord.Color.blue(), "emoji": "❓"},
+}
 
 
-@tasks.loop(seconds=5)
-async def status_loop():
-    os.system('cls' if os.name == 'nt' else 'clear')
-
-    guild = bot.guilds[0] if bot.guilds else None
-    ping = round(bot.latency * 1000)
-    member_count = len([m for m in guild.members if not m.bot]) if guild else 0
-
-    prefix_commands = [f"!{cmd.name}" for cmd in bot.commands]
-    slash_commands = [f"/{cmd.name}" for cmd in bot.tree.get_commands()]
-
-    print("=" * 50)
-    print(f"✅ Connecté en tant que {bot.user}")
-    print(f"📡 Ping : {ping} ms")
-    print(f"👥 Membres (hors bots) : {member_count}")
-    print("=" * 50)
-    print(f"📜 Commandes préfixe (!) — {len(prefix_commands)}")
-    for c in prefix_commands:
-        print(f"   {c}")
-    print("-" * 50)
-    print(f"⚡ Commandes slash (/) — {len(slash_commands)}")
-    for c in slash_commands:
-        print(f"   {c}")
-    print("=" * 50)
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+        default = {"counters": {"global": 0, "fiche": 0, "partenariat": 0, "autre": 0}, "tickets": {}}
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(default, f, indent=4)
+        return default
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-@bot.command()
-async def ping(ctx):
-    await ctx.send("🏓 Pong !")
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
 
 
-bot.run(TOKEN)
+def has_staff_role(member: discord.Member) -> bool:
+    return any(role.id == STAFF_ROLE_ID for role in member.roles)
+
+
+def get_ticket_by_channel(data, channel_id):
+    for ticket_id, info in data["tickets"].items():
+        if info["channel_id"] == channel_id:
+            return ticket_id, info
+    return None
+
+
+async def save_transcript(channel: discord.TextChannel, ticket_id: str) -> str:
+    folder = os.path.join(os.path.dirname(__file__), "..", "data", "transcripts")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"ticket_{ticket_id}.txt")
+
+    lines = []
+    async for message in channel.history(limit=None, oldest_first=True):
+        timestamp = message.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        lines.append(f"[{timestamp}] {message.author} : {message.content}")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    return path
+
+
+class AutreReasonModal(discord.ui.Modal, title="Précise ta raison"):
+    reason_input = discord.ui.TextInput(
+        label="Pourquoi ouvres-tu ce ticket ?",
+        style=discord.TextStyle.paragraph,
+        max_length=300,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await send_confirmation_request(interaction, "autre", self.reason_input.value)
+
+
+class ConfirmView(discord.ui.View):
+    def __init__(self, requester: discord.Member, ticket_type: str, reason_text: str):
+        super().__init__(timeout=None)
+        self.requester = requester
+        self.ticket_type = ticket_type
+        self.reason_text = reason_text
+
+    async def _check_staff(self, interaction: discord.Interaction) -> bool:
+        if not has_staff_role(interaction.user):
+            await interaction.response.send_message("Tu n'as pas la permission de faire ça.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Accepter", style=discord.ButtonStyle.success, custom_id="confirm_accept")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_staff(interaction):
+            return
+        await create_ticket_channel(interaction, self.requester, self.ticket_type, self.reason_text)
+        embed = discord.Embed(
+            description=f"✅ La demande de {self.requester.mention} a été **acceptée** par {interaction.user.mention}",
+            color=discord.Color.green(),
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    @discord.ui.button(label="Refuser", style=discord.ButtonStyle.danger, custom_id="confirm_deny")
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_staff(interaction):
+            return
+        embed = discord.Embed(
+            description=f"❌ La demande de {self.requester.mention} a été **refusée** par {interaction.user.mention}",
+            color=discord.Color.red(),
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+async def send_confirmation_request(interaction: discord.Interaction, ticket_type: str, reason_text: str):
+    confirm_channel = interaction.guild.get_channel(CONFIRM_CHANNEL_ID)
+    info = REASONS[ticket_type]
+
+    embed = discord.Embed(
+        title="Nouvelle demande de ticket",
+        description=f"{interaction.user.mention} souhaite ouvrir un ticket.",
+        color=info["color"],
+    )
+    embed.add_field(name="Raison", value=info["label"], inline=True)
+    if ticket_type == "autre":
+        embed.add_field(name="Détail", value=reason_text, inline=False)
+    embed.set_footer(text=f"ID utilisateur : {interaction.user.id}")
+
+    view = ConfirmView(interaction.user, ticket_type, reason_text)
+    await confirm_channel.send(embed=embed, view=view)
+
+    await interaction.response.send_message(
+        "Ta demande a été envoyée au staff, tu seras notifié une fois traitée.", ephemeral=True
+    )
+
+
+class TicketOpenView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Fiche", style=discord.ButtonStyle.success, custom_id="ticket_open_fiche", emoji="📄")
+    async def fiche(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await send_confirmation_request(interaction, "fiche", "Fiche")
+
+    @discord.ui.button(label="Partenariat", style=discord.ButtonStyle.danger, custom_id="ticket_open_partenariat", emoji="🤝")
+    async def partenariat(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await send_confirmation_request(interaction, "partenariat", "Partenariat")
+
+    @discord.ui.button(label="Autre", style=discord.ButtonStyle.primary, custom_id="ticket_open_autre", emoji="❓")
+    async def autre(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AutreReasonModal())
+
+
+async def create_ticket_channel(interaction, requester, ticket_type, reason_text):
+    data = load_data()
+    data["counters"]["global"] += 1
+    data["counters"][ticket_type] += 1
+    global_id = data["counters"]["global"]
+    type_number = data["counters"][ticket_type]
+
+    guild = interaction.guild
+    category = guild.get_channel(TICKET_CATEGORY_ID)
+    access_role = guild.get_role(TICKET_ACCESS_ROLE_ID)
+
+    safe_name = requester.name.lower().replace(" ", "-")
+    channel_name = f"{ticket_type}-{safe_name}-{type_number}"
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        requester: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        access_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True),
+    }
+
+    channel = await category.create_text_channel(name=channel_name, overwrites=overwrites)
+
+    data["tickets"][str(global_id)] = {
+        "channel_id": channel.id,
+        "user_id": requester.id,
+        "type": ticket_type,
+        "reason": reason_text,
+        "status": "open",
+        "created_at": datetime.utcnow().isoformat(),
+        "transcript": None,
+    }
+    save_data(data)
+
+    info = REASONS[ticket_type]
+    embed = discord.Embed(
+        title=f"Ticket #{global_id}",
+        description=f"Voici le ticket de {requester.mention} pour **{info['label']}**" +
+                     (f"\n\n> {reason_text}" if ticket_type == "autre" else ""),
+        color=info["color"],
+    )
+    embed.set_footer(text=f"Ticket #{global_id}")
+
+    view = TicketControlView()
+    msg = await channel.send(content=requester.mention, embed=embed, view=view)
+    await msg.pin()
+
+
+class TicketControlView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Fermer", style=discord.ButtonStyle.secondary, custom_id="ticket_close", emoji="🔒")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        ticket = get_ticket_by_channel(data, interaction.channel.id)
+        if not ticket:
+            await interaction.response.send_message("Ticket introuvable dans la base de données.", ephemeral=True)
+            return
+
+        ticket_id, ticket_info = ticket
+        member = interaction.guild.get_member(ticket_info["user_id"])
+        if member:
+            await interaction.channel.set_permissions(member, view_channel=False)
+
+        ticket_info["status"] = "closed"
+        save_data(data)
+
+        embed = discord.Embed(
+            description=f"🔒 Ticket fermé par {interaction.user.mention}. Le joueur n'a plus accès au salon.",
+            color=discord.Color.orange(),
+        )
+        await interaction.response.send_message(embed=embed)
+
+    @discord.ui.button(label="Supprimer", style=discord.ButtonStyle.danger, custom_id="ticket_delete", emoji="🗑️")
+    async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        ticket = get_ticket_by_channel(data, interaction.channel.id)
+        if not ticket:
+            await interaction.response.send_message("Ticket introuvable dans la base de données.", ephemeral=True)
+            return
+
+        ticket_id, ticket_info = ticket
+        await interaction.response.send_message("Suppression en cours, sauvegarde de la conversation...")
+
+        transcript_path = await save_transcript(interaction.channel, ticket_id)
+        ticket_info["status"] = "deleted"
+        ticket_info["transcript"] = transcript_path
+        save_data(data)
+
+        owner = interaction.client.get_user(OWNER_DM_ID)
+        if owner:
+            info = REASONS[ticket_info["type"]]
+            embed = discord.Embed(
+                title=f"Ticket #{ticket_id} supprimé",
+                description=f"Type : {info['label']}\nOuvert par : <@{ticket_info['user_id']}>\nSupprimé par : {interaction.user.mention}",
+                color=discord.Color.dark_grey(),
+            )
+            try:
+                await owner.send(embed=embed, file=discord.File(transcript_path))
+            except discord.Forbidden:
+                pass
+
+        await interaction.channel.delete()
+
+
+class Ticket(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    async def cog_load(self):
+        self.bot.add_view(TicketOpenView())
+        self.bot.add_view(TicketControlView())
+
+    @app_commands.command(name="ticket", description="Envoie le panel d'ouverture de tickets")
+    async def ticket(self, interaction: discord.Interaction):
+        if not has_staff_role(interaction.user):
+            await interaction.response.send_message("Tu n'as pas la permission d'utiliser cette commande.", ephemeral=True)
+            return
+
+        channel = interaction.guild.get_channel(PANEL_CHANNEL_ID)
+        embed = discord.Embed(
+            title="🎫 Ouvrir un ticket",
+            description="Bienvenue ! Clique sur l'un des boutons ci-dessous selon ce que tu désires.",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="📄 Fiche", value="Ouvrir un ticket pour ta fiche", inline=False)
+        embed.add_field(name="🤝 Partenariat", value="Ouvrir un ticket pour un partenariat", inline=False)
+        embed.add_field(name="❓ Autre", value="Ouvrir un ticket pour toute autre demande", inline=False)
+
+        await channel.send(embed=embed, view=TicketOpenView())
+        await interaction.response.send_message(f"Panel envoyé dans {channel.mention} ✅", ephemeral=True)
+
+
+async def setup(bot):
+    await bot.add_cog(Ticket(bot))
