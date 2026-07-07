@@ -24,6 +24,15 @@ async def status_loop():
 
     guild = bot.guilds[0] if bot.guilds else None
     ping = round(bot.latency * 1000)
+
+    if ping < 100:
+        ping_status = "Excellent"
+    elif ping < 200:
+        ping_status = "Bon"
+    elif ping < 350:
+        ping_status = "Moyen"
+    else:
+        ping_status = "Mauvais"
     member_count = len([m for m in guild.members if not m.bot]) if guild else 0
 
     prefix_commands = [f"!{cmd.name}" for cmd in bot.commands]
