@@ -3,6 +3,7 @@ from discord.ext import commands
 from discord import app_commands
 import json
 import os
+import uuid
 from datetime import datetime
 
 # ---------- IDs ----------
@@ -25,15 +26,19 @@ REASONS = {
 def load_data():
     if not os.path.exists(DATA_FILE):
         os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-        default = {"counters": {"global": 0, "fiche": 0, "partenariat": 0, "autre": 0}, "tickets": {}}
+        default = {"counters": {"global": 0, "fiche": 0, "partenariat": 0, "autre": 0}, "tickets": {}, "pending_requests": {}}
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(default, f, indent=4)
         return default
     with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    if "pending_requests" not in data:
+        data["pending_requests"] = {}
+    return data
 
 
 def save_data(data):
+    data.setdefault("pending_requests", {})
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
 
@@ -78,38 +83,22 @@ class AutreReasonModal(discord.ui.Modal, title="Précise ta raison"):
 
 
 class ConfirmView(discord.ui.View):
-    def __init__(self, requester: discord.Member, ticket_type: str, reason_text: str):
+    """Vue "one-shot" servant uniquement à générer les boutons avec des custom_id dynamiques.
+    Toute la logique de callback est gérée par le listener on_interaction du cog, ce qui
+    rend les boutons persistants même après un redémarrage du bot."""
+
+    def __init__(self, request_id: str):
         super().__init__(timeout=None)
-        self.requester = requester
-        self.ticket_type = ticket_type
-        self.reason_text = reason_text
-
-    async def _check_staff(self, interaction: discord.Interaction) -> bool:
-        if not has_staff_role(interaction.user):
-            await interaction.response.send_message("Tu n'as pas la permission de faire ça.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="Accepter", style=discord.ButtonStyle.success, custom_id="confirm_accept")
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._check_staff(interaction):
-            return
-        await create_ticket_channel(interaction, self.requester, self.ticket_type, self.reason_text)
-        embed = discord.Embed(
-            description=f"✅ La demande de {self.requester.mention} a été **acceptée** par {interaction.user.mention}",
-            color=discord.Color.green(),
-        )
-        await interaction.response.edit_message(embed=embed, view=None)
-
-    @discord.ui.button(label="Refuser", style=discord.ButtonStyle.danger, custom_id="confirm_deny")
-    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._check_staff(interaction):
-            return
-        embed = discord.Embed(
-            description=f"❌ La demande de {self.requester.mention} a été **refusée** par {interaction.user.mention}",
-            color=discord.Color.red(),
-        )
-        await interaction.response.edit_message(embed=embed, view=None)
+        self.add_item(discord.ui.Button(
+            label="Accepter",
+            style=discord.ButtonStyle.success,
+            custom_id=f"confirm_accept:{request_id}",
+        ))
+        self.add_item(discord.ui.Button(
+            label="Refuser",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"confirm_deny:{request_id}",
+        ))
 
 
 async def send_confirmation_request(interaction: discord.Interaction, ticket_type: str, reason_text: str):
@@ -126,7 +115,16 @@ async def send_confirmation_request(interaction: discord.Interaction, ticket_typ
         embed.add_field(name="Détail", value=reason_text, inline=False)
     embed.set_footer(text=f"ID utilisateur : {interaction.user.id}")
 
-    view = ConfirmView(interaction.user, ticket_type, reason_text)
+    request_id = uuid.uuid4().hex
+    data = load_data()
+    data["pending_requests"][request_id] = {
+        "requester_id": interaction.user.id,
+        "ticket_type": ticket_type,
+        "reason_text": reason_text,
+    }
+    save_data(data)
+
+    view = ConfirmView(request_id)
     await confirm_channel.send(embed=embed, view=view)
 
     await interaction.response.send_message(
@@ -149,6 +147,26 @@ class TicketOpenView(discord.ui.View):
     @discord.ui.button(label="Autre", style=discord.ButtonStyle.primary, custom_id="ticket_open_autre", emoji="❓")
     async def autre(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(AutreReasonModal())
+
+
+class FicheStartView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Commencer", style=discord.ButtonStyle.primary, custom_id="ticket_fiche_start", emoji="🚀")
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="Instructions",
+            description=(
+                "Puisque tu n'as pas de question, voici ce qu'il te faut préparer avant de commencer :\n\n"
+                "- Une image représentant ton personnage\n"
+                "- Un prénom pour ton personnage\n"
+                "- Un nom de famille, uniquement si ton personnage n'appartient à aucun clan\n\n"
+                "Une fois que tout est prêt, utilise la commande /depart avec moi pour démarrer la création de ta fiche."
+            ),
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.send_message(embed=embed)
 
 
 async def create_ticket_channel(interaction, requester, ticket_type, reason_text):
@@ -197,6 +215,18 @@ async def create_ticket_channel(interaction, requester, ticket_type, reason_text
     view = TicketControlView()
     msg = await channel.send(content=requester.mention, embed=embed, view=view)
     await msg.pin()
+
+    if ticket_type == "fiche":
+        welcome_embed = discord.Embed(
+            title="Bienvenue",
+            description=(
+                f"Bonjour {requester.mention}, bienvenue dans ton ticket, celui où ton destin va être décidé.\n\n"
+                "Si tu as la moindre question, tu peux te rendre dans <#1521818990412955669> ou contacter le staff en message privé.\n\n"
+                "Si tu n'as aucune question, clique sur le bouton ci-dessous pour recevoir les instructions."
+            ),
+            color=REASONS["fiche"]["color"],
+        )
+        await channel.send(embed=welcome_embed, view=FicheStartView())
 
 
 class TicketControlView(discord.ui.View):
@@ -264,6 +294,59 @@ class Ticket(commands.Cog):
     async def cog_load(self):
         self.bot.add_view(TicketOpenView())
         self.bot.add_view(TicketControlView())
+        self.bot.add_view(FicheStartView())
+
+    @commands.Cog.listener()
+    async def on_interaction(self, interaction: discord.Interaction):
+        if interaction.type != discord.InteractionType.component:
+            return
+        custom_id = interaction.data.get("custom_id", "")
+        if not (custom_id.startswith("confirm_accept:") or custom_id.startswith("confirm_deny:")):
+            return
+
+        if not has_staff_role(interaction.user):
+            await interaction.response.send_message("Tu n'as pas la permission de faire ça.", ephemeral=True)
+            return
+
+        request_id = custom_id.split(":", 1)[1]
+        data = load_data()
+        pending = data["pending_requests"].get(request_id)
+
+        if pending is None:
+            await interaction.response.send_message(
+                "Cette demande a déjà été traitée ou n'existe plus.", ephemeral=True
+            )
+            return
+
+        requester_id = pending["requester_id"]
+        ticket_type = pending["ticket_type"]
+        reason_text = pending["reason_text"]
+        requester = interaction.guild.get_member(requester_id)
+
+        if custom_id.startswith("confirm_accept:"):
+            if requester is None:
+                await interaction.response.send_message(
+                    "Le membre à l'origine de la demande est introuvable (a-t-il quitté le serveur ?).",
+                    ephemeral=True,
+                )
+                return
+            del data["pending_requests"][request_id]
+            save_data(data)
+            await create_ticket_channel(interaction, requester, ticket_type, reason_text)
+            embed = discord.Embed(
+                description=f"✅ La demande de {requester.mention} a été **acceptée** par {interaction.user.mention}",
+                color=discord.Color.green(),
+            )
+        else:
+            del data["pending_requests"][request_id]
+            save_data(data)
+            mention = requester.mention if requester else f"<@{requester_id}>"
+            embed = discord.Embed(
+                description=f"❌ La demande de {mention} a été **refusée** par {interaction.user.mention}",
+                color=discord.Color.red(),
+            )
+
+        await interaction.response.edit_message(embed=embed, view=None)
 
     @app_commands.command(name="ticket", description="Envoie le panel d'ouverture de tickets")
     async def ticket(self, interaction: discord.Interaction):

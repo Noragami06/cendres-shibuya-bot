@@ -18,6 +18,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def setup_hook():
     await bot.load_extension("cogs.ticket")
     await bot.load_extension("cogs.salon")
+    await bot.load_extension("cogs.informations")
 
 
 @bot.event
