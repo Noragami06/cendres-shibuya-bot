@@ -7,6 +7,30 @@ DATA_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "informations.
 
 MAX_PAGE_LENGTH = 4000
 
+DEFAULT_EMOJI = "📘"
+
+KEYWORD_EMOJIS = {
+    "exorciste": "⚔️",
+    "fléau": "👹",
+    "hybride": "🧬",
+    "énergie": "🔮",
+    "occulte": "🔮",
+    "territoire": "🗺️",
+    "rct": "❤️‍🩹",
+    "clan": "🏯",
+    "grade": "🎖️",
+    "pacte": "📜",
+    "interdit": "🚫",
+}
+
+
+def get_emoji_for_title(title: str) -> str:
+    lowered = title.lower()
+    for keyword, emoji in KEYWORD_EMOJIS.items():
+        if keyword in lowered:
+            return emoji
+    return DEFAULT_EMOJI
+
 DEFAULT_DATA = {
     "1": {
         "title": "Exorcistes",
@@ -141,13 +165,7 @@ class InformationsView(discord.ui.View):
         def check_author(m: discord.Message):
             return m.author.id == interaction.user.id and m.channel.id == interaction.channel.id
 
-        try:
-            answer = await interaction.client.wait_for("message", check=check_author, timeout=60)
-        except TimeoutError:
-            await interaction.channel.send(
-                f"⏱️ {interaction.user.mention} Temps écoulé, aucune réponse reçue. Reclique sur le bouton pour réessayer."
-            )
-            return
+        answer = await interaction.client.wait_for("message", check=check_author, timeout=None)
 
         number = answer.content.strip()
         data = load_data()
@@ -159,7 +177,7 @@ class InformationsView(discord.ui.View):
             return
 
         entry = data[number]
-        title = f"{number}) {entry['title']}"
+        title = f"{get_emoji_for_title(entry['title'])} {entry['title']}"
         pages = paginate_content(entry["content"])
 
         if len(pages) == 1:
@@ -186,7 +204,9 @@ class Informations(commands.Cog):
             return
 
         entries = sorted(data.items(), key=lambda item: int(item[0]))
-        summary = "\n".join(f"{num}) {info['title']}" for num, info in entries)
+        summary = "\n".join(
+            f"{num}) {get_emoji_for_title(info['title'])} {info['title']}" for num, info in entries
+        )
 
         embed = discord.Embed(
             title="📖 Informations disponibles",

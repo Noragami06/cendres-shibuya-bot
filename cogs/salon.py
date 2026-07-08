@@ -22,7 +22,7 @@ class Salon(commands.Cog):
 
         embed = discord.Embed(
             title="📁 Création de salons — Étape 1/2",
-            description="Envoie dans ce salon l'**ID de la catégorie** dans laquelle créer les salons.\n\n⏱️ Tu as 2 minutes pour répondre.",
+            description="Envoie dans ce salon l'**ID de la catégorie** dans laquelle créer les salons.",
             color=discord.Color.blurple(),
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -30,11 +30,7 @@ class Salon(commands.Cog):
         def check_author(m: discord.Message):
             return m.author.id == interaction.user.id and m.channel.id == interaction.channel.id
 
-        try:
-            category_msg = await self.bot.wait_for("message", check=check_author, timeout=120)
-        except TimeoutError:
-            await interaction.followup.send("⏱️ Temps écoulé, commande annulée.", ephemeral=True)
-            return
+        category_msg = await self.bot.wait_for("message", check=check_author, timeout=None)
 
         category_id_text = category_msg.content.strip()
         try:
@@ -57,18 +53,13 @@ class Salon(commands.Cog):
             description=(
                 f"Catégorie sélectionnée : **{category.name}**\n\n"
                 "Envoie maintenant la liste des salons à créer, un par ligne, au format :\n"
-                "```\n1 ❘・quartier-historique\n2 ❘・pont-sumida\n```\n"
-                "⏱️ Tu as 3 minutes."
+                "```\n1 ❘・quartier-historique\n2 ❘・pont-sumida\n```"
             ),
             color=discord.Color.blurple(),
         )
         await interaction.followup.send(embed=embed2, ephemeral=True)
 
-        try:
-            list_msg = await self.bot.wait_for("message", check=check_author, timeout=180)
-        except TimeoutError:
-            await interaction.followup.send("⏱️ Temps écoulé, commande annulée.", ephemeral=True)
-            return
+        list_msg = await self.bot.wait_for("message", check=check_author, timeout=None)
 
         raw_lines = list_msg.content.strip().split("\n")
         try:

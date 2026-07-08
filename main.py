@@ -11,7 +11,7 @@ intents.message_content = True
 intents.members = True
 intents.presences = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 
 @bot.event
@@ -62,11 +62,6 @@ async def status_loop():
     for c in slash_commands:
         print(f"   {c}")
     print("=" * 50)
-
-
-@bot.command()
-async def ping(ctx):
-    await ctx.send("🏓 Pong !")
 
 
 bot.run(TOKEN)
