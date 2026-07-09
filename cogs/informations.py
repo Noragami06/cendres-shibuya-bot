@@ -21,6 +21,7 @@ KEYWORD_EMOJIS = {
     "grade": "🎖️",
     "pacte": "📜",
     "interdit": "🚫",
+    "black flash": "⚡",
 }
 
 
