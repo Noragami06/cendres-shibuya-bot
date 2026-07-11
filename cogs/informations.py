@@ -17,11 +17,13 @@ KEYWORD_EMOJIS = {
     "occulte": "🔮",
     "territoire": "🗺️",
     "rct": "❤️‍🩹",
-    "clan": "🏯",
     "grade": "🎖️",
-    "pacte": "📜",
+    "clan": "🏯",
     "interdit": "🚫",
+    "pacte": "📜",
     "black flash": "⚡",
+    "raid": "⚔️",
+    "ordre": "🏛️",
 }
 
 
