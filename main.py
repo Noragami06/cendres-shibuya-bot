@@ -3,6 +3,8 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import os
 
+from cogs.clans import build_clans_report
+
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -61,6 +63,7 @@ async def status_loop():
     print(f"⚡ Commandes slash (/) — {len(slash_commands)}")
     for c in slash_commands:
         print(f"   {c}")
+    print(build_clans_report(guild))
     print("=" * 50)
 
 
