@@ -30,7 +30,7 @@ async def on_ready():
         status_loop.start()
 
 
-@tasks.loop(seconds=5)
+@tasks.loop(seconds=120)
 async def status_loop():
     os.system('cls' if os.name == 'nt' else 'clear')
 
