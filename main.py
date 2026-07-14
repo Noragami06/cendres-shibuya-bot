@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import os
 
 from cogs.clans import build_clans_report
+from cogs.utils.database import init_db
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -18,6 +19,8 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 @bot.event
 async def setup_hook():
+    init_db()
+
     await bot.load_extension("cogs.ticket")
     await bot.load_extension("cogs.salon")
     await bot.load_extension("cogs.informations")

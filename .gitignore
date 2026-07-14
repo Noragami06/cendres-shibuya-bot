@@ -3,3 +3,6 @@ venv/
 __pycache__/
 data/tickets.json
 data/transcripts/
+data/bot.db
+data/*.bak
+temp/

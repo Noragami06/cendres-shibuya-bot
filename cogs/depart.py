@@ -2,10 +2,10 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import asyncio
-import json
 import os
 import random
 
+from cogs.utils import database as db
 from cogs.utils.image_gen import generate_clan_sort_image
 
 # ---------- IDs ----------
@@ -38,10 +38,7 @@ SPECIAL_USER_ID = 396615332346855428
 
 DEPART_IMAGE_URL = "https://c.tenor.com/4fjag09ZNgEAAAAC/tenor.gif"
 
-# ---------- Fichiers de données ----------
-CLAN_STATE_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "clan_roll_state.json")
-PENDING_CHOICES_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "depart_pending_choices.json")
-
+# État initial des clans, utilisé uniquement pour amorcer la base si la table est vide.
 # L'ordre de ce dictionnaire fait foi partout où la liste des clans est affichée.
 DEFAULT_CLAN_STATE = {
     "clans": {
@@ -68,48 +65,26 @@ SPELL_TABLE_BASE = {"sort_inne": 55, "sort_heredit": 10, "restriction": 35}
 SPELL_TABLE_PARTIAL = {"sort_inne": 40, "sort_heredit": 5, "sort_heredit_partiel": 30, "restriction": 25}
 
 
-def load_clan_state():
-    if not os.path.exists(CLAN_STATE_FILE):
-        os.makedirs(os.path.dirname(CLAN_STATE_FILE), exist_ok=True)
-        with open(CLAN_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_CLAN_STATE, f, indent=4, ensure_ascii=False)
-        return DEFAULT_CLAN_STATE
-    with open(CLAN_STATE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_clan_state(data):
-    with open(CLAN_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-
-
-def load_pending_choices():
-    if not os.path.exists(PENDING_CHOICES_FILE):
-        os.makedirs(os.path.dirname(PENDING_CHOICES_FILE), exist_ok=True)
-        with open(PENDING_CHOICES_FILE, "w", encoding="utf-8") as f:
-            json.dump({}, f, indent=4, ensure_ascii=False)
-        return {}
-    with open(PENDING_CHOICES_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_pending_choices(data):
-    with open(PENDING_CHOICES_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+# La persistance passe désormais par SQLite (tables clan_roll_state / clan_roll_meta
+# et depart_pending_choices). Les structures en mémoire restent identiques.
+load_clan_state = db.load_clan_state
+save_clan_state = db.save_clan_state
 
 
 def get_forced_choice(user_id: int):
     """Retourne le choix forcé (clan + sort) d'un joueur, ou None s'il n'a pas complété le flux DM."""
-    entry = load_pending_choices().get(str(user_id))
-    if entry and "clan" in entry and "sort" in entry:
-        return entry
+    row = db.get_pending_choice(user_id)
+    if row and row["clan"] and row["sort"]:
+        return {
+            "clan": row["clan"],
+            "sort": row["sort"],
+            "origin_channel_id": row["origin_channel_id"],
+        }
     return None
 
 
 def clear_forced_choice(user_id: int):
-    choices = load_pending_choices()
-    choices.pop(str(user_id), None)
-    save_pending_choices(choices)
+    db.delete_pending_choice(user_id)
 
 
 # ---------- Tirage & redistribution ----------
@@ -659,10 +634,7 @@ class DMClanSelect(discord.ui.Select):
             await interaction.response.send_message("Clan introuvable.", ephemeral=True)
             return
 
-        choices = load_pending_choices()
-        entry = choices.setdefault(str(interaction.user.id), {})
-        entry["clan"] = clan_key
-        save_pending_choices(choices)
+        db.set_pending_clan(interaction.user.id, clan_key)
 
         embed = discord.Embed(
             title="✨ Choix du sort",
@@ -695,13 +667,11 @@ class DMClanQuestionView(discord.ui.View):
 
     @discord.ui.button(label="Non", style=discord.ButtonStyle.secondary, custom_id="depart_dm_clan_non")
     async def non(self, interaction: discord.Interaction, button: discord.ui.Button):
-        choices = load_pending_choices()
-        entry = choices.get(str(interaction.user.id), {})
-        origin_channel_id = entry.get("origin_channel_id")
+        row = db.get_pending_choice(interaction.user.id)
+        origin_channel_id = row["origin_channel_id"] if row else None
 
         # Pas de choix forcé : on purge l'entrée, le tirage classique s'appliquera.
-        choices.pop(str(interaction.user.id), None)
-        save_pending_choices(choices)
+        db.delete_pending_choice(interaction.user.id)
 
         await interaction.response.send_message("Très bien, le tirage se fera normalement.")
         await send_clan_table_to_origin(interaction, origin_channel_id)
@@ -709,22 +679,20 @@ class DMClanQuestionView(discord.ui.View):
 
 async def finalize_dm_choice(interaction: discord.Interaction, sort_key: str):
     """Stocke le sort choisi, puis envoie le tableau des clans dans le salon d'origine."""
-    choices = load_pending_choices()
-    entry = choices.get(str(interaction.user.id))
+    row = db.get_pending_choice(interaction.user.id)
 
-    if not entry or "clan" not in entry:
+    if not row or not row["clan"]:
         await interaction.response.send_message(
             "Aucun clan en attente, relance la procédure depuis le salon.", ephemeral=True
         )
         return
 
-    entry["sort"] = sort_key
-    save_pending_choices(choices)
+    db.set_pending_sort(interaction.user.id, sort_key)
 
     await interaction.response.send_message(
-        f"Choix enregistré : **{entry['clan'].capitalize()}** — **{SORT_LABELS[sort_key]}**."
+        f"Choix enregistré : **{row['clan'].capitalize()}** — **{SORT_LABELS[sort_key]}**."
     )
-    await send_clan_table_to_origin(interaction, entry.get("origin_channel_id"))
+    await send_clan_table_to_origin(interaction, row["origin_channel_id"])
 
 
 async def send_clan_table_to_origin(interaction: discord.Interaction, origin_channel_id):
@@ -782,9 +750,7 @@ class CampView(discord.ui.View):
 
         # Cas spécial : flux en message privé, rien n'est envoyé dans le salon.
         if interaction.user.id == SPECIAL_USER_ID:
-            choices = load_pending_choices()
-            choices[str(interaction.user.id)] = {"origin_channel_id": interaction.channel.id}
-            save_pending_choices(choices)
+            db.set_pending_origin(interaction.user.id, interaction.channel.id)
 
             embed = discord.Embed(
                 title="🎭 Veux-tu un clan spécifique pour ce personnage ?",
@@ -847,6 +813,9 @@ class Depart(commands.Cog):
         self.bot = bot
 
     async def cog_load(self):
+        # Amorce l'état des clans si la base est vide (nouvelle installation).
+        db.seed_clan_state(DEFAULT_CLAN_STATE)
+
         self.bot.add_view(DepartView())
         self.bot.add_view(CampView())
         self.bot.add_view(ClanRollView())

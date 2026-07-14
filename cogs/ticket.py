@@ -1,10 +1,11 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import json
 import os
 import uuid
 from datetime import datetime
+
+from cogs.utils import database as db
 
 # ---------- IDs ----------
 STAFF_ROLE_ID = 1521228799302307967          # Peut utiliser /ticket + accepter/refuser
@@ -14,8 +15,6 @@ CONFIRM_CHANNEL_ID = 1523649007753236491      # Salon des demandes de confirmati
 TICKET_CATEGORY_ID = 1523648386052653056      # Catégorie des salons de tickets
 OWNER_DM_ID = 396615332346855428              # Toi - reçoit le MP à la suppression
 
-DATA_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "tickets.json")
-
 REASONS = {
     "fiche": {"label": "Fiche", "color": discord.Color.green(), "emoji": "📄"},
     "partenariat": {"label": "Partenariat", "color": discord.Color.red(), "emoji": "🤝"},
@@ -23,35 +22,8 @@ REASONS = {
 }
 
 
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-        default = {"counters": {"global": 0, "fiche": 0, "partenariat": 0, "autre": 0}, "tickets": {}, "pending_requests": {}}
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(default, f, indent=4)
-        return default
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if "pending_requests" not in data:
-        data["pending_requests"] = {}
-    return data
-
-
-def save_data(data):
-    data.setdefault("pending_requests", {})
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
-
-
 def has_staff_role(member: discord.Member) -> bool:
     return any(role.id == STAFF_ROLE_ID for role in member.roles)
-
-
-def get_ticket_by_channel(data, channel_id):
-    for ticket_id, info in data["tickets"].items():
-        if info["channel_id"] == channel_id:
-            return ticket_id, info
-    return None
 
 
 async def save_transcript(channel: discord.TextChannel, ticket_id: str) -> str:
@@ -116,13 +88,7 @@ async def send_confirmation_request(interaction: discord.Interaction, ticket_typ
     embed.set_footer(text=f"ID utilisateur : {interaction.user.id}")
 
     request_id = uuid.uuid4().hex
-    data = load_data()
-    data["pending_requests"][request_id] = {
-        "requester_id": interaction.user.id,
-        "ticket_type": ticket_type,
-        "reason_text": reason_text,
-    }
-    save_data(data)
+    db.add_pending_request(request_id, interaction.user.id, ticket_type, reason_text)
 
     view = ConfirmView(request_id)
     await confirm_channel.send(embed=embed, view=view)
@@ -170,11 +136,7 @@ class FicheStartView(discord.ui.View):
 
 
 async def create_ticket_channel(interaction, requester, ticket_type, reason_text):
-    data = load_data()
-    data["counters"]["global"] += 1
-    data["counters"][ticket_type] += 1
-    global_id = data["counters"]["global"]
-    type_number = data["counters"][ticket_type]
+    global_id, type_number = db.next_ticket_numbers(ticket_type)
 
     guild = interaction.guild
     category = guild.get_channel(TICKET_CATEGORY_ID)
@@ -192,16 +154,15 @@ async def create_ticket_channel(interaction, requester, ticket_type, reason_text
 
     channel = await category.create_text_channel(name=channel_name, overwrites=overwrites)
 
-    data["tickets"][str(global_id)] = {
-        "channel_id": channel.id,
-        "user_id": requester.id,
-        "type": ticket_type,
-        "reason": reason_text,
-        "status": "open",
-        "created_at": datetime.utcnow().isoformat(),
-        "transcript": None,
-    }
-    save_data(data)
+    db.insert_ticket(
+        ticket_id=global_id,
+        channel_id=channel.id,
+        user_id=requester.id,
+        ticket_type=ticket_type,
+        reason=reason_text,
+        status="open",
+        created_at=datetime.utcnow().isoformat(),
+    )
 
     info = REASONS[ticket_type]
     embed = discord.Embed(
@@ -235,19 +196,16 @@ class TicketControlView(discord.ui.View):
 
     @discord.ui.button(label="Fermer", style=discord.ButtonStyle.secondary, custom_id="ticket_close", emoji="🔒")
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
-        data = load_data()
-        ticket = get_ticket_by_channel(data, interaction.channel.id)
+        ticket = db.get_ticket_by_channel(interaction.channel.id)
         if not ticket:
             await interaction.response.send_message("Ticket introuvable dans la base de données.", ephemeral=True)
             return
 
-        ticket_id, ticket_info = ticket
-        member = interaction.guild.get_member(ticket_info["user_id"])
+        member = interaction.guild.get_member(ticket["user_id"])
         if member:
             await interaction.channel.set_permissions(member, view_channel=False)
 
-        ticket_info["status"] = "closed"
-        save_data(data)
+        db.update_ticket_status(ticket["id"], "closed")
 
         embed = discord.Embed(
             description=f"🔒 Ticket fermé par {interaction.user.mention}. Le joueur n'a plus accès au salon.",
@@ -257,26 +215,23 @@ class TicketControlView(discord.ui.View):
 
     @discord.ui.button(label="Supprimer", style=discord.ButtonStyle.danger, custom_id="ticket_delete", emoji="🗑️")
     async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
-        data = load_data()
-        ticket = get_ticket_by_channel(data, interaction.channel.id)
+        ticket = db.get_ticket_by_channel(interaction.channel.id)
         if not ticket:
             await interaction.response.send_message("Ticket introuvable dans la base de données.", ephemeral=True)
             return
 
-        ticket_id, ticket_info = ticket
+        ticket_id = ticket["id"]
         await interaction.response.send_message("Suppression en cours, sauvegarde de la conversation...")
 
         transcript_path = await save_transcript(interaction.channel, ticket_id)
-        ticket_info["status"] = "deleted"
-        ticket_info["transcript"] = transcript_path
-        save_data(data)
+        db.update_ticket_transcript(ticket_id, "deleted", transcript_path)
 
         owner = interaction.client.get_user(OWNER_DM_ID)
         if owner:
-            info = REASONS[ticket_info["type"]]
+            info = REASONS[ticket["type"]]
             embed = discord.Embed(
                 title=f"Ticket #{ticket_id} supprimé",
-                description=f"Type : {info['label']}\nOuvert par : <@{ticket_info['user_id']}>\nSupprimé par : {interaction.user.mention}",
+                description=f"Type : {info['label']}\nOuvert par : <@{ticket['user_id']}>\nSupprimé par : {interaction.user.mention}",
                 color=discord.Color.dark_grey(),
             )
             try:
@@ -309,8 +264,7 @@ class Ticket(commands.Cog):
             return
 
         request_id = custom_id.split(":", 1)[1]
-        data = load_data()
-        pending = data["pending_requests"].get(request_id)
+        pending = db.get_pending_request(request_id)
 
         if pending is None:
             await interaction.response.send_message(
@@ -330,16 +284,14 @@ class Ticket(commands.Cog):
                     ephemeral=True,
                 )
                 return
-            del data["pending_requests"][request_id]
-            save_data(data)
+            db.delete_pending_request(request_id)
             await create_ticket_channel(interaction, requester, ticket_type, reason_text)
             embed = discord.Embed(
                 description=f"✅ La demande de {requester.mention} a été **acceptée** par {interaction.user.mention}",
                 color=discord.Color.green(),
             )
         else:
-            del data["pending_requests"][request_id]
-            save_data(data)
+            db.delete_pending_request(request_id)
             mention = requester.mention if requester else f"<@{requester_id}>"
             embed = discord.Embed(
                 description=f"❌ La demande de {mention} a été **refusée** par {interaction.user.mention}",
