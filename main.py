@@ -21,6 +21,7 @@ async def setup_hook():
     await bot.load_extension("cogs.ticket")
     await bot.load_extension("cogs.salon")
     await bot.load_extension("cogs.informations")
+    await bot.load_extension("cogs.depart")
 
 
 @bot.event

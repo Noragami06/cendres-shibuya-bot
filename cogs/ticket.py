@@ -162,7 +162,7 @@ class FicheStartView(discord.ui.View):
                 "- Une image représentant ton personnage\n"
                 "- Un prénom pour ton personnage\n"
                 "- Un nom de famille, uniquement si ton personnage n'appartient à aucun clan\n\n"
-                "Une fois que tout est prêt, utilise la commande /depart avec moi pour démarrer la création de ta fiche."
+                "Une fois que tout est prêt, utilise la commande /départ avec moi pour démarrer la création de ta fiche."
             ),
             color=discord.Color.blurple(),
         )
