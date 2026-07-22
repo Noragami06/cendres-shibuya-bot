@@ -667,18 +667,18 @@ class DMClanQuestionView(discord.ui.View):
 
     @discord.ui.button(label="Non", style=discord.ButtonStyle.secondary, custom_id="depart_dm_clan_non")
     async def non(self, interaction: discord.Interaction, button: discord.ui.Button):
-        row = db.get_pending_choice(interaction.user.id)
-        origin_channel_id = row["origin_channel_id"] if row else None
-
-        # Pas de choix forcé : on purge l'entrée, le tirage classique s'appliquera.
+        # Pas de choix forcé : on purge l'entrée, le tirage aléatoire classique s'appliquera.
+        # Le tableau des clans est déjà dans le salon, rien à renvoyer ici.
         db.delete_pending_choice(interaction.user.id)
-
-        await interaction.response.send_message("Très bien, le tirage se fera normalement.")
-        await send_clan_table_to_origin(interaction, origin_channel_id)
+        await interaction.response.send_message(
+            "Très bien, le tirage se fera normalement. Clique sur « 🎲 Roll clan/sort » dans le salon quand tu es prêt."
+        )
 
 
 async def finalize_dm_choice(interaction: discord.Interaction, sort_key: str):
-    """Stocke le sort choisi, puis envoie le tableau des clans dans le salon d'origine."""
+    """Enregistre le sort choisi. Le tableau du salon a déjà été envoyé au clic sur le camp :
+    on ne renvoie donc rien ici, on confirme simplement le choix en DM. Le choix forcé ne sera
+    pris en compte que si le joueur clique "Roll clan/sort" APRÈS avoir terminé ce flux."""
     row = db.get_pending_choice(interaction.user.id)
 
     if not row or not row["clan"]:
@@ -690,25 +690,9 @@ async def finalize_dm_choice(interaction: discord.Interaction, sort_key: str):
     db.set_pending_sort(interaction.user.id, sort_key)
 
     await interaction.response.send_message(
-        f"Choix enregistré : **{row['clan'].capitalize()}** — **{SORT_LABELS[sort_key]}**."
+        f"Choix enregistré : **{row['clan'].capitalize()}** — **{SORT_LABELS[sort_key]}**. "
+        "Retourne dans le salon et clique sur « 🎲 Roll clan/sort »."
     )
-    await send_clan_table_to_origin(interaction, row["origin_channel_id"])
-
-
-async def send_clan_table_to_origin(interaction: discord.Interaction, origin_channel_id):
-    """Envoie l'embed de l'étape 2 dans le salon où /départ avait été lancé."""
-    if not origin_channel_id:
-        await interaction.followup.send(
-            "Je n'ai pas retrouvé le salon d'origine, relance /départ depuis le serveur.", ephemeral=True
-        )
-        return
-
-    channel = interaction.client.get_channel(origin_channel_id)
-    if channel is None:
-        await interaction.followup.send("Le salon d'origine est introuvable.", ephemeral=True)
-        return
-
-    await channel.send(embed=build_clan_table_embed(channel.guild), view=ClanRollView())
 
 
 async def apply_camp_role(interaction: discord.Interaction, camp_role_id: int) -> bool:
@@ -748,31 +732,33 @@ class CampView(discord.ui.View):
         if not await apply_camp_role(interaction, ROLE_EXORCISTE):
             return
 
-        # Cas spécial : flux en message privé, rien n'est envoyé dans le salon.
+        # Dans TOUS les cas : le tableau des clans + bouton Roll part immédiatement dans le salon.
+        # Ce message ne dépend de rien et n'attend jamais quoi que ce soit.
+        await interaction.response.send_message(
+            embed=build_clan_table_embed(interaction.guild), view=ClanRollView(), ephemeral=False
+        )
+
+        # En PLUS, uniquement pour l'utilisateur spécial : un DM indépendant avec la question
+        # "clan spécifique ?". Deux envois successifs, aucun wait_for ni await bloquant entre eux :
+        # le joueur peut cliquer "Roll clan/sort" à tout moment (tirage aléatoire tant que son
+        # flux DM n'est pas terminé). set_pending_origin crée la ligne pour que le flux DM
+        # (set_pending_clan/set_pending_sort) puisse ensuite s'y greffer.
         if interaction.user.id == SPECIAL_USER_ID:
             db.set_pending_origin(interaction.user.id, interaction.channel.id)
 
-            embed = discord.Embed(
+            dm_embed = discord.Embed(
                 title="🎭 Veux-tu un clan spécifique pour ce personnage ?",
                 description="Réponds ci-dessous. En cas de refus, le tirage se fera normalement.",
                 color=discord.Color.blurple(),
             )
             try:
-                await interaction.user.send(embed=embed, view=DMClanQuestionView())
+                await interaction.user.send(embed=dm_embed, view=DMClanQuestionView())
             except discord.Forbidden:
-                await interaction.response.send_message(
-                    "❌ Je n'arrive pas à t'envoyer un message privé, ouvre tes MP et réessaie.",
+                await interaction.followup.send(
+                    "❌ Je n'arrive pas à t'envoyer un message privé (ouvre tes MP si tu veux choisir "
+                    "ton clan). Le tirage reste disponible ci-dessus.",
                     ephemeral=True,
                 )
-                return
-
-            await interaction.response.send_message("📩 Je t'ai envoyé un message privé.", ephemeral=True)
-            return
-
-        # Cas normal : tableau des clans directement dans le salon.
-        await interaction.response.send_message(
-            embed=build_clan_table_embed(interaction.guild), view=ClanRollView(), ephemeral=False
-        )
 
     @discord.ui.button(label="Hybride", emoji="🧬", style=discord.ButtonStyle.danger, custom_id="depart_camp_hybride")
     async def hybride(self, interaction: discord.Interaction, button: discord.ui.Button):
