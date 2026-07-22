@@ -425,18 +425,19 @@ async def send_roll_result(
         grades_text = build_grades_text(interaction.guild, state["clans"][result_key]["role_id"])
 
     path = generate_clan_sort_image(clan_data, spell_data)
-    filename = os.path.basename(path)
 
-    embed = discord.Embed(title="🎲 Résultat du tirage", color=discord.Color.gold())
-    embed.set_image(url=f"attachment://{filename}")
-    embed.add_field(name="Grades du clan", value=grades_text, inline=False)
-
-    await interaction.followup.send(embed=embed, file=discord.File(path, filename=filename))
+    # 1er message : l'image seule, en pièce jointe, sans embed autour.
+    await interaction.followup.send(file=discord.File(path, filename="clan_sort.png"))
 
     try:
         os.remove(path)
     except OSError:
         pass
+
+    # 2e message : un embed sans image, avec l'état des 8 grades du clan obtenu.
+    embed = discord.Embed(title="🎲 Résultat du tirage", color=discord.Color.gold())
+    embed.add_field(name="Grades du clan", value=grades_text, inline=False)
+    await interaction.followup.send(embed=embed)
 
 
 # ---------- Vues ----------
