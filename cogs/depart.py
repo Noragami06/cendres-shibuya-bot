@@ -724,6 +724,123 @@ async def apply_camp_role(interaction: discord.Interaction, camp_role_id: int) -
     return True
 
 
+EDUCATION_DESCRIPTION = (
+    "L'endroit où ton personnage a grandi a façonné en profondeur ce qu'il est devenu. "
+    "Chaque environnement a laissé une empreinte différente sur son corps et sur ses capacités. "
+    "Choisis avec soin.\n\n"
+    "──────────────────\n\n"
+    "**🏙️ 1. Chez les humains**\n"
+    "Élevé au sein d'une famille ordinaire, ton personnage a grandi sans jamais toucher à sa "
+    "véritable nature. Ses gènes de fléau sont restés profondément endormis, et rien ne le "
+    "distingue extérieurement d'un simple civil. Ce choix mène directement à la création de ta "
+    "fiche, sans étape supplémentaire.\n\n"
+    "✅ Avantages :\n"
+    "- Idéal pour un rp sans prise de tête, sans pouvoir, avec la possibilité de changer plus tard\n"
+    "- Possède de l'énergie occulte, stable dans le corps, sans connaissance ni méthode d'utilisation\n"
+    "- Peut apprendre à l'utiliser plus tard avec un sensei si le rp devient monotone\n"
+    "- Bénéficie d'un boost physique naturel, supérieur à n'importe quel humain\n"
+    "- Ce boost est encore renforcé si combiné à de l'énergie occulte\n\n"
+    "❌ Inconvénients :\n"
+    "- Très en retard et bien moins compétent qu'un exorciste au départ\n"
+    "- Gènes de fléau totalement disparus, incapable de se soigner avec son énergie occulte\n"
+    "- Doit apprendre le RCT classiquement, ce qui n'est pas donné à tout le monde\n"
+    "- Quasi impossible d'obtenir un sort\n"
+    "- Peut seulement se renforcer, enduire ses poings, son corps, ou des objets\n\n"
+    "**⚔️ 2. Chez les exorcistes**\n"
+    "Élevé parmi des sorciers, le corps de ton personnage s'est adapté pour devenir un véritable "
+    "exorciste à part entière. Il suivra exactement le même parcours qu'un exorciste de sang : "
+    "tirage d'un clan, réserve d'énergie occulte, et RCT. Seule différence, son sort sera toujours "
+    "un Sort inné, jamais un sort héréditaire ou une restriction céleste, son sang n'étant pas "
+    "celui du clan qui l'a recueilli.\n\n"
+    "✅ Avantages :\n"
+    "- Éduqué dès le plus jeune âge, dans un clan ou recueilli par un exorciste sans clan\n"
+    "- Reçoit un véritable enseignement de l'énergie occulte\n"
+    "- Sort inné garanti à 100%\n"
+    "- Automatiquement classé Membre principal si intégré à un clan\n"
+    "- Peut évoluer jusqu'à héritier voire chef de clan en se montrant utile\n\n"
+    "❌ Inconvénients :\n"
+    "- Ne peut jamais obtenir de restriction céleste ni de sort héréditaire\n"
+    "- Toujours limité à un sort 100% inné\n"
+    "- Chances réduites de devenir héritier ou chef de clan (mais pas impossible)\n\n"
+    "**👹 3. Chez les fléaux**\n"
+    "Élevé dans l'ombre des fléaux eux mêmes, ses gènes de fléau ont pris le dessus. Il évolue "
+    "plus vite qu'un exorciste normal et n'a besoin d'aucun RCT pour se soigner, son énergie brute "
+    "suffit à le régénérer. En contrepartie, il n'appartient à aucun clan et ne pourra jamais "
+    "apprendre de sort héréditaire, seule la nature de son énergie occulte sera déterminée.\n\n"
+    "✅ Avantages :\n"
+    "- Peut régénérer un membre directement grâce à son énergie occulte\n"
+    "- Apparence humaine facilitant la tromperie d'un adversaire\n"
+    "- Peut développer des membres de fléau (tentacule, etc.) déployables à volonté\n\n"
+    "❌ Inconvénients :\n"
+    "- Usage du RCT totalement impossible\n"
+    "- Corps de plus en plus marqué par les gènes de fléau\n\n"
+    "**🌪️ 4. Livré à soi même**\n"
+    "Personne ne l'a guidé. Personne ne lui a rien appris. Livré à lui même depuis l'enfance, il "
+    "n'a eu que son corps pour survivre, et cela se voit : une force, une vitesse et une endurance "
+    "largement supérieures à celles d'un hybride ordinaire. Son énergie occulte reste en revanche "
+    "brute et inexploitée, faute d'avoir jamais eu de maître pour la canaliser en un véritable "
+    "sort.\n\n"
+    "✅ Avantages :\n"
+    "- Force physique et sens surdéveloppés, proches d'une restriction céleste (mais inférieurs)\n"
+    "- Nettement supérieur à un humain ou même un exorciste renforcé à l'énergie occulte\n"
+    "- Plus agile, plus rapide, plus féroce\n\n"
+    "❌ Inconvénients :\n"
+    "- Aucune connaissance du monde extérieur, ou très peu\n"
+    "- Aucune connaissance de ses propres facultés énergétiques\n"
+    "- Incapable d'utiliser son énergie occulte ou d'avoir un sort tant qu'il n'a pas de mentor\n\n"
+    "──────────────────\n\n"
+    "*Clique sur l'environnement qui correspond à l'histoire de ton personnage.*"
+)
+
+
+def build_education_embed() -> discord.Embed:
+    return discord.Embed(
+        title="🧬 Lieu d'éducation",
+        description=EDUCATION_DESCRIPTION,
+        color=discord.Color.red(),
+    )
+
+
+class EducationView(discord.ui.View):
+    """4 boutons du lieu d'éducation de l'hybride. Persistante (custom_id fixes).
+    Placeholder pour l'instant : la vraie logique de chaque voie viendra dans une prochaine étape."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Chez les humains", emoji="🏙️", style=discord.ButtonStyle.secondary, custom_id="depart_edu_humains")
+    async def humains(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # TODO: voie "humains" — passage direct à la création de la fiche.
+        await interaction.response.send_message(
+            f"{interaction.user.mention} a grandi 🏙️ chez les humains. La suite arrive bientôt.",
+            ephemeral=False,
+        )
+
+    @discord.ui.button(label="Chez les exorcistes", emoji="⚔️", style=discord.ButtonStyle.primary, custom_id="depart_edu_exorcistes")
+    async def exorcistes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # TODO: voie "exorcistes" — même parcours qu'un exorciste, mais sort forcé à "Sort inné".
+        await interaction.response.send_message(
+            f"{interaction.user.mention} a grandi ⚔️ chez les exorcistes. La suite arrive bientôt.",
+            ephemeral=False,
+        )
+
+    @discord.ui.button(label="Chez les fléaux", emoji="👹", style=discord.ButtonStyle.danger, custom_id="depart_edu_fleaux")
+    async def fleaux(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # TODO: voie "fléaux" — pas de clan, uniquement la nature de l'énergie occulte.
+        await interaction.response.send_message(
+            f"{interaction.user.mention} a grandi 👹 chez les fléaux. La suite arrive bientôt.",
+            ephemeral=False,
+        )
+
+    @discord.ui.button(label="Livré à soi même", emoji="🌪️", style=discord.ButtonStyle.secondary, custom_id="depart_edu_livre")
+    async def livre(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # TODO: voie "livré à soi même" — énergie occulte brute, pas de sort tant qu'aucun mentor.
+        await interaction.response.send_message(
+            f"{interaction.user.mention} a grandi 🌪️ livré à lui même. La suite arrive bientôt.",
+            ephemeral=False,
+        )
+
+
 class CampView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -765,11 +882,8 @@ class CampView(discord.ui.View):
     async def hybride(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await apply_camp_role(interaction, ROLE_HYBRIDE):
             return
-        # TODO: étape suivante — choix du lieu d'éducation (sera codée dans une prochaine étape).
         await interaction.response.send_message(
-            f"{interaction.user.mention} a choisi la voie d'hybride ! 🧬 "
-            "La suite (choix du lieu d'éducation) arrive bientôt.",
-            ephemeral=False,
+            embed=build_education_embed(), view=EducationView(), ephemeral=False
         )
 
     @discord.ui.button(label="Humain", emoji="🧑", style=discord.ButtonStyle.secondary, custom_id="depart_camp_humain")
@@ -805,6 +919,7 @@ class Depart(commands.Cog):
 
         self.bot.add_view(DepartView())
         self.bot.add_view(CampView())
+        self.bot.add_view(EducationView())
         self.bot.add_view(ClanRollView())
         self.bot.add_view(DMClanQuestionView())
         self.bot.add_view(DMClanSelectView())
