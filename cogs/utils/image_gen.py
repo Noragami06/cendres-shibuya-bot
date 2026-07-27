@@ -165,3 +165,104 @@ def generate_clan_sort_image(clan_data: dict, spell_data: dict) -> str:
     path = os.path.join(OUTPUT_DIR, f"depart_{uuid.uuid4().hex}.png")
     image.save(path, "PNG")
     return path
+
+
+def make_output_path(prefix: str = "img") -> str:
+    """Retourne un chemin PNG unique dans le dossier temporaire des images."""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    return os.path.join(OUTPUT_DIR, f"{prefix}_{uuid.uuid4().hex}.png")
+
+
+def _format_number(n: int) -> str:
+    return f"{n:,}".replace(",", " ")
+
+
+def generate_reserve_image(classe, value, minimum, maximum, ranking, energy_table, output_path):
+    """Image de l'étape "Réserve d'énergie occulte" (même style que le tirage clan/sort).
+
+    classe        : str affichée telle quelle (ex "4", "S")
+    value/min/max : entiers (jauge de position)
+    ranking       : [(rang, nom, valeur, is_hit), ...]
+    energy_table  : [(nom_nature, "65%", is_hit), ...] ou liste vide (pas de nature)
+    """
+    image = Image.new("RGB", (CANVAS_W, CANVAS_H), BG)
+    draw = ImageDraw.Draw(image)
+
+    font_title = _load_font(SERIF_BOLD, 17)
+    font_big = _load_font(SERIF_BOLD, 34)
+    font_label = _load_font(SERIF_REGULAR, 13)
+    font_row = _load_font(SERIF_REGULAR, 15)
+    font_row_bold = _load_font(SERIF_BOLD, 15)
+    font_head = _load_font(SERIF_BOLD, 16)
+
+    # ---------- Panneau GAUCHE : classe / valeur / jauge ----------
+    _draw_panel(draw, LEFT_X, PANEL_Y)
+    cx = LEFT_X + PANEL_W // 2
+
+    title = "Réserve d'énergie occulte"
+    draw.text((cx - _text_width(draw, title, font_title) // 2, PANEL_Y + 22), title, font=font_title, fill=GOLD)
+
+    classe_line = f"Classe {classe}"
+    draw.text((cx - _text_width(draw, classe_line, font_head) // 2, PANEL_Y + 58), classe_line, font=font_head, fill=CLAN_DIM)
+
+    value_str = _format_number(value)
+    draw.text((cx - _text_width(draw, value_str, font_big) // 2, PANEL_Y + 108), value_str, font=font_big, fill=GOLD)
+
+    unit = "d'énergie occulte"
+    draw.text((cx - _text_width(draw, unit, font_label) // 2, PANEL_Y + 154), unit, font=font_label, fill=CLAN_DIM)
+
+    # Jauge de position entre min et max
+    bar_x1 = LEFT_X + PADDING + 10
+    bar_x2 = LEFT_X + PANEL_W - PADDING - 10
+    bar_y = PANEL_Y + 214
+    bar_h = 10
+    draw.rounded_rectangle([bar_x1, bar_y, bar_x2, bar_y + bar_h], radius=5, fill=PANEL_BORDER)
+
+    span = maximum - minimum
+    frac = 0.0 if span <= 0 else max(0.0, min(1.0, (value - minimum) / span))
+    fill_x = bar_x1 + int((bar_x2 - bar_x1) * frac)
+    if fill_x > bar_x1:
+        draw.rounded_rectangle([bar_x1, bar_y, fill_x, bar_y + bar_h], radius=5, fill=GOLD_BORDER)
+    draw.ellipse([fill_x - 5, bar_y - 3, fill_x + 5, bar_y + bar_h + 3], fill=GOLD)
+
+    draw.text((bar_x1, bar_y + 20), _format_number(minimum), font=font_label, fill=CLAN_DIM)
+    max_str = _format_number(maximum)
+    draw.text((bar_x2 - _text_width(draw, max_str, font_label), bar_y + 20), max_str, font=font_label, fill=CLAN_DIM)
+
+    # ---------- Panneau DROIT : classement (+ natures si fournies) ----------
+    _draw_panel(draw, RIGHT_X, PANEL_Y)
+
+    draw.text((RIGHT_X + PADDING, PANEL_Y + 20), "Classement", font=font_head, fill=GOLD)
+    draw.line(
+        [RIGHT_X + PADDING, PANEL_Y + 46, RIGHT_X + PANEL_W - PADDING, PANEL_Y + 46],
+        fill=PANEL_BORDER, width=1,
+    )
+
+    row_y = PANEL_Y + 58
+    for rank, name, val, is_hit in ranking:
+        color = GOLD if is_hit else SPELL_DIM
+        font = font_row_bold if is_hit else font_row
+        left = f"#{rank}  {name}"
+        val_str = _format_number(val)
+        draw.text((RIGHT_X + PADDING, row_y), left, font=font, fill=color)
+        draw.text((RIGHT_X + PANEL_W - PADDING - _text_width(draw, val_str, font), row_y), val_str, font=font, fill=color)
+        row_y += 26
+
+    if energy_table:
+        row_y += 10
+        draw.line([RIGHT_X + PADDING, row_y, RIGHT_X + PANEL_W - PADDING, row_y], fill=PANEL_BORDER, width=1)
+        row_y += 14
+        draw.text((RIGHT_X + PADDING, row_y), "Nature de l'énergie", font=font_head, fill=GOLD)
+        row_y += 30
+        for name, pct, is_hit in energy_table:
+            color = GOLD if is_hit else SPELL_DIM
+            font = font_row_bold if is_hit else font_row
+            draw.text((RIGHT_X + PADDING, row_y), name, font=font, fill=color)
+            draw.text((RIGHT_X + PANEL_W - PADDING - _text_width(draw, pct, font), row_y), pct, font=font, fill=color)
+            row_y += 26
+
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    image.save(output_path, "PNG")
+    return output_path

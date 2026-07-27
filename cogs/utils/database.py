@@ -66,6 +66,19 @@ CREATE TABLE IF NOT EXISTS depart_pending_choices (
     sort TEXT,
     origin_channel_id INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS validated_characters (
+    user_id INTEGER PRIMARY KEY,
+    guild_id INTEGER,
+    display_name TEXT,
+    camp TEXT,
+    clan TEXT,
+    sort TEXT,
+    eo_classe TEXT,
+    eo_value INTEGER,
+    nature TEXT,
+    validated_at TEXT
+);
 """
 
 

@@ -2,11 +2,12 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import asyncio
+import json
 import os
 import random
 
 from cogs.utils import database as db
-from cogs.utils.image_gen import generate_clan_sort_image
+from cogs.utils.image_gen import generate_clan_sort_image, generate_reserve_image, make_output_path
 
 # ---------- IDs ----------
 DEPART_ROLE_ID = 1521961072334999663  # Rôle requis pour utiliser /départ
@@ -64,6 +65,55 @@ SORT_LABELS = {
 # Tables de sort de base
 SPELL_TABLE_BASE = {"sort_inne": 55, "sort_heredit": 10, "restriction": 35}
 SPELL_TABLE_PARTIAL = {"sort_inne": 40, "sort_heredit": 5, "sort_heredit_partiel": 30, "restriction": 25}
+
+# ---------- Réserve d'énergie occulte ----------
+EO_CLASS_TABLE = {
+    "classe_4": {"min": 100, "max": 5000, "pct": 45},
+    "classe_3": {"min": 1000, "max": 25000, "pct": 30},
+    "classe_2": {"min": 5000, "max": 75000, "pct": 15},
+    "classe_1": {"min": 15000, "max": 200000, "pct": 7},
+    "classe_s": {"min": 40000, "max": 500000, "pct": 3},
+}
+
+EO_NATURE_TABLE = {
+    "sans_nature": 65,
+    "brute": 20,
+    "electrique": 10,
+    "raffinee": 5,
+}
+
+NATURE_DISPLAY_NAMES = {
+    "sans_nature": "Sans nature",
+    "brute": "Nature brute",
+    "electrique": "Nature électrique",
+    "raffinee": "Nature raffinée",
+}
+
+# ---------- Suivi de progression du parcours (fichier JSON dédié) ----------
+PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "depart_character_progress.json")
+
+
+def load_progress() -> dict:
+    if not os.path.exists(PROGRESS_FILE):
+        os.makedirs(os.path.dirname(PROGRESS_FILE), exist_ok=True)
+        with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+            json.dump({}, f, indent=4, ensure_ascii=False)
+        return {}
+    with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_progress(data: dict):
+    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+
+def update_progress(user_id: int, **fields):
+    """Fusionne les champs fournis dans l'entrée de l'utilisateur (sans écraser le reste)."""
+    data = load_progress()
+    entry = data.setdefault(str(user_id), {})
+    entry.update(fields)
+    save_progress(data)
 
 
 # La persistance passe désormais par SQLite (tables clan_roll_state / clan_roll_meta
@@ -452,13 +502,98 @@ async def send_roll_result(
     except OSError:
         pass
 
-    # 2e message : un embed sans image, avec l'état des 8 grades du clan obtenu.
+    # 2e message : un embed sans image, avec l'état des 8 grades + bouton "Continuer"
+    # (étape suivante : réserve d'énergie occulte).
     embed = discord.Embed(title="🎲 Résultat du tirage", color=discord.Color.gold())
     embed.add_field(name="Grades du clan", value=grades_text, inline=False)
-    await interaction.followup.send(embed=embed)
+    await interaction.followup.send(embed=embed, view=ContinueEnergyView())
+
+
+async def roll_and_send_reserve(source, member: discord.Member, guild: discord.Guild, with_nature: bool):
+    """Tire la classe d'énergie occulte, sa valeur, éventuellement sa nature, génère l'image
+    et l'envoie. `source` peut être une Interaction (qui sera acquittée) ou directement un salon."""
+    if isinstance(source, discord.Interaction):
+        if not source.response.is_done():
+            await source.response.defer()
+        channel = source.channel
+    else:
+        channel = source
+
+    # Classe puis valeur dans l'intervalle de la classe.
+    class_pool = {key: info["pct"] for key, info in EO_CLASS_TABLE.items()}
+    eo_classe = weighted_choice(class_pool)
+    info = EO_CLASS_TABLE[eo_classe]
+    value = random.randint(info["min"], info["max"])
+
+    nature = weighted_choice(EO_NATURE_TABLE) if with_nature else None
+
+    # Classement réel de la classe tirée : personnages déjà validés dans cette classe
+    # + le joueur actuel (qui n'est pas encore en base).
+    # TODO: l'insertion dans validated_characters se fera uniquement à l'étape de validation
+    # de la fiche par le staff (point 7 du parcours, pas encore développée). Tant que la table
+    # est vide, chaque joueur qui teste se retrouve donc seul en 1ère position, ce qui est normal.
+    with db.get_connection() as conn:
+        validated = conn.execute(
+            "SELECT display_name, eo_value FROM validated_characters WHERE eo_classe = ? ORDER BY eo_value DESC",
+            (eo_classe,),
+        ).fetchall()
+
+    merged = [(member.display_name, value, True)]
+    merged += [(row["display_name"], row["eo_value"], False) for row in validated]
+    merged.sort(key=lambda entry: entry[1], reverse=True)  # valeur décroissante
+
+    # Rangs 1,2,3... ; is_hit uniquement sur le joueur qui vient de tirer ; 4 lignes max affichées.
+    ranking = [
+        (rank, name, val, is_hit)
+        for rank, (name, val, is_hit) in enumerate(merged[:4], start=1)
+    ]
+
+    if with_nature:
+        energy_table = [
+            (NATURE_DISPLAY_NAMES[key], f"{pct}%", key == nature)
+            for key, pct in EO_NATURE_TABLE.items()
+        ]
+    else:
+        energy_table = []
+
+    classe_display = eo_classe.replace("classe_", "").upper()  # "classe_4" -> "4", "classe_s" -> "S"
+    path = make_output_path("reserve")
+    generate_reserve_image(classe_display, value, info["min"], info["max"], ranking, energy_table, path)
+
+    # 1er message : l'image seule, sans embed.
+    await channel.send(file=discord.File(path, filename="reserve.png"))
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+    # 2e message (uniquement avec nature) : la nature obtenue.
+    if with_nature:
+        embed = discord.Embed(
+            title="🔮 Nature de l'énergie occulte",
+            description=f"{member.mention} possède une **{NATURE_DISPLAY_NAMES[nature]}** !",
+            color=discord.Color.purple(),
+        )
+        await channel.send(embed=embed)
+
+    update_progress(member.id, eo_classe=eo_classe, eo_value=value, nature=nature)
 
 
 # ---------- Vues ----------
+class ContinueEnergyView(discord.ui.View):
+    """Bouton "Continuer" affiché après le tirage clan/sort (exorciste ou hybride-exorciste),
+    qui déclenche l'étape réserve + nature."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Continuer", emoji="➡️", style=discord.ButtonStyle.success, custom_id="depart_continuer_energie")
+    async def continuer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await roll_and_send_reserve(interaction, interaction.user, interaction.guild, with_nature=True)
+
+
+class HeirView(discord.ui.View):
+    """Accepter / refuser de devenir l'héritier du clan. Réservé au joueur qui a tiré le sort."""
 class HeirView(discord.ui.View):
     """Accepter / refuser de devenir l'héritier du clan. Réservé au joueur qui a tiré le sort."""
 
@@ -491,6 +626,7 @@ class HeirView(discord.ui.View):
             return
 
         update_clan_state_after_join(interaction.guild, self.clan_key)
+        update_progress(interaction.user.id, camp="exorciste", clan=self.clan_key, sort="sort_heredit")
 
         await send_roll_result(
             interaction,
@@ -521,6 +657,7 @@ class HeirView(discord.ui.View):
         # TODO: attribution du grade (Membres principaux/secondaires) à définir plus tard avec l'utilisateur
 
         update_clan_state_after_join(interaction.guild, self.clan_key)
+        update_progress(interaction.user.id, camp="exorciste", clan=self.clan_key, sort=new_sort)
 
         await send_roll_result(
             interaction,
@@ -564,6 +701,7 @@ class ClanRollView(discord.ui.View):
         # ----- Cas "Sans clan" -----
         if result_key == "sans_clan":
             # Aucun rôle attribué, aucun sort réel, aucune section de grades.
+            update_progress(interaction.user.id, camp="exorciste", clan="sans_clan", sort=None)
             await send_roll_result(interaction, state, "sans_clan", None, "Aucun", {}, {})
             return
 
@@ -600,6 +738,7 @@ class ClanRollView(discord.ui.View):
         # TODO: attribution du grade (Membres principaux/secondaires) à définir plus tard avec l'utilisateur
 
         update_clan_state_after_join(guild, result_key)
+        update_progress(interaction.user.id, camp="exorciste", clan=result_key, sort=sort_key)
 
         await send_roll_result(
             interaction, state, result_key, sort_key, SORT_LABELS[sort_key], base_table, final_table
@@ -630,6 +769,7 @@ class ClanRollHybrideView(discord.ui.View):
 
         # d) Sans clan : aucun rôle attribué (ni clan, ni marqueur de clan).
         if result_key == "sans_clan":
+            update_progress(interaction.user.id, camp="hybride", clan="sans_clan", sort="sort_inne")
             spell_data = build_hybride_spell_data(partial_heredit=False)
             await send_roll_result(
                 interaction, state, "sans_clan", None, "Sort inné", {}, {}, spell_data_override=spell_data
@@ -645,6 +785,7 @@ class ClanRollHybrideView(discord.ui.View):
 
         # L'hybride occupe une vraie place du clan : mêmes règles de fermeture/réouverture.
         update_clan_state_after_join(guild, result_key)
+        update_progress(interaction.user.id, camp="hybride", clan=result_key, sort="sort_inne")
 
         # b/e) Sort toujours "Sort inné", table verrouillée pour l'affichage.
         spell_data = build_hybride_spell_data(info["partial_heredit"])
@@ -888,21 +1029,17 @@ class EducationView(discord.ui.View):
             embed=build_clan_table_embed(interaction.guild), view=ClanRollHybrideView(), ephemeral=False
         )
 
-    @discord.ui.button(label="Chez les fléaux", emoji="👹", style=discord.ButtonStyle.danger, custom_id="depart_edu_fleaux")
+    @discord.ui.button(label="Chez les fléaux", emoji="👹", style=discord.ButtonStyle.danger, custom_id="depart_hybride_fleaux")
     async def fleaux(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # TODO: voie "fléaux" — pas de clan, uniquement la nature de l'énergie occulte.
-        await interaction.response.send_message(
-            f"{interaction.user.mention} a grandi 👹 chez les fléaux. La suite arrive bientôt.",
-            ephemeral=False,
-        )
+        # Voie "fléaux" : pas de clan, réserve d'énergie occulte SANS nature, déclenchée directement.
+        update_progress(interaction.user.id, camp="hybride")
+        await roll_and_send_reserve(interaction, interaction.user, interaction.guild, with_nature=False)
 
-    @discord.ui.button(label="Livré à soi même", emoji="🌪️", style=discord.ButtonStyle.secondary, custom_id="depart_edu_livre")
+    @discord.ui.button(label="Livré à soi même", emoji="🌪️", style=discord.ButtonStyle.secondary, custom_id="depart_hybride_seul")
     async def livre(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # TODO: voie "livré à soi même" — énergie occulte brute, pas de sort tant qu'aucun mentor.
-        await interaction.response.send_message(
-            f"{interaction.user.mention} a grandi 🌪️ livré à lui même. La suite arrive bientôt.",
-            ephemeral=False,
-        )
+        # Voie "livré à soi même" : réserve d'énergie occulte AVEC nature, déclenchée directement.
+        update_progress(interaction.user.id, camp="hybride")
+        await roll_and_send_reserve(interaction, interaction.user, interaction.guild, with_nature=True)
 
 
 class CampView(discord.ui.View):
@@ -913,6 +1050,8 @@ class CampView(discord.ui.View):
     async def exorciste(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await apply_camp_role(interaction, ROLE_EXORCISTE):
             return
+
+        update_progress(interaction.user.id, camp="exorciste")
 
         # Dans TOUS les cas : le tableau des clans + bouton Roll part immédiatement dans le salon.
         # Ce message ne dépend de rien et n'attend jamais quoi que ce soit.
@@ -946,6 +1085,7 @@ class CampView(discord.ui.View):
     async def hybride(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await apply_camp_role(interaction, ROLE_HYBRIDE):
             return
+        update_progress(interaction.user.id, camp="hybride")
         await interaction.response.send_message(
             embed=build_education_embed(), view=EducationView(), ephemeral=False
         )
@@ -986,6 +1126,7 @@ class Depart(commands.Cog):
         self.bot.add_view(EducationView())
         self.bot.add_view(ClanRollView())
         self.bot.add_view(ClanRollHybrideView())
+        self.bot.add_view(ContinueEnergyView())
         self.bot.add_view(DMClanQuestionView())
         self.bot.add_view(DMClanSelectView())
         # Enregistrée avec les 4 boutons pour couvrir tous les custom_id après redémarrage,
