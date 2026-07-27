@@ -20,6 +20,7 @@ CAMP_ROLES = [ROLE_EXORCISTE, ROLE_HYBRIDE, ROLE_HUMAIN]
 # Rôle marqueur "appartient à un clan" (identique à cogs/clans.py)
 CLAN_MEMBER_ROLE_ID = 1521961709517148220
 HERITIER_ROLE_ID = 1521963035898548455
+MEMBRES_PRINCIPAUX_ROLE_ID = 1521963104903233658  # Grade attribué d'office à l'hybride élevé chez les exorcistes
 
 # Grades de clan (ordre d'affichage)
 GRADE_ROLES = [
@@ -365,6 +366,19 @@ def build_sans_clan_spell_data() -> dict:
     }
 
 
+def build_hybride_spell_data(partial_heredit: bool) -> dict:
+    """Table de sort d'un hybride élevé chez les exorcistes : toujours Sort inné à 100%,
+    tout le reste verrouillé (barré) pour montrer que c'est inaccessible."""
+    rows = [
+        {"label": "Restriction céleste", "pct": 0, "selected": False, "unavailable": True},
+        {"label": "Sort inné", "pct": 100, "selected": True, "unavailable": False},
+        {"label": "Sort héréditaire", "pct": 0, "selected": False, "unavailable": True},
+    ]
+    if partial_heredit:
+        rows.append({"label": "Sort héréditaire partiel", "pct": 0, "selected": False, "unavailable": True})
+    return {"result": "Sort inné", "rows": rows}
+
+
 def build_grades_text(guild: discord.Guild, clan_role_id: int) -> str:
     lines = []
     for grade_name, grade_role_id in GRADE_ROLES:
@@ -383,13 +397,16 @@ def build_grades_text(guild: discord.Guild, clan_role_id: int) -> str:
 
 
 # ---------- Attribution des rôles ----------
-async def assign_clan_roles(interaction: discord.Interaction, clan_role_id: int, heir: bool = False) -> bool:
+async def assign_clan_roles(interaction: discord.Interaction, clan_role_id: int, heir: bool = False,
+                            extra_role_ids: list = None) -> bool:
     member: discord.Member = interaction.user
     guild = interaction.guild
 
     role_ids = [clan_role_id, CLAN_MEMBER_ROLE_ID]
     if heir:
         role_ids.append(HERITIER_ROLE_ID)
+    if extra_role_ids:
+        role_ids.extend(extra_role_ids)
 
     roles = [guild.get_role(rid) for rid in role_ids]
     roles = [role for role in roles if role is not None]
@@ -414,14 +431,15 @@ async def send_roll_result(
     result_label: str,
     base_table: dict,
     final_table: dict,
+    spell_data_override: dict = None,
 ):
     clan_data = build_clan_image_data(state, result_key)
 
     if result_key == "sans_clan":
-        spell_data = build_sans_clan_spell_data()
+        spell_data = spell_data_override or build_sans_clan_spell_data()
         grades_text = "Aucun clan, aucun grade applicable."
     else:
-        spell_data = build_spell_image_data(base_table, final_table, sort_key, result_label)
+        spell_data = spell_data_override or build_spell_image_data(base_table, final_table, sort_key, result_label)
         grades_text = build_grades_text(interaction.guild, state["clans"][result_key]["role_id"])
 
     path = generate_clan_sort_image(clan_data, spell_data)
@@ -585,6 +603,53 @@ class ClanRollView(discord.ui.View):
 
         await send_roll_result(
             interaction, state, result_key, sort_key, SORT_LABELS[sort_key], base_table, final_table
+        )
+
+
+class ClanRollHybrideView(discord.ui.View):
+    """Tirage du clan pour un hybride élevé chez les exorcistes.
+    Même tirage de clan que l'exorciste classique, mais le sort est TOUJOURS Sort inné
+    (aucun héritier, aucune restriction), et le grade Membres principaux est attribué d'office."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Roll clan (Hybride)", emoji="🎲", style=discord.ButtonStyle.primary, custom_id="depart_roll_clan_hybride")
+    async def roll(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+
+        guild = interaction.guild
+        state = load_clan_state()
+
+        # a) Tirage aléatoire du clan, identique à l'exorciste classique (pas de choix forcé ici).
+        pool = {"sans_clan": state["sans_clan_pct"]}
+        for clan_key, info in state["clans"].items():
+            if not info["closed"]:
+                pool[clan_key] = info["current_pct"]
+        result_key = weighted_choice(pool)
+
+        # d) Sans clan : aucun rôle attribué (ni clan, ni marqueur de clan).
+        if result_key == "sans_clan":
+            spell_data = build_hybride_spell_data(partial_heredit=False)
+            await send_roll_result(
+                interaction, state, "sans_clan", None, "Sort inné", {}, {}, spell_data_override=spell_data
+            )
+            return
+
+        # c) Clan précis : clan + marqueur + Membres principaux (automatique, sans confirmation).
+        info = state["clans"][result_key]
+        if not await assign_clan_roles(
+            interaction, info["role_id"], extra_role_ids=[MEMBRES_PRINCIPAUX_ROLE_ID]
+        ):
+            return
+
+        # L'hybride occupe une vraie place du clan : mêmes règles de fermeture/réouverture.
+        update_clan_state_after_join(guild, result_key)
+
+        # b/e) Sort toujours "Sort inné", table verrouillée pour l'affichage.
+        spell_data = build_hybride_spell_data(info["partial_heredit"])
+        await send_roll_result(
+            interaction, state, result_key, "sort_inne", "Sort inné", {}, {}, spell_data_override=spell_data
         )
 
 
@@ -816,12 +881,11 @@ class EducationView(discord.ui.View):
             ephemeral=False,
         )
 
-    @discord.ui.button(label="Chez les exorcistes", emoji="⚔️", style=discord.ButtonStyle.primary, custom_id="depart_edu_exorcistes")
+    @discord.ui.button(label="Chez les exorcistes", emoji="⚔️", style=discord.ButtonStyle.primary, custom_id="depart_hybride_exorcistes")
     async def exorcistes(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # TODO: voie "exorcistes" — même parcours qu'un exorciste, mais sort forcé à "Sort inné".
+        # Même tableau des clans que l'exorciste classique, mais avec le bouton de roll hybride.
         await interaction.response.send_message(
-            f"{interaction.user.mention} a grandi ⚔️ chez les exorcistes. La suite arrive bientôt.",
-            ephemeral=False,
+            embed=build_clan_table_embed(interaction.guild), view=ClanRollHybrideView(), ephemeral=False
         )
 
     @discord.ui.button(label="Chez les fléaux", emoji="👹", style=discord.ButtonStyle.danger, custom_id="depart_edu_fleaux")
@@ -921,6 +985,7 @@ class Depart(commands.Cog):
         self.bot.add_view(CampView())
         self.bot.add_view(EducationView())
         self.bot.add_view(ClanRollView())
+        self.bot.add_view(ClanRollHybrideView())
         self.bot.add_view(DMClanQuestionView())
         self.bot.add_view(DMClanSelectView())
         # Enregistrée avec les 4 boutons pour couvrir tous les custom_id après redémarrage,
