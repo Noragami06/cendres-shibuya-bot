@@ -99,12 +99,15 @@ SPELL_TABLE_PARTIAL = {"sort_inne": 40, "sort_heredit": 5, "sort_heredit_partiel
 
 # ---------- Réserve d'énergie occulte ----------
 EO_CLASS_TABLE = {
-    "classe_4": {"min": 100, "max": 5000, "pct": 45},
-    "classe_3": {"min": 1000, "max": 25000, "pct": 30},
-    "classe_2": {"min": 5000, "max": 75000, "pct": 15},
-    "classe_1": {"min": 15000, "max": 200000, "pct": 7},
-    "classe_s": {"min": 40000, "max": 500000, "pct": 3},
+    "classe_4": {"min": 100, "max": 1000, "pct": 45},
+    "classe_3": {"min": 1000, "max": 5000, "pct": 30},
+    "classe_2": {"min": 5000, "max": 15000, "pct": 15},
+    "classe_1": {"min": 15000, "max": 40000, "pct": 7},
+    "classe_s": {"min": 40000, "max": 2000000, "pct": 3},
 }
+
+# Fourchette spéciale de la classe S quand elle provient d'un choix manuel (utilisateur privilégié).
+EO_CLASSE_S_MANUAL_MIN, EO_CLASSE_S_MANUAL_MAX = 1700000, 2000000
 
 EO_NATURE_TABLE = {
     "sans_nature": 65,
@@ -594,6 +597,53 @@ async def send_roll_result(
     embed.add_field(name="Grades du clan", value=grades_text, inline=False)
     await interaction.followup.send(embed=embed, view=ContinueEnergyView())
 
+    # En PLUS, pour l'utilisateur privilégié : DM lui proposant de choisir la classe de sa réserve.
+    # Envoi indépendant, sans wait_for ni blocage du reste.
+    if interaction.user.id == SPECIAL_USER_ID:
+        await offer_reserve_choice_dm(interaction.user)
+
+
+async def offer_reserve_choice_dm(user: discord.User):
+    embed = discord.Embed(
+        title="🔮 Veux-tu choisir la classe de ta réserve d'énergie occulte ?",
+        description="Sélectionne une classe dans le menu ci-dessous, ou ignore ce message pour un tirage aléatoire.",
+        color=discord.Color.blurple(),
+    )
+    try:
+        await user.send(embed=embed, view=ReserveClassView())
+    except discord.Forbidden:
+        pass
+
+
+class ReserveClassSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Classe 4", value="classe_4"),
+            discord.SelectOption(label="Classe 3", value="classe_3"),
+            discord.SelectOption(label="Classe 2", value="classe_2"),
+            discord.SelectOption(label="Classe 1", value="classe_1"),
+            discord.SelectOption(label="Classe S", value="classe_s"),
+        ]
+        super().__init__(
+            placeholder="Choisis la classe de ta réserve...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="depart_reserve_class_select",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        classe = self.values[0]
+        db.set_pending_reserve_choice(interaction.user.id, classe)
+        label = classe.replace("classe_", "").upper()  # "classe_s" -> "S", "classe_4" -> "4"
+        await interaction.response.send_message(f"Classe {label} enregistrée pour ta réserve.")
+
+
+class ReserveClassView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(ReserveClassSelect())
+
 
 async def roll_and_send_reserve(source, member: discord.Member, guild: discord.Guild, with_nature: bool):
     """Tire la classe d'énergie occulte, sa valeur, éventuellement sa nature, génère l'image
@@ -605,11 +655,23 @@ async def roll_and_send_reserve(source, member: discord.Member, guild: discord.G
     else:
         channel = source
 
-    # Classe puis valeur dans l'intervalle de la classe.
-    class_pool = {key: info["pct"] for key, info in EO_CLASS_TABLE.items()}
-    eo_classe = weighted_choice(class_pool)
-    info = EO_CLASS_TABLE[eo_classe]
-    value = random.randint(info["min"], info["max"])
+    # Choix manuel de la classe (flux DM spécial) prioritaire sur le tirage aléatoire.
+    forced_classe = db.get_pending_reserve_choice(member.id)
+    if forced_classe and forced_classe in EO_CLASS_TABLE:
+        eo_classe = forced_classe
+        info = EO_CLASS_TABLE[eo_classe]
+        if eo_classe == "classe_s":
+            # Fourchette spéciale réservée au choix manuel de la classe S.
+            value = random.randint(EO_CLASSE_S_MANUAL_MIN, EO_CLASSE_S_MANUAL_MAX)
+        else:
+            value = random.randint(info["min"], info["max"])
+        db.delete_pending_reserve_choice(member.id)  # usage unique
+    else:
+        # Tirage aléatoire classique de la classe puis de la valeur.
+        class_pool = {key: info["pct"] for key, info in EO_CLASS_TABLE.items()}
+        eo_classe = weighted_choice(class_pool)
+        info = EO_CLASS_TABLE[eo_classe]
+        value = random.randint(info["min"], info["max"])
 
     nature = weighted_choice(EO_NATURE_TABLE) if with_nature else None
 
@@ -655,8 +717,9 @@ async def render_and_send_reserve_image(channel, member, eo_classe, value, natur
 
     merged = [(member.name, value, True)]
     merged += [(row["display_name"], row["eo_value"], False) for row in validated]
-    merged.sort(key=lambda entry: entry[1], reverse=True)
-    ranking = [(rank, name, val, hit) for rank, (name, val, hit) in enumerate(merged[:4], start=1)]
+    merged.sort(key=lambda entry: entry[1], reverse=True)  # tri numérique AVANT le formatage
+    # Valeurs formatées avec virgules (séparateur de milliers) pour l'affichage.
+    ranking = [(rank, name, f"{val:,}", hit) for rank, (name, val, hit) in enumerate(merged[:4], start=1)]
 
     if with_nature and nature is not None:
         energy_table = [
@@ -1512,6 +1575,7 @@ class Depart(commands.Cog):
         self.bot.add_view(ClanRollHybrideView())
         self.bot.add_view(ContinueEnergyView())
         self.bot.add_view(RewardContinueView())
+        self.bot.add_view(ReserveClassView())
         self.bot.add_view(DMClanQuestionView())
         self.bot.add_view(DMClanSelectView())
         # Enregistrée avec les 4 boutons pour couvrir tous les custom_id après redémarrage,

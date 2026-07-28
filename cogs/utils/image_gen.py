@@ -237,7 +237,7 @@ def generate_reserve_image(classe: str, value: int, range_min: int, range_max: i
     sub = f"Réserve de classe {classe}"
     sub_w = text_w(draw, sub, f_sub)
     draw.text((W / 2 - sub_w / 2, outer[1] + 18), sub, font=f_sub, fill=MUTED_SUB)
-    val_text = f"{value} EO"
+    val_text = f"{value:,} EO"
     val_w = text_w(draw, val_text, f_val)
     draw.text((W / 2 - val_w / 2, outer[1] + 38), val_text, font=f_val, fill=GOLD)
     ratio = max(0.0, min(1.0, (value - range_min) / (range_max - range_min)))

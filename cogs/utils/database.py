@@ -102,6 +102,11 @@ CREATE TABLE IF NOT EXISTS depart_pending_rewards (
     option_a_json TEXT,
     option_b_json TEXT
 );
+
+CREATE TABLE IF NOT EXISTS depart_pending_reserve_choice (
+    user_id INTEGER PRIMARY KEY,
+    classe TEXT
+);
 """
 
 
@@ -460,3 +465,27 @@ def get_pending_rewards(user_id: int):
 def delete_pending_rewards(user_id: int):
     with get_connection() as conn:
         conn.execute("DELETE FROM depart_pending_rewards WHERE user_id = ?", (user_id,))
+
+
+# =====================================================================
+# DEPART PENDING RESERVE CHOICE (choix manuel de la classe de réserve)
+# =====================================================================
+def set_pending_reserve_choice(user_id: int, classe: str):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO depart_pending_reserve_choice (user_id, classe) VALUES (?, ?)",
+            (user_id, classe),
+        )
+
+
+def get_pending_reserve_choice(user_id: int):
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT classe FROM depart_pending_reserve_choice WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return row["classe"] if row else None
+
+
+def delete_pending_reserve_choice(user_id: int):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM depart_pending_reserve_choice WHERE user_id = ?", (user_id,))
