@@ -2,7 +2,6 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import asyncio
-import json
 import os
 import random
 import uuid
@@ -121,51 +120,24 @@ NATURE_DISPLAY_NAMES = {
     "raffinee": "Nature raffinée",
 }
 
-# ---------- Suivi de progression du parcours (fichier JSON dédié) ----------
-PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "depart_character_progress.json")
-
-
-def load_progress() -> dict:
-    if not os.path.exists(PROGRESS_FILE):
-        os.makedirs(os.path.dirname(PROGRESS_FILE), exist_ok=True)
-        with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-            json.dump({}, f, indent=4, ensure_ascii=False)
-        return {}
-    with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_progress(data: dict):
-    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-
-
+# ---------- Suivi de progression du parcours (SQLite : depart_character_progress) ----------
 def update_progress(user_id: int, **fields):
-    """Fusionne les champs fournis dans l'entrée de l'utilisateur (sans écraser le reste)."""
-    data = load_progress()
-    entry = data.setdefault(str(user_id), {})
-    entry.update(fields)
-    save_progress(data)
+    """Fusionne les champs fournis dans la progression de l'utilisateur (sans écraser le reste)."""
+    db.upsert_character_progress(user_id, fields)
 
 
 def get_progress(user_id: int) -> dict:
-    return load_progress().get(str(user_id), {})
+    return db.get_character_progress(user_id)
 
 
 def add_progress_item(user_id: int, name: str):
-    """Ajoute un objet obtenu à la liste 'items' de l'utilisateur (future fiche/inventaire)."""
-    data = load_progress()
-    entry = data.setdefault(str(user_id), {})
-    entry.setdefault("items", []).append(name)
-    save_progress(data)
+    """Ajoute un objet obtenu (future fiche/inventaire)."""
+    db.add_character_item(user_id, name)
 
 
 def add_progress_pending_reroll(user_id: int, key: str):
     """Mémorise un reroll gagné mais pas encore applicable (territoire/RCT)."""
-    data = load_progress()
-    entry = data.setdefault(str(user_id), {})
-    entry.setdefault("pending_rerolls", []).append(key)
-    save_progress(data)
+    db.add_character_pending_reroll(user_id, key)
 
 
 # ---------- Récompenses ----------
@@ -217,35 +189,17 @@ def pick_two_distinct_rewards():
     return resolve_reward(first_def), resolve_reward(second_def)
 
 
-# ---------- Choix de récompense en attente (fichier JSON dédié) ----------
-PENDING_REWARDS_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "depart_pending_rewards.json")
-
-
-def load_pending_rewards() -> dict:
-    if not os.path.exists(PENDING_REWARDS_FILE):
-        os.makedirs(os.path.dirname(PENDING_REWARDS_FILE), exist_ok=True)
-        with open(PENDING_REWARDS_FILE, "w", encoding="utf-8") as f:
-            json.dump({}, f, indent=4, ensure_ascii=False)
-        return {}
-    with open(PENDING_REWARDS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_pending_rewards(data: dict):
-    with open(PENDING_REWARDS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-
-
+# ---------- Choix de récompense en attente (SQLite : depart_pending_rewards) ----------
 def store_pending_rewards(user_id: int, option_a: dict, option_b: dict):
-    data = load_pending_rewards()
-    data[str(user_id)] = {"option_a": option_a, "option_b": option_b}
-    save_pending_rewards(data)
+    db.set_pending_rewards(user_id, option_a, option_b)
+
+
+def get_pending_rewards(user_id: int):
+    return db.get_pending_rewards(user_id)
 
 
 def clear_pending_reward(user_id: int):
-    data = load_pending_rewards()
-    data.pop(str(user_id), None)
-    save_pending_rewards(data)
+    db.delete_pending_rewards(user_id)
 
 
 # La persistance passe désormais par SQLite (tables clan_roll_state / clan_roll_meta
@@ -699,7 +653,7 @@ async def render_and_send_reserve_image(channel, member, eo_classe, value, natur
             (eo_classe,),
         ).fetchall()
 
-    merged = [(member.display_name, value, True)]
+    merged = [(member.name, value, True)]
     merged += [(row["display_name"], row["eo_value"], False) for row in validated]
     merged.sort(key=lambda entry: entry[1], reverse=True)
     ranking = [(rank, name, val, hit) for rank, (name, val, hit) in enumerate(merged[:4], start=1)]
@@ -997,7 +951,7 @@ class RewardChoiceView(discord.ui.View):
 
 async def handle_reward_choice(interaction: discord.Interaction, which: str):
     uid = interaction.user.id
-    pending = load_pending_rewards().get(str(uid))
+    pending = get_pending_rewards(uid)
     if not pending or which not in pending:
         await interaction.response.send_message(
             "Cette récompense n'est plus disponible (déjà utilisée).", ephemeral=True

@@ -1,5 +1,7 @@
+import json
 import os
 import sqlite3
+from datetime import datetime
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "data", "bot.db")
 
@@ -78,6 +80,27 @@ CREATE TABLE IF NOT EXISTS validated_characters (
     eo_value INTEGER,
     nature TEXT,
     validated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS depart_character_progress (
+    user_id INTEGER PRIMARY KEY,
+    guild_id INTEGER,
+    camp TEXT,
+    path TEXT,
+    clan TEXT,
+    sort TEXT,
+    eo_classe TEXT,
+    eo_value INTEGER,
+    nature TEXT,
+    items_json TEXT,
+    pending_rerolls_json TEXT,
+    updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS depart_pending_rewards (
+    user_id INTEGER PRIMARY KEY,
+    option_a_json TEXT,
+    option_b_json TEXT
 );
 """
 
@@ -332,3 +355,108 @@ def set_pending_sort(user_id: int, sort: str):
 def delete_pending_choice(user_id: int):
     with get_connection() as conn:
         conn.execute("DELETE FROM depart_pending_choices WHERE user_id = ?", (user_id,))
+
+
+# =====================================================================
+# DEPART CHARACTER PROGRESS
+# =====================================================================
+_PROGRESS_SCALAR_COLS = ("guild_id", "camp", "path", "clan", "sort", "eo_classe", "eo_value", "nature")
+
+
+def get_character_progress(user_id: int) -> dict:
+    """Reconstruit la progression sous la forme du dict historique (items/pending_rerolls en listes)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM depart_character_progress WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    if row is None:
+        return {}
+    return {
+        "guild_id": row["guild_id"],
+        "camp": row["camp"],
+        "path": row["path"],
+        "clan": row["clan"],
+        "sort": row["sort"],
+        "eo_classe": row["eo_classe"],
+        "eo_value": row["eo_value"],
+        "nature": row["nature"],
+        "items": json.loads(row["items_json"]) if row["items_json"] else [],
+        "pending_rerolls": json.loads(row["pending_rerolls_json"]) if row["pending_rerolls_json"] else [],
+    }
+
+
+def upsert_character_progress(user_id: int, fields: dict):
+    """Fusionne les champs scalaires fournis (crée la ligne si besoin), sans écraser le reste."""
+    with get_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO depart_character_progress (user_id) VALUES (?)", (user_id,))
+        assignments, values = [], []
+        for col in _PROGRESS_SCALAR_COLS:
+            if col in fields:
+                assignments.append(f"{col} = ?")
+                values.append(fields[col])
+        assignments.append("updated_at = ?")
+        values.append(datetime.utcnow().isoformat())
+        values.append(user_id)
+        conn.execute(
+            f"UPDATE depart_character_progress SET {', '.join(assignments)} WHERE user_id = ?",
+            values,
+        )
+
+
+def add_character_item(user_id: int, name: str):
+    with get_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO depart_character_progress (user_id) VALUES (?)", (user_id,))
+        row = conn.execute(
+            "SELECT items_json FROM depart_character_progress WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        items = json.loads(row["items_json"]) if row and row["items_json"] else []
+        items.append(name)
+        conn.execute(
+            "UPDATE depart_character_progress SET items_json = ?, updated_at = ? WHERE user_id = ?",
+            (json.dumps(items, ensure_ascii=False), datetime.utcnow().isoformat(), user_id),
+        )
+
+
+def add_character_pending_reroll(user_id: int, key: str):
+    with get_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO depart_character_progress (user_id) VALUES (?)", (user_id,))
+        row = conn.execute(
+            "SELECT pending_rerolls_json FROM depart_character_progress WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        rerolls = json.loads(row["pending_rerolls_json"]) if row and row["pending_rerolls_json"] else []
+        rerolls.append(key)
+        conn.execute(
+            "UPDATE depart_character_progress SET pending_rerolls_json = ?, updated_at = ? WHERE user_id = ?",
+            (json.dumps(rerolls, ensure_ascii=False), datetime.utcnow().isoformat(), user_id),
+        )
+
+
+# =====================================================================
+# DEPART PENDING REWARDS
+# =====================================================================
+def set_pending_rewards(user_id: int, option_a: dict, option_b: dict):
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO depart_pending_rewards (user_id, option_a_json, option_b_json)
+               VALUES (?, ?, ?)""",
+            (user_id, json.dumps(option_a, ensure_ascii=False), json.dumps(option_b, ensure_ascii=False)),
+        )
+
+
+def get_pending_rewards(user_id: int):
+    """Retourne {'option_a': {...}, 'option_b': {...}} ou None."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT option_a_json, option_b_json FROM depart_pending_rewards WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "option_a": json.loads(row["option_a_json"]),
+        "option_b": json.loads(row["option_b_json"]),
+    }
+
+
+def delete_pending_rewards(user_id: int):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM depart_pending_rewards WHERE user_id = ?", (user_id,))

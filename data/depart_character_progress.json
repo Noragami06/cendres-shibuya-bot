@@ -2,10 +2,10 @@
     "396615332346855428": {
         "camp": "exorciste",
         "clan": "gojo",
-        "sort": "sort_heredit",
-        "eo_classe": "classe_2",
-        "eo_value": 73647,
-        "nature": "brute",
+        "sort": "sort_heredit_partiel",
+        "eo_classe": "classe_4",
+        "eo_value": 4307,
+        "nature": "sans_nature",
         "path": "exorciste"
     }
 }

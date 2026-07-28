@@ -17,6 +17,8 @@ TICKETS_JSON = os.path.join(DATA_DIR, "tickets.json")
 INFORMATIONS_JSON = os.path.join(DATA_DIR, "informations.json")
 CLAN_STATE_JSON = os.path.join(DATA_DIR, "clan_roll_state.json")
 PENDING_CHOICES_JSON = os.path.join(DATA_DIR, "depart_pending_choices.json")
+PROGRESS_JSON = os.path.join(DATA_DIR, "depart_character_progress.json")
+PENDING_REWARDS_JSON = os.path.join(DATA_DIR, "depart_pending_rewards.json")
 
 CATEGORY_KEY = "8"  # L'entrée "Clans" est la seule catégorie actuelle
 
@@ -168,6 +170,53 @@ def migrate_pending_choices(conn, stats):
         stats["depart_pending_choices"] += 1
 
 
+def migrate_character_progress(conn, stats):
+    data = read_json(PROGRESS_JSON)
+    if not data:
+        return
+
+    for user_id, entry in data.items():
+        conn.execute(
+            """INSERT OR IGNORE INTO depart_character_progress
+               (user_id, guild_id, camp, path, clan, sort, eo_classe, eo_value, nature,
+                items_json, pending_rerolls_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                int(user_id),
+                entry.get("guild_id"),
+                entry.get("camp"),
+                entry.get("path"),
+                entry.get("clan"),
+                entry.get("sort"),
+                entry.get("eo_classe"),
+                entry.get("eo_value"),
+                entry.get("nature"),
+                json.dumps(entry.get("items", []), ensure_ascii=False),
+                json.dumps(entry.get("pending_rerolls", []), ensure_ascii=False),
+                entry.get("updated_at"),
+            ),
+        )
+        stats["depart_character_progress"] += 1
+
+
+def migrate_pending_rewards(conn, stats):
+    data = read_json(PENDING_REWARDS_JSON)
+    if not data:
+        return
+
+    for user_id, entry in data.items():
+        conn.execute(
+            """INSERT OR IGNORE INTO depart_pending_rewards (user_id, option_a_json, option_b_json)
+               VALUES (?, ?, ?)""",
+            (
+                int(user_id),
+                json.dumps(entry.get("option_a"), ensure_ascii=False),
+                json.dumps(entry.get("option_b"), ensure_ascii=False),
+            ),
+        )
+        stats["depart_pending_rewards"] += 1
+
+
 def main():
     print("=" * 55)
     print("Migration JSON -> SQLite (data/bot.db)")
@@ -185,6 +234,8 @@ def main():
         "clan_roll_state": 0,
         "clan_roll_meta": 0,
         "depart_pending_choices": 0,
+        "depart_character_progress": 0,
+        "depart_pending_rewards": 0,
     }
 
     with get_connection() as conn:
@@ -192,6 +243,8 @@ def main():
         migrate_informations(conn, stats)
         migrate_clan_state(conn, stats)
         migrate_pending_choices(conn, stats)
+        migrate_character_progress(conn, stats)
+        migrate_pending_rewards(conn, stats)
 
     print("Lignes traitees par table :")
     for table, count in stats.items():
@@ -205,7 +258,8 @@ def main():
             print(f"  {table:28} {total} ligne(s)")
 
     print("\nSauvegarde des JSON d'origine :")
-    for path in (TICKETS_JSON, INFORMATIONS_JSON, CLAN_STATE_JSON, PENDING_CHOICES_JSON):
+    for path in (TICKETS_JSON, INFORMATIONS_JSON, CLAN_STATE_JSON, PENDING_CHOICES_JSON,
+                 PROGRESS_JSON, PENDING_REWARDS_JSON):
         backup_path = backup(path)
         if backup_path:
             print(f"  {os.path.basename(path)} -> {os.path.basename(backup_path)}")

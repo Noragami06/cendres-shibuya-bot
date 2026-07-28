@@ -5,4 +5,5 @@ data/tickets.json
 data/transcripts/
 data/bot.db
 data/*.bak
+data/*.json.bak
 temp/
