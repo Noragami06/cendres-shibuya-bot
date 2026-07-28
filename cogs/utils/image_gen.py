@@ -173,6 +173,53 @@ def make_output_path(prefix: str = "img") -> str:
     return os.path.join(OUTPUT_DIR, f"{prefix}_{uuid.uuid4().hex}.png")
 
 
+def _draw_reward_panel(draw, x, header, option, font_head, font_name, font_qty):
+    _draw_panel(draw, x, PANEL_Y)
+    cx = x + PANEL_W // 2
+
+    draw.text((cx - _text_width(draw, header, font_head) // 2, PANEL_Y + 26), header, font=font_head, fill=GOLD)
+    draw.line(
+        [x + PADDING, PANEL_Y + 58, x + PANEL_W - PADDING, PANEL_Y + 58],
+        fill=PANEL_BORDER, width=1,
+    )
+
+    # Cadre doré autour de la récompense
+    box_top = PANEL_Y + 140
+    box_bottom = box_top + 100
+    draw.rounded_rectangle(
+        [x + PADDING, box_top, x + PANEL_W - PADDING, box_bottom],
+        radius=8, outline=GOLD_BORDER, width=1,
+    )
+
+    name = option["name"]
+    qty = option.get("qty", "")
+    draw.text((cx - _text_width(draw, name, font_name) // 2, box_top + 24), name, font=font_name, fill=GOLD)
+    if qty:
+        draw.text((cx - _text_width(draw, qty, font_qty) // 2, box_top + 60), qty, font=font_qty, fill=SPELL_DIM)
+
+
+def generate_recompense_image(option_a, option_b, output_path):
+    """Image du choix de récompense (deux options côte à côte, même style que le reste).
+
+    option_a / option_b : dicts contenant au moins {"name": str, "qty": str}
+    """
+    image = Image.new("RGB", (CANVAS_W, CANVAS_H), BG)
+    draw = ImageDraw.Draw(image)
+
+    font_head = _load_font(SERIF_BOLD, 18)
+    font_name = _load_font(SERIF_BOLD, 19)
+    font_qty = _load_font(SERIF_REGULAR, 15)
+
+    _draw_reward_panel(draw, LEFT_X, "Récompense A", option_a, font_head, font_name, font_qty)
+    _draw_reward_panel(draw, RIGHT_X, "Récompense B", option_b, font_head, font_name, font_qty)
+
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    image.save(output_path, "PNG")
+    return output_path
+
+
 def _format_number(n: int) -> str:
     return f"{n:,}".replace(",", " ")
 

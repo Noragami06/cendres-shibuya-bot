@@ -7,7 +7,12 @@ import os
 import random
 
 from cogs.utils import database as db
-from cogs.utils.image_gen import generate_clan_sort_image, generate_reserve_image, make_output_path
+from cogs.utils.image_gen import (
+    generate_clan_sort_image,
+    generate_reserve_image,
+    generate_recompense_image,
+    make_output_path,
+)
 
 # ---------- IDs ----------
 DEPART_ROLE_ID = 1521961072334999663  # Rôle requis pour utiliser /départ
@@ -114,6 +119,106 @@ def update_progress(user_id: int, **fields):
     entry = data.setdefault(str(user_id), {})
     entry.update(fields)
     save_progress(data)
+
+
+def get_progress(user_id: int) -> dict:
+    return load_progress().get(str(user_id), {})
+
+
+def add_progress_item(user_id: int, name: str):
+    """Ajoute un objet obtenu à la liste 'items' de l'utilisateur (future fiche/inventaire)."""
+    data = load_progress()
+    entry = data.setdefault(str(user_id), {})
+    entry.setdefault("items", []).append(name)
+    save_progress(data)
+
+
+def add_progress_pending_reroll(user_id: int, key: str):
+    """Mémorise un reroll gagné mais pas encore applicable (territoire/RCT)."""
+    data = load_progress()
+    entry = data.setdefault(str(user_id), {})
+    entry.setdefault("pending_rerolls", []).append(key)
+    save_progress(data)
+
+
+# ---------- Récompenses ----------
+REWARD_TABLE = [
+    {"key": "argent", "label": "Argent", "pct": 20.75, "category": "currency"},
+    {"key": "xp", "label": "XP", "pct": 15.56, "category": "currency"},
+    {"key": "reroll_clan", "label": "Reroll Clan", "pct": 11.41, "category": "reroll"},
+    {"key": "reroll_sort", "label": "Reroll Sort", "pct": 9.34, "category": "reroll"},
+    {"key": "reroll_energie_qte", "label": "Reroll Quantité d'énergie", "pct": 7.78, "category": "reroll"},
+    {"key": "reroll_energie_nature", "label": "Reroll Nature d'énergie", "pct": 6.74, "category": "reroll"},
+    {"key": "reroll_territoire", "label": "Reroll Territoire", "pct": 5.71, "category": "reroll_todo"},
+    {"key": "reroll_rct", "label": "Reroll RCT", "pct": 4.67, "category": "reroll_todo"},
+    {"key": "relique_4", "label": "Relique de classe 4", "pct": 3.94, "category": "item"},
+    {"key": "relique_3", "label": "Relique de classe 3", "pct": 3.32, "category": "item"},
+    {"key": "relique_2", "label": "Relique de classe 2", "pct": 2.70, "category": "item"},
+    {"key": "arme_4", "label": "Arme de classe 4", "pct": 2.18, "category": "item"},
+    {"key": "arme_3", "label": "Arme de classe 3", "pct": 1.76, "category": "item"},
+    {"key": "arme_2", "label": "Arme de classe 2", "pct": 1.35, "category": "item"},
+    {"key": "arme_1", "label": "Arme de classe 1", "pct": 1.04, "category": "item"},
+    {"key": "relique_1", "label": "Relique de classe 1", "pct": 0.78, "category": "item"},
+    {"key": "arme_s", "label": "Arme de classe S", "pct": 0.57, "category": "item"},
+    {"key": "relique_s", "label": "Relique de classe S", "pct": 0.40, "category": "item"},
+]
+
+ARGENT_MIN, ARGENT_MAX = 10000, 100000
+XP_MIN, XP_MAX = 1000, 10000
+
+
+def resolve_reward(reward_def: dict) -> dict:
+    """Retourne un dict complet {key, name, qty, amount} prêt à afficher ET à appliquer."""
+    if reward_def["key"] == "argent":
+        amount = random.randint(ARGENT_MIN, ARGENT_MAX)
+        return {"key": "argent", "name": "Argent", "qty": f"{amount:,} yens".replace(",", " "), "amount": amount}
+    if reward_def["key"] == "xp":
+        amount = random.randint(XP_MIN, XP_MAX)
+        return {"key": "xp", "name": "XP", "qty": f"{amount} XP", "amount": amount}
+    return {"key": reward_def["key"], "name": reward_def["label"], "qty": "x1", "amount": None}
+
+
+def pick_two_distinct_rewards():
+    """Tire deux récompenses différentes selon les poids de REWARD_TABLE."""
+    keys = [r["key"] for r in REWARD_TABLE]
+    weights = [r["pct"] for r in REWARD_TABLE]
+    first_key = random.choices(keys, weights=weights, k=1)[0]
+    remaining = [(k, w) for k, w in zip(keys, weights) if k != first_key]
+    second_key = random.choices([k for k, w in remaining], weights=[w for k, w in remaining], k=1)[0]
+    first_def = next(r for r in REWARD_TABLE if r["key"] == first_key)
+    second_def = next(r for r in REWARD_TABLE if r["key"] == second_key)
+    return resolve_reward(first_def), resolve_reward(second_def)
+
+
+# ---------- Choix de récompense en attente (fichier JSON dédié) ----------
+PENDING_REWARDS_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "depart_pending_rewards.json")
+
+
+def load_pending_rewards() -> dict:
+    if not os.path.exists(PENDING_REWARDS_FILE):
+        os.makedirs(os.path.dirname(PENDING_REWARDS_FILE), exist_ok=True)
+        with open(PENDING_REWARDS_FILE, "w", encoding="utf-8") as f:
+            json.dump({}, f, indent=4, ensure_ascii=False)
+        return {}
+    with open(PENDING_REWARDS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_pending_rewards(data: dict):
+    with open(PENDING_REWARDS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+
+def store_pending_rewards(user_id: int, option_a: dict, option_b: dict):
+    data = load_pending_rewards()
+    data[str(user_id)] = {"option_a": option_a, "option_b": option_b}
+    save_pending_rewards(data)
+
+
+def clear_pending_reward(user_id: int):
+    data = load_pending_rewards()
+    data.pop(str(user_id), None)
+    save_pending_rewards(data)
 
 
 # La persistance passe désormais par SQLite (tables clan_roll_state / clan_roll_meta
@@ -527,11 +632,40 @@ async def roll_and_send_reserve(source, member: discord.Member, guild: discord.G
 
     nature = weighted_choice(EO_NATURE_TABLE) if with_nature else None
 
-    # Classement réel de la classe tirée : personnages déjà validés dans cette classe
-    # + le joueur actuel (qui n'est pas encore en base).
+    # 1er message : l'image de réserve (classement + nature si applicable).
+    await render_and_send_reserve_image(channel, member, eo_classe, value, nature, with_nature)
+
+    # 2e message (uniquement avec nature) : la nature obtenue.
+    if with_nature:
+        await channel.send(embed=build_nature_embed(member, nature))
+
+        # 3e message : bouton "Continuer" vers l'étape récompense (persistant).
+        await channel.send(
+            embed=discord.Embed(
+                description="Clique pour continuer ton parcours.", color=discord.Color.blurple()
+            ),
+            view=RewardContinueView(),
+        )
+
+    update_progress(member.id, eo_classe=eo_classe, eo_value=value, nature=nature)
+
+
+def build_nature_embed(member: discord.Member, nature: str) -> discord.Embed:
+    return discord.Embed(
+        title="🔮 Nature de l'énergie occulte",
+        description=f"{member.mention} possède une **{NATURE_DISPLAY_NAMES[nature]}** !",
+        color=discord.Color.purple(),
+    )
+
+
+async def render_and_send_reserve_image(channel, member, eo_classe, value, nature, with_nature):
+    """Génère et envoie l'image de réserve pour des valeurs déjà déterminées (réutilisé aux rerolls)."""
+    info = EO_CLASS_TABLE[eo_classe]
+
+    # Classement réel de la classe : personnages déjà validés + le joueur actuel (pas encore en base).
     # TODO: l'insertion dans validated_characters se fera uniquement à l'étape de validation
     # de la fiche par le staff (point 7 du parcours, pas encore développée). Tant que la table
-    # est vide, chaque joueur qui teste se retrouve donc seul en 1ère position, ce qui est normal.
+    # est vide, chaque joueur qui teste se retrouve seul en 1ère position, ce qui est normal.
     with db.get_connection() as conn:
         validated = conn.execute(
             "SELECT display_name, eo_value FROM validated_characters WHERE eo_classe = ? ORDER BY eo_value DESC",
@@ -540,15 +674,10 @@ async def roll_and_send_reserve(source, member: discord.Member, guild: discord.G
 
     merged = [(member.display_name, value, True)]
     merged += [(row["display_name"], row["eo_value"], False) for row in validated]
-    merged.sort(key=lambda entry: entry[1], reverse=True)  # valeur décroissante
+    merged.sort(key=lambda entry: entry[1], reverse=True)
+    ranking = [(rank, name, val, hit) for rank, (name, val, hit) in enumerate(merged[:4], start=1)]
 
-    # Rangs 1,2,3... ; is_hit uniquement sur le joueur qui vient de tirer ; 4 lignes max affichées.
-    ranking = [
-        (rank, name, val, is_hit)
-        for rank, (name, val, is_hit) in enumerate(merged[:4], start=1)
-    ]
-
-    if with_nature:
+    if with_nature and nature is not None:
         energy_table = [
             (NATURE_DISPLAY_NAMES[key], f"{pct}%", key == nature)
             for key, pct in EO_NATURE_TABLE.items()
@@ -560,26 +689,302 @@ async def roll_and_send_reserve(source, member: discord.Member, guild: discord.G
     path = make_output_path("reserve")
     generate_reserve_image(classe_display, value, info["min"], info["max"], ranking, energy_table, path)
 
-    # 1er message : l'image seule, sans embed.
     await channel.send(file=discord.File(path, filename="reserve.png"))
     try:
         os.remove(path)
     except OSError:
         pass
 
-    # 2e message (uniquement avec nature) : la nature obtenue.
-    if with_nature:
-        embed = discord.Embed(
-            title="🔮 Nature de l'énergie occulte",
-            description=f"{member.mention} possède une **{NATURE_DISPLAY_NAMES[nature]}** !",
-            color=discord.Color.purple(),
-        )
-        await channel.send(embed=embed)
 
-    update_progress(member.id, eo_classe=eo_classe, eo_value=value, nature=nature)
+# ---------- Récompenses : rendu & application ----------
+def build_result_spell_data(state, clan_key, sort_key, path, guild):
+    """Reconstruit le spell_data d'un résultat clan/sort déjà déterminé (pour régénérer un pillow)."""
+    if clan_key == "sans_clan":
+        return build_hybride_spell_data(False) if path == "hybride_exorciste" else build_sans_clan_spell_data()
+
+    info = state["clans"][clan_key]
+    if path == "hybride_exorciste":
+        return build_hybride_spell_data(info["partial_heredit"])
+
+    heredit_taken = is_heredit_taken(guild, info["role_id"])
+    base_table = dict(SPELL_TABLE_PARTIAL if info["partial_heredit"] else SPELL_TABLE_BASE)
+    final_table = redistribute_pct(base_table, "sort_heredit") if heredit_taken else dict(base_table)
+    label = "Sort héréditaire (complet)" if sort_key == "sort_heredit" else SORT_LABELS.get(sort_key, "Sort inné")
+    return build_spell_image_data(base_table, final_table, sort_key, label)
+
+
+async def send_clan_sort_pillow(channel, state, clan_key, spell_data):
+    clan_data = build_clan_image_data(state, clan_key)
+    path = generate_clan_sort_image(clan_data, spell_data)
+    await channel.send(file=discord.File(path, filename="clan_sort.png"))
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _reward_embed(text: str) -> discord.Embed:
+    return discord.Embed(description=text, color=discord.Color.gold())
+
+
+async def apply_reward(interaction: discord.Interaction, reward: dict):
+    """Applique l'effet de la récompense choisie selon reward['key']."""
+    member = interaction.user
+    channel = interaction.channel
+    uid = member.id
+    key = reward["key"]
+    progress = get_progress(uid)
+
+    if key in ("argent", "xp"):
+        # TODO: intégrer réellement ce montant dans le futur système économique/XP une fois développé.
+        await channel.send(embed=_reward_embed(f"{member.mention} a choisi **{reward['qty']}** !"))
+        return
+
+    if key == "reroll_clan":
+        await reward_reroll_clan(interaction, progress)
+        return
+    if key == "reroll_sort":
+        await reward_reroll_sort(interaction, progress)
+        return
+    if key == "reroll_energie_qte":
+        await reward_reroll_energie_qte(interaction, progress)
+        return
+    if key == "reroll_energie_nature":
+        await reward_reroll_energie_nature(interaction, progress)
+        return
+
+    if key in ("reroll_territoire", "reroll_rct"):
+        # TODO: aucun effet pour l'instant, les étapes Territoire et RCT ne sont pas encore
+        # développées ; cette récompense sera appliquée plus tard (manuellement ou automatiquement
+        # une fois ces étapes codées).
+        add_progress_pending_reroll(uid, key)
+        await channel.send(embed=_reward_embed(
+            f"{member.mention} a obtenu **{reward['name']}**. Elle est enregistrée et sera appliquée "
+            "quand cette étape sera disponible."
+        ))
+        return
+
+    # Objets (relique_X / arme_X)
+    # TODO: pas de système d'inventaire pour l'instant, juste enregistré pour la future fiche.
+    add_progress_item(uid, reward["name"])
+    await channel.send(embed=_reward_embed(f"{member.mention} a obtenu : **{reward['name']}** !"))
+
+
+async def reward_reroll_clan(interaction, progress):
+    member = interaction.user
+    guild = interaction.guild
+    channel = interaction.channel
+    uid = member.id
+    path = progress.get("path")
+    sort_key = progress.get("sort")
+    old_clan = progress.get("clan")
+
+    state = load_clan_state()
+
+    remove_roles = []
+    if old_clan and old_clan != "sans_clan":
+        old_info = state["clans"].get(old_clan)
+        if old_info:
+            r = guild.get_role(old_info["role_id"])
+            if r:
+                remove_roles.append(r)
+
+    # Nouveau tirage de clan, identique au parcours normal.
+    pool = {"sans_clan": state["sans_clan_pct"]}
+    for clan_key, inf in state["clans"].items():
+        if not inf["closed"]:
+            pool[clan_key] = inf["current_pct"]
+    new_clan = weighted_choice(pool)
+
+    if new_clan == "sans_clan":
+        marker = guild.get_role(CLAN_MEMBER_ROLE_ID)
+        if marker and marker in member.roles:
+            remove_roles.append(marker)
+        if remove_roles:
+            try:
+                await member.remove_roles(*remove_roles)
+            except discord.Forbidden:
+                pass
+    else:
+        if remove_roles:
+            try:
+                await member.remove_roles(*remove_roles)
+            except discord.Forbidden:
+                pass
+        new_info = state["clans"][new_clan]
+        extra = [MEMBRES_PRINCIPAUX_ROLE_ID] if path == "hybride_exorciste" else None
+        await assign_clan_roles(interaction, new_info["role_id"], extra_role_ids=extra)
+        update_clan_state_after_join(guild, new_clan)
+
+    update_progress(uid, clan=new_clan)
+    # TODO: cas limite si le nouveau clan ne permet pas le sort déjà obtenu (ex: sort héréditaire
+    # partiel sur un clan qui ne le propose pas), à vérifier manuellement pour l'instant.
+
+    state = load_clan_state()
+    spell_data = build_result_spell_data(state, new_clan, sort_key, path, guild)
+    await send_clan_sort_pillow(channel, state, new_clan, spell_data)
+
+    label = "Sans clan" if new_clan == "sans_clan" else new_clan.capitalize()
+    await channel.send(embed=_reward_embed(f"{member.mention} a rerollé son clan : **{label}** !"))
+
+
+async def reward_reroll_sort(interaction, progress):
+    member = interaction.user
+    guild = interaction.guild
+    channel = interaction.channel
+    uid = member.id
+    path = progress.get("path")
+
+    if path == "hybride_exorciste":
+        # TODO: ce reroll n'a aucun effet pour un hybride chez les exorcistes puisqu'il est
+        # toujours forcé à Sort inné, à gérer/exclure plus tard si besoin.
+        await channel.send(embed=_reward_embed(
+            f"{member.mention} est un hybride élevé chez les exorcistes : son sort reste **Sort inné**, "
+            "ce reroll n'a aucun effet."
+        ))
+        return
+
+    clan_key = progress.get("clan")
+    state = load_clan_state()
+    if not clan_key or clan_key == "sans_clan":
+        await channel.send(embed=_reward_embed(
+            f"{member.mention} n'a aucun clan : il n'y a pas de sort à reroll."
+        ))
+        return
+
+    info = state["clans"][clan_key]
+    heredit_taken = is_heredit_taken(guild, info["role_id"])
+    base_table = dict(SPELL_TABLE_PARTIAL if info["partial_heredit"] else SPELL_TABLE_BASE)
+    final_table = redistribute_pct(base_table, "sort_heredit") if heredit_taken else dict(base_table)
+    new_sort = weighted_choice(final_table)
+
+    # TODO: si new_sort == "sort_heredit", la validation accepter/refuser héritier n'est pas
+    # re-déclenchée ici ; le reroll attribue directement le sort héréditaire complet (rôle Héritier).
+    if new_sort == "sort_heredit":
+        await assign_clan_roles(interaction, info["role_id"], heir=True)
+        label = "Sort héréditaire (complet)"
+    else:
+        label = SORT_LABELS[new_sort]
+
+    update_progress(uid, sort=new_sort)
+
+    spell_data = build_spell_image_data(base_table, final_table, new_sort, label)
+    await send_clan_sort_pillow(channel, state, clan_key, spell_data)
+    await channel.send(embed=_reward_embed(f"{member.mention} a rerollé son sort : **{label}** !"))
+
+
+async def reward_reroll_energie_qte(interaction, progress):
+    member = interaction.user
+    channel = interaction.channel
+    uid = member.id
+
+    class_pool = {k: v["pct"] for k, v in EO_CLASS_TABLE.items()}
+    eo_classe = weighted_choice(class_pool)
+    value = random.randint(EO_CLASS_TABLE[eo_classe]["min"], EO_CLASS_TABLE[eo_classe]["max"])
+    nature = progress.get("nature")  # nature inchangée
+
+    update_progress(uid, eo_classe=eo_classe, eo_value=value)
+    await render_and_send_reserve_image(channel, member, eo_classe, value, nature, nature is not None)
+    await channel.send(embed=_reward_embed(f"{member.mention} a rerollé sa quantité d'énergie occulte !"))
+
+
+async def reward_reroll_energie_nature(interaction, progress):
+    member = interaction.user
+    channel = interaction.channel
+    new_nature = weighted_choice(EO_NATURE_TABLE)
+    update_progress(member.id, nature=new_nature)
+    await channel.send(embed=build_nature_embed(member, new_nature))
 
 
 # ---------- Vues ----------
+class RewardContinueView(discord.ui.View):
+    """Bouton "Continuer" affiché après l'étape nature, qui déclenche l'étape récompense
+    (exorciste / hybride-exorciste) ou un message temporaire (livré à soi même)."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Continuer", emoji="➡️", style=discord.ButtonStyle.success, custom_id="depart_continuer_recompense")
+    async def continuer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        progress = get_progress(interaction.user.id)
+        path = progress.get("path")
+
+        if path in ("exorciste", "hybride_exorciste"):
+            option_a, option_b = pick_two_distinct_rewards()
+            store_pending_rewards(interaction.user.id, option_a, option_b)
+
+            img = make_output_path("recompense")
+            generate_recompense_image(option_a, option_b, img)
+            await interaction.channel.send(file=discord.File(img, filename="recompense.png"))
+            try:
+                os.remove(img)
+            except OSError:
+                pass
+
+            embed = discord.Embed(
+                title="🎁 Choix de récompense",
+                description=(
+                    "Il est temps de faire un choix. Deux récompenses s'offrent à toi, mais tu ne "
+                    "peux en garder qu'une seule. Prends le temps de bien réfléchir avant de cliquer, "
+                    "ce choix est définitif une fois validé."
+                ),
+                color=discord.Color.gold(),
+            )
+            await interaction.channel.send(embed=embed, view=RewardChoiceView(interaction.user.id))
+
+        elif path == "hybride_seul":
+            # TODO: système de récompense propre à Livré à soi même, pas encore défini
+            await interaction.channel.send("La suite arrive dans une prochaine étape.")
+        else:
+            await interaction.channel.send("La suite arrive dans une prochaine étape.")
+
+
+class RewardChoiceView(discord.ui.View):
+    """Deux boutons Récompense A / B, réservés au joueur concerné (custom_id suffixé de son id)."""
+
+    def __init__(self, user_id: int):
+        super().__init__(timeout=None)
+        self.user_id = user_id
+        self.reward_a.custom_id = f"depart_reward_a:{user_id}"
+        self.reward_b.custom_id = f"depart_reward_b:{user_id}"
+
+    async def _check_owner(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Ce choix ne t'appartient pas.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Récompense A", style=discord.ButtonStyle.primary)
+    async def reward_a(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_owner(interaction):
+            return
+        await handle_reward_choice(interaction, "option_a")
+
+    @discord.ui.button(label="Récompense B", style=discord.ButtonStyle.primary)
+    async def reward_b(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_owner(interaction):
+            return
+        await handle_reward_choice(interaction, "option_b")
+
+
+async def handle_reward_choice(interaction: discord.Interaction, which: str):
+    uid = interaction.user.id
+    pending = load_pending_rewards().get(str(uid))
+    if not pending or which not in pending:
+        await interaction.response.send_message(
+            "Cette récompense n'est plus disponible (déjà utilisée).", ephemeral=True
+        )
+        return
+
+    reward = pending[which]
+
+    # Retire les boutons du message de choix (plus rien de cliquable), applique, puis purge.
+    await interaction.response.edit_message(view=None)
+    await apply_reward(interaction, reward)
+    clear_pending_reward(uid)
+
+
 class ContinueEnergyView(discord.ui.View):
     """Bouton "Continuer" affiché après le tirage clan/sort (exorciste ou hybride-exorciste),
     qui déclenche l'étape réserve + nature."""
@@ -592,8 +997,6 @@ class ContinueEnergyView(discord.ui.View):
         await roll_and_send_reserve(interaction, interaction.user, interaction.guild, with_nature=True)
 
 
-class HeirView(discord.ui.View):
-    """Accepter / refuser de devenir l'héritier du clan. Réservé au joueur qui a tiré le sort."""
 class HeirView(discord.ui.View):
     """Accepter / refuser de devenir l'héritier du clan. Réservé au joueur qui a tiré le sort."""
 
@@ -626,7 +1029,7 @@ class HeirView(discord.ui.View):
             return
 
         update_clan_state_after_join(interaction.guild, self.clan_key)
-        update_progress(interaction.user.id, camp="exorciste", clan=self.clan_key, sort="sort_heredit")
+        update_progress(interaction.user.id, camp="exorciste", path="exorciste", clan=self.clan_key, sort="sort_heredit")
 
         await send_roll_result(
             interaction,
@@ -657,7 +1060,7 @@ class HeirView(discord.ui.View):
         # TODO: attribution du grade (Membres principaux/secondaires) à définir plus tard avec l'utilisateur
 
         update_clan_state_after_join(interaction.guild, self.clan_key)
-        update_progress(interaction.user.id, camp="exorciste", clan=self.clan_key, sort=new_sort)
+        update_progress(interaction.user.id, camp="exorciste", path="exorciste", clan=self.clan_key, sort=new_sort)
 
         await send_roll_result(
             interaction,
@@ -701,7 +1104,7 @@ class ClanRollView(discord.ui.View):
         # ----- Cas "Sans clan" -----
         if result_key == "sans_clan":
             # Aucun rôle attribué, aucun sort réel, aucune section de grades.
-            update_progress(interaction.user.id, camp="exorciste", clan="sans_clan", sort=None)
+            update_progress(interaction.user.id, camp="exorciste", path="exorciste", clan="sans_clan", sort=None)
             await send_roll_result(interaction, state, "sans_clan", None, "Aucun", {}, {})
             return
 
@@ -738,7 +1141,7 @@ class ClanRollView(discord.ui.View):
         # TODO: attribution du grade (Membres principaux/secondaires) à définir plus tard avec l'utilisateur
 
         update_clan_state_after_join(guild, result_key)
-        update_progress(interaction.user.id, camp="exorciste", clan=result_key, sort=sort_key)
+        update_progress(interaction.user.id, camp="exorciste", path="exorciste", clan=result_key, sort=sort_key)
 
         await send_roll_result(
             interaction, state, result_key, sort_key, SORT_LABELS[sort_key], base_table, final_table
@@ -769,7 +1172,7 @@ class ClanRollHybrideView(discord.ui.View):
 
         # d) Sans clan : aucun rôle attribué (ni clan, ni marqueur de clan).
         if result_key == "sans_clan":
-            update_progress(interaction.user.id, camp="hybride", clan="sans_clan", sort="sort_inne")
+            update_progress(interaction.user.id, camp="hybride", path="hybride_exorciste", clan="sans_clan", sort="sort_inne")
             spell_data = build_hybride_spell_data(partial_heredit=False)
             await send_roll_result(
                 interaction, state, "sans_clan", None, "Sort inné", {}, {}, spell_data_override=spell_data
@@ -785,7 +1188,7 @@ class ClanRollHybrideView(discord.ui.View):
 
         # L'hybride occupe une vraie place du clan : mêmes règles de fermeture/réouverture.
         update_clan_state_after_join(guild, result_key)
-        update_progress(interaction.user.id, camp="hybride", clan=result_key, sort="sort_inne")
+        update_progress(interaction.user.id, camp="hybride", path="hybride_exorciste", clan=result_key, sort="sort_inne")
 
         # b/e) Sort toujours "Sort inné", table verrouillée pour l'affichage.
         spell_data = build_hybride_spell_data(info["partial_heredit"])
@@ -1032,13 +1435,13 @@ class EducationView(discord.ui.View):
     @discord.ui.button(label="Chez les fléaux", emoji="👹", style=discord.ButtonStyle.danger, custom_id="depart_hybride_fleaux")
     async def fleaux(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Voie "fléaux" : pas de clan, réserve d'énergie occulte SANS nature, déclenchée directement.
-        update_progress(interaction.user.id, camp="hybride")
+        update_progress(interaction.user.id, camp="hybride", path="hybride_fleaux")
         await roll_and_send_reserve(interaction, interaction.user, interaction.guild, with_nature=False)
 
     @discord.ui.button(label="Livré à soi même", emoji="🌪️", style=discord.ButtonStyle.secondary, custom_id="depart_hybride_seul")
     async def livre(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Voie "livré à soi même" : réserve d'énergie occulte AVEC nature, déclenchée directement.
-        update_progress(interaction.user.id, camp="hybride")
+        update_progress(interaction.user.id, camp="hybride", path="hybride_seul")
         await roll_and_send_reserve(interaction, interaction.user, interaction.guild, with_nature=True)
 
 
@@ -1127,6 +1530,7 @@ class Depart(commands.Cog):
         self.bot.add_view(ClanRollView())
         self.bot.add_view(ClanRollHybrideView())
         self.bot.add_view(ContinueEnergyView())
+        self.bot.add_view(RewardContinueView())
         self.bot.add_view(DMClanQuestionView())
         self.bot.add_view(DMClanSelectView())
         # Enregistrée avec les 4 boutons pour couvrir tous les custom_id après redémarrage,
