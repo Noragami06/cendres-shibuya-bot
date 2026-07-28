@@ -1,10 +1,11 @@
 {
     "396615332346855428": {
-        "camp": "hybride",
-        "clan": "geto",
-        "sort": "sort_inne",
-        "eo_classe": "classe_4",
-        "eo_value": 424,
-        "nature": "sans_nature"
+        "camp": "exorciste",
+        "clan": "gojo",
+        "sort": "sort_heredit",
+        "eo_classe": "classe_2",
+        "eo_value": 73647,
+        "nature": "brute",
+        "path": "exorciste"
     }
 }

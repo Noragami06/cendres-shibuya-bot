@@ -5,14 +5,41 @@ import asyncio
 import json
 import os
 import random
+import uuid
 
 from cogs.utils import database as db
 from cogs.utils.image_gen import (
     generate_clan_sort_image,
     generate_reserve_image,
     generate_recompense_image,
-    make_output_path,
 )
+
+
+# ---------- Chemins temporaires des images générées ----------
+IMAGE_TEMP_DIR = os.path.join(os.path.dirname(__file__), "..", "temp", "depart_images")
+
+
+def _tmp_image_path(prefix: str) -> str:
+    """Chemin PNG temporaire unique (remplace l'ancien make_output_path retiré de image_gen)."""
+    os.makedirs(IMAGE_TEMP_DIR, exist_ok=True)
+    return os.path.join(IMAGE_TEMP_DIR, f"{prefix}_{uuid.uuid4().hex}.png")
+
+
+def _render_clan_sort_image(clan_data: dict, spell_data: dict) -> str:
+    """Adapte les structures internes (clan_data/spell_data) à la signature positionnelle de
+    generate_clan_sort_image, et retourne le chemin du PNG généré. Aucune logique de dessin ici :
+    tout le rendu vient de cogs.utils.image_gen."""
+    clans_table = [
+        (row["label"], f"{row['pct']}%", row["selected"])
+        for row in clan_data["rows"]
+    ]
+    spells_table = [
+        (row["label"], f"{row['pct']}%", row["selected"], row.get("unavailable", False))
+        for row in spell_data["rows"]
+    ]
+    out_path = _tmp_image_path("clan_sort")
+    generate_clan_sort_image(clan_data["title"], clans_table, spell_data["result"], spells_table, out_path)
+    return out_path
 
 # ---------- IDs ----------
 DEPART_ROLE_ID = 1521961072334999663  # Rôle requis pour utiliser /départ
@@ -597,7 +624,7 @@ async def send_roll_result(
         spell_data = spell_data_override or build_spell_image_data(base_table, final_table, sort_key, result_label)
         grades_text = build_grades_text(interaction.guild, state["clans"][result_key]["role_id"])
 
-    path = generate_clan_sort_image(clan_data, spell_data)
+    path = _render_clan_sort_image(clan_data, spell_data)
 
     # 1er message : l'image seule, en pièce jointe, sans embed autour.
     await interaction.followup.send(file=discord.File(path, filename="clan_sort.png"))
@@ -686,7 +713,7 @@ async def render_and_send_reserve_image(channel, member, eo_classe, value, natur
         energy_table = []
 
     classe_display = eo_classe.replace("classe_", "").upper()  # "classe_4" -> "4", "classe_s" -> "S"
-    path = make_output_path("reserve")
+    path = _tmp_image_path("reserve")
     generate_reserve_image(classe_display, value, info["min"], info["max"], ranking, energy_table, path)
 
     await channel.send(file=discord.File(path, filename="reserve.png"))
@@ -715,7 +742,7 @@ def build_result_spell_data(state, clan_key, sort_key, path, guild):
 
 async def send_clan_sort_pillow(channel, state, clan_key, spell_data):
     clan_data = build_clan_image_data(state, clan_key)
-    path = generate_clan_sort_image(clan_data, spell_data)
+    path = _render_clan_sort_image(clan_data, spell_data)
     await channel.send(file=discord.File(path, filename="clan_sort.png"))
     try:
         os.remove(path)
@@ -914,7 +941,7 @@ class RewardContinueView(discord.ui.View):
             option_a, option_b = pick_two_distinct_rewards()
             store_pending_rewards(interaction.user.id, option_a, option_b)
 
-            img = make_output_path("recompense")
+            img = _tmp_image_path("recompense")
             generate_recompense_image(option_a, option_b, img)
             await interaction.channel.send(file=discord.File(img, filename="recompense.png"))
             try:

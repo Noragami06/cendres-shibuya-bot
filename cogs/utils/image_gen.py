@@ -1,315 +1,288 @@
-import os
-import uuid
-
 from PIL import Image, ImageDraw, ImageFont
+import os
 
-# ---------- Palette (modèle "sceau et registre") ----------
-BG = "#100c07"
-PANEL_BG = "#150f08"
-PANEL_BORDER = "#4a3a1e"
-GOLD = "#e8c579"
-GOLD_BORDER = "#b4872f"
-CLAN_DIM = "#7a6748"
-SPELL_DIM = "#a3915f"
-STRUCK = "#4a3a24"
-
-# ---------- Dimensions ----------
-CANVAS_W, CANVAS_H = 900, 420
-PANEL_W, PANEL_H = 320, 380
-PANEL_Y = (CANVAS_H - PANEL_H) // 2
-LEFT_X = 90
-RIGHT_X = CANVAS_W - PANEL_W - 90
-PADDING = 20
-RADIUS = 10
-
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "temp", "depart_images")
-
-# Polices candidates, de la plus fidèle au repli le plus large
-SERIF_REGULAR = [
-    r"C:\Windows\Fonts\georgia.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
-    "/System/Library/Fonts/Supplemental/Georgia.ttf",
-]
-SERIF_BOLD = [
-    r"C:\Windows\Fonts\georgiab.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
-    "/System/Library/Fonts/Supplemental/Georgia Bold.ttf",
-]
-
-
-def _load_font(candidates, size):
-    """Charge la première police disponible, sans jamais planter."""
+def _load_font(size, bold=False):
+    candidates = []
+    if bold:
+        candidates = [
+            "C:\\Windows\\Fonts\\georgiab.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+        ]
+    else:
+        candidates = [
+            "C:\\Windows\\Fonts\\georgia.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+        ]
     for path in candidates:
         if os.path.exists(path):
-            try:
-                return ImageFont.truetype(path, size)
-            except OSError:
-                continue
+            return ImageFont.truetype(path, size)
     try:
-        return ImageFont.load_default(size)
-    except TypeError:  # Pillow < 9.2 : load_default() ne prend pas de taille
+        return ImageFont.truetype("arial.ttf", size)
+    except Exception:
         return ImageFont.load_default()
 
+def font(size, bold=False):
+    return _load_font(size, bold)
 
-def _text_width(draw, text, font):
-    return draw.textbbox((0, 0), text, font=font)[2]
+def text_w(draw, text, f):
+    bbox = draw.textbbox((0, 0), text, font=f)
+    return bbox[2] - bbox[0]
 
-
-def _draw_panel(draw, x, y):
-    draw.rounded_rectangle(
-        [x, y, x + PANEL_W, y + PANEL_H],
-        radius=RADIUS,
-        fill=PANEL_BG,
-        outline=PANEL_BORDER,
-        width=1,
-    )
-
-
-def generate_clan_sort_image(clan_data: dict, spell_data: dict) -> str:
-    """Génère l'image du résultat de tirage et retourne le chemin du PNG.
-
-    clan_data  = {"title": str, "rows": [{"label": str, "pct": int, "selected": bool}, ...]}
-    spell_data = {"result": str,
-                  "rows": [{"label": str, "pct": int, "selected": bool, "unavailable": bool}, ...]}
-    """
-    image = Image.new("RGB", (CANVAS_W, CANVAS_H), BG)
-    draw = ImageDraw.Draw(image)
-
-    font_title = _load_font(SERIF_BOLD, 20)
-    font_row = _load_font(SERIF_REGULAR, 15)
-    font_row_bold = _load_font(SERIF_BOLD, 15)
-    font_result = _load_font(SERIF_BOLD, 17)
-
-    # ---------- Panneau GAUCHE : le clan ----------
-    _draw_panel(draw, LEFT_X, PANEL_Y)
-
-    title = clan_data["title"]
-    title_x = LEFT_X + (PANEL_W - _text_width(draw, title, font_title)) // 2
-    draw.text((title_x, PANEL_Y + PADDING), title, font=font_title, fill=GOLD)
-
-    # Filet de séparation sous le titre
-    line_y = PANEL_Y + PADDING + 34
-    draw.line(
-        [LEFT_X + PADDING, line_y, LEFT_X + PANEL_W - PADDING, line_y],
-        fill=PANEL_BORDER,
-        width=1,
-    )
-
-    row_y = line_y + 18
-    for row in clan_data["rows"]:
-        selected = row["selected"]
-        color = GOLD if selected else CLAN_DIM
-        font = font_row_bold if selected else font_row
-
-        pct_text = f"{row['pct']}%"
-        draw.text((LEFT_X + PADDING, row_y), row["label"], font=font, fill=color)
-        draw.text(
-            (LEFT_X + PANEL_W - PADDING - _text_width(draw, pct_text, font), row_y),
-            pct_text,
-            font=font,
-            fill=color,
-        )
-        row_y += 28
-
-    # ---------- Panneau DROIT : le sort ----------
-    _draw_panel(draw, RIGHT_X, PANEL_Y)
-
-    # Case du résultat, encadrée en doré
-    box_top = PANEL_Y + PADDING
-    box_bottom = box_top + 44
-    draw.rounded_rectangle(
-        [RIGHT_X + PADDING, box_top, RIGHT_X + PANEL_W - PADDING, box_bottom],
-        radius=6,
-        outline=GOLD_BORDER,
-        width=1,
-    )
-
-    result_text = f"Sort : {spell_data['result']}"
-    result_x = RIGHT_X + (PANEL_W - _text_width(draw, result_text, font_result)) // 2
-    draw.text((result_x, box_top + 12), result_text, font=font_result, fill=GOLD)
-
-    row_y = box_bottom + 24
-    for row in spell_data["rows"]:
-        unavailable = row.get("unavailable", False)
-        selected = row["selected"]
-
-        if unavailable:
-            color = STRUCK
-            font = font_row
-        elif selected:
-            color = GOLD
-            font = font_row_bold
+def wrap_text(draw, text, f, max_width):
+    words = text.split()
+    lines, cur = [], ""
+    for w in words:
+        trial = (cur + " " + w).strip()
+        if text_w(draw, trial, f) <= max_width:
+            cur = trial
         else:
-            color = SPELL_DIM
-            font = font_row
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
 
-        pct_text = f"{row['pct']}%"
-        label_x = RIGHT_X + PADDING
-        pct_x = RIGHT_X + PANEL_W - PADDING - _text_width(draw, pct_text, font)
+BG = (16, 12, 7, 255)
+PANEL_BG = (21, 15, 8, 255)
+PANEL_BORDER = (74, 58, 30, 255)
+BOX_BG = (28, 21, 11, 255)
+BOX_BORDER = (180, 135, 47, 255)
+GOLD = (232, 197, 121, 255)
+MUTED_LEFT = (122, 103, 72, 255)
+MUTED_RIGHT = (163, 145, 95, 255)
+STRIKE_COLOR = (74, 58, 36, 255)
 
-        draw.text((label_x, row_y), row["label"], font=font, fill=color)
-        draw.text((pct_x, row_y), pct_text, font=font, fill=color)
+def rounded_panel(draw, xy, radius, fill, outline, width=1):
+    draw.rounded_rectangle(xy, radius=radius, fill=fill, outline=outline, width=width)
 
-        # Option indisponible : trait barré par-dessus le texte
-        if unavailable:
-            strike_y = row_y + 9
-            draw.line(
-                [label_x, strike_y, RIGHT_X + PANEL_W - PADDING, strike_y],
-                fill=STRUCK,
-                width=1,
-            )
+def strike_through(draw, x1, y, x2, color, width=1):
+    draw.line([(x1, y), (x2, y)], fill=color, width=width)
 
+
+def generate_clan_sort_image(clan_result: str, clans_table: list, spell_result: str, spells_table: list, out_path: str):
+    W, H = 900, 420
+    img = Image.new("RGBA", (W, H), BG)
+    draw = ImageDraw.Draw(img)
+
+    f_title = font(22, bold=True)
+    f_row = font(15)
+    f_row_b = font(15, bold=True)
+    f_box = font(17)
+
+    left_x0, left_y0, left_x1, left_y1 = 40, 40, 380, 380
+    rounded_panel(draw, (left_x0, left_y0, left_x1, left_y1), radius=90, fill=PANEL_BG, outline=PANEL_BORDER, width=1)
+
+    title_w = text_w(draw, clan_result, f_title)
+    draw.text(((left_x0 + left_x1) / 2 - title_w / 2, left_y0 + 34), clan_result, font=f_title, fill=GOLD)
+
+    row_y = left_y0 + 90
+    row_x_left = left_x0 + 45
+    row_x_right = left_x1 - 45
+    for name, pct, is_hit in clans_table:
+        f_use = f_row_b if is_hit else f_row
+        color = GOLD if is_hit else MUTED_LEFT
+        draw.text((row_x_left, row_y), name, font=f_use, fill=color)
+        pct_w = text_w(draw, pct, f_use)
+        draw.text((row_x_right - pct_w, row_y), pct, font=f_use, fill=color)
         row_y += 30
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    path = os.path.join(OUTPUT_DIR, f"depart_{uuid.uuid4().hex}.png")
-    image.save(path, "PNG")
-    return path
+    right_x0, right_y0, right_x1, right_y1 = 420, 40, 860, 380
+    rounded_panel(draw, (right_x0, right_y0, right_x1, right_y1), radius=14, fill=PANEL_BG, outline=PANEL_BORDER, width=1)
+
+    box_x0, box_y0, box_x1, box_y1 = right_x0 + 20, right_y0 + 20, right_x1 - 20, right_y0 + 74
+    rounded_panel(draw, (box_x0, box_y0, box_x1, box_y1), radius=10, fill=BOX_BG, outline=BOX_BORDER, width=1)
+    box_text = f"Sort : {spell_result}"
+    box_text_w = text_w(draw, box_text, f_box)
+    draw.text(((box_x0 + box_x1) / 2 - box_text_w / 2, (box_y0 + box_y1) / 2 - 10), box_text, font=f_box, fill=GOLD)
+
+    srow_y = box_y1 + 26
+    srow_x_left = right_x0 + 24
+    srow_x_right = right_x1 - 24
+    for name, pct, is_hit, is_strike in spells_table:
+        if is_strike:
+            f_use = f_row
+            color = STRIKE_COLOR
+        elif is_hit:
+            f_use = f_row_b
+            color = GOLD
+        else:
+            f_use = f_row
+            color = MUTED_RIGHT
+        draw.text((srow_x_left, srow_y), name, font=f_use, fill=color)
+        pct_w = text_w(draw, pct, f_use)
+        draw.text((srow_x_right - pct_w, srow_y), pct, font=f_use, fill=color)
+        if is_strike:
+            name_w = text_w(draw, name, f_use)
+            strike_through(draw, srow_x_left, srow_y + 10, srow_x_left + name_w, color)
+            strike_through(draw, srow_x_right - pct_w, srow_y + 10, srow_x_right, color)
+        srow_y += 32
+
+    img.save(out_path)
+    return out_path
 
 
-def make_output_path(prefix: str = "img") -> str:
-    """Retourne un chemin PNG unique dans le dossier temporaire des images."""
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    return os.path.join(OUTPUT_DIR, f"{prefix}_{uuid.uuid4().hex}.png")
+def generate_recompense_image(option_a: dict, option_b: dict, out_path: str):
+    CARD_BORDER = (180, 135, 47, 255)
+    CARD_INNER_BORDER = (107, 78, 30, 255)
+    FRAME_BG = (36, 26, 16, 255)
+    NAME_COLOR = (240, 224, 184, 255)
+    QTY_COLOR = (180, 135, 47, 255)
+    CARD_BG_TOP = (28, 21, 11, 255)
+    CARD_BG_BOTTOM = (18, 13, 7, 255)
+
+    def make_card(letter, name, qty, size=(190, 320)):
+        W, H = size
+        card = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        d = ImageDraw.Draw(card)
+        for y in range(H):
+            t = y / H
+            r = int(CARD_BG_TOP[0] + (CARD_BG_BOTTOM[0] - CARD_BG_TOP[0]) * t)
+            g = int(CARD_BG_TOP[1] + (CARD_BG_BOTTOM[1] - CARD_BG_TOP[1]) * t)
+            b = int(CARD_BG_TOP[2] + (CARD_BG_BOTTOM[2] - CARD_BG_TOP[2]) * t)
+            d.line([(0, y), (W, y)], fill=(r, g, b, 255))
+        mask = Image.new("L", (W, H), 0)
+        md = ImageDraw.Draw(mask)
+        md.rounded_rectangle((0, 0, W - 1, H - 1), radius=16, fill=255)
+        card.putalpha(mask)
+        d.rounded_rectangle((2, 2, W - 3, H - 3), radius=15, outline=CARD_BORDER, width=3)
+        d.rounded_rectangle((8, 8, W - 9, H - 9), radius=11, outline=CARD_INNER_BORDER, width=1)
+        f_letter = font(14)
+        cx, cy, r = W / 2, 32, 15
+        d.ellipse((cx - r, cy - r, cx + r, cy + r), outline=CARD_BORDER, width=1)
+        lw = text_w(d, letter, f_letter)
+        d.text((cx - lw / 2, cy - 8), letter, font=f_letter, fill=GOLD)
+        frame_xy = (18, 56, W - 18, H - 18)
+        d.rounded_rectangle(frame_xy, radius=6, fill=FRAME_BG, outline=CARD_INNER_BORDER, width=1)
+        f_name = font(16)
+        max_w = (frame_xy[2] - frame_xy[0]) - 20
+        lines = wrap_text(d, name, f_name, max_w)
+        line_h = 22
+        f_qty = font(12)
+        total_h = len(lines) * line_h + 10 + 16
+        fy = (frame_xy[1] + frame_xy[3]) / 2 - total_h / 2
+        for line in lines:
+            lw = text_w(d, line, f_name)
+            d.text(((frame_xy[0] + frame_xy[2]) / 2 - lw / 2, fy), line, font=f_name, fill=NAME_COLOR)
+            fy += line_h
+        fy += 6
+        qw = text_w(d, qty, f_qty)
+        d.text(((frame_xy[0] + frame_xy[2]) / 2 - qw / 2, fy), qty, font=f_qty, fill=QTY_COLOR)
+        return card
+
+    W, H = 900, 460
+    canvas = Image.new("RGBA", (W, H), BG)
+    card_a = make_card("A", option_a["name"], option_a["qty"])
+    card_b = make_card("B", option_b["name"], option_b["qty"])
+    card_a = card_a.rotate(6, expand=True, resample=Image.BICUBIC)
+    card_b = card_b.rotate(-6, expand=True, resample=Image.BICUBIC)
+    gap = 90
+    total_w = card_a.width + gap + card_b.width
+    start_x = (W - total_w) // 2
+    y_pos = (H - card_a.height) // 2 + 10
+    canvas.alpha_composite(card_a, (start_x, y_pos))
+    canvas.alpha_composite(card_b, (start_x + card_a.width + gap, y_pos))
+    draw = ImageDraw.Draw(canvas)
+    med_cx = start_x + card_a.width + gap / 2
+    med_cy = H / 2
+    med_r = 40
+    draw.ellipse((med_cx - med_r, med_cy - med_r, med_cx + med_r, med_cy + med_r), fill=BG, outline=GOLD, width=2)
+    f_ou = font(18, bold=True)
+    ou_w = text_w(draw, "OU", f_ou)
+    draw.text((med_cx - ou_w / 2, med_cy - 12), "OU", font=f_ou, fill=GOLD)
+    f_title = font(16)
+    title = "Choix de récompense"
+    tw = text_w(draw, title, f_title)
+    draw.text((W / 2 - tw / 2, 30), title, font=f_title, fill=GOLD)
+    canvas.save(out_path)
+    return out_path
 
 
-def _draw_reward_panel(draw, x, header, option, font_head, font_name, font_qty):
-    _draw_panel(draw, x, PANEL_Y)
-    cx = x + PANEL_W // 2
+def generate_reserve_image(classe: str, value: int, range_min: int, range_max: int, ranking: list, energy_table: list, out_path: str):
+    HEAD_BG = (31, 24, 17, 255)
+    BODY_BG = (22, 16, 6, 255)
+    BORDER = (58, 46, 24, 255)
+    MUTED_SUB = (107, 88, 56, 255)
+    GAUGE_TRACK = (28, 21, 11, 255)
+    GAUGE_BORDER = (74, 58, 30, 255)
+    GAUGE_FILL_START = (107, 78, 30, 255)
+    GAUGE_FILL_END = (232, 197, 121, 255)
+    ROW_MUTED = (122, 103, 72, 255)
 
-    draw.text((cx - _text_width(draw, header, font_head) // 2, PANEL_Y + 26), header, font=font_head, fill=GOLD)
-    draw.line(
-        [x + PADDING, PANEL_Y + 58, x + PANEL_W - PADDING, PANEL_Y + 58],
-        fill=PANEL_BORDER, width=1,
-    )
+    def draw_gauge(draw, x0, y0, x1, y1, ratio):
+        draw.rounded_rectangle((x0, y0, x1, y1), radius=(y1 - y0) / 2, fill=GAUGE_TRACK, outline=GAUGE_BORDER, width=1)
+        fill_w = (x1 - x0) * ratio
+        if fill_w > 4:
+            for i in range(int(fill_w)):
+                t = i / max(fill_w, 1)
+                r = int(GAUGE_FILL_START[0] + (GAUGE_FILL_END[0] - GAUGE_FILL_START[0]) * t)
+                g = int(GAUGE_FILL_START[1] + (GAUGE_FILL_END[1] - GAUGE_FILL_START[1]) * t)
+                b = int(GAUGE_FILL_START[2] + (GAUGE_FILL_END[2] - GAUGE_FILL_START[2]) * t)
+                draw.line([(x0 + i, y0 + 1), (x0 + i, y1 - 1)], fill=(r, g, b, 255))
+        marker_x = x0 + fill_w
+        draw.line([(marker_x, y0 - 4), (marker_x, y1 + 4)], fill=(240, 224, 184, 255), width=2)
 
-    # Cadre doré autour de la récompense
-    box_top = PANEL_Y + 140
-    box_bottom = box_top + 100
-    draw.rounded_rectangle(
-        [x + PADDING, box_top, x + PANEL_W - PADDING, box_bottom],
-        radius=8, outline=GOLD_BORDER, width=1,
-    )
-
-    name = option["name"]
-    qty = option.get("qty", "")
-    draw.text((cx - _text_width(draw, name, font_name) // 2, box_top + 24), name, font=font_name, fill=GOLD)
-    if qty:
-        draw.text((cx - _text_width(draw, qty, font_qty) // 2, box_top + 60), qty, font=font_qty, fill=SPELL_DIM)
-
-
-def generate_recompense_image(option_a, option_b, output_path):
-    """Image du choix de récompense (deux options côte à côte, même style que le reste).
-
-    option_a / option_b : dicts contenant au moins {"name": str, "qty": str}
-    """
-    image = Image.new("RGB", (CANVAS_W, CANVAS_H), BG)
-    draw = ImageDraw.Draw(image)
-
-    font_head = _load_font(SERIF_BOLD, 18)
-    font_name = _load_font(SERIF_BOLD, 19)
-    font_qty = _load_font(SERIF_REGULAR, 15)
-
-    _draw_reward_panel(draw, LEFT_X, "Récompense A", option_a, font_head, font_name, font_qty)
-    _draw_reward_panel(draw, RIGHT_X, "Récompense B", option_b, font_head, font_name, font_qty)
-
-    out_dir = os.path.dirname(output_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    image.save(output_path, "PNG")
-    return output_path
-
-
-def _format_number(n: int) -> str:
-    return f"{n:,}".replace(",", " ")
-
-
-def generate_reserve_image(classe, value, minimum, maximum, ranking, energy_table, output_path):
-    """Image de l'étape "Réserve d'énergie occulte" (même style que le tirage clan/sort).
-
-    classe        : str affichée telle quelle (ex "4", "S")
-    value/min/max : entiers (jauge de position)
-    ranking       : [(rang, nom, valeur, is_hit), ...]
-    energy_table  : [(nom_nature, "65%", is_hit), ...] ou liste vide (pas de nature)
-    """
-    image = Image.new("RGB", (CANVAS_W, CANVAS_H), BG)
-    draw = ImageDraw.Draw(image)
-
-    font_title = _load_font(SERIF_BOLD, 17)
-    font_big = _load_font(SERIF_BOLD, 34)
-    font_label = _load_font(SERIF_REGULAR, 13)
-    font_row = _load_font(SERIF_REGULAR, 15)
-    font_row_bold = _load_font(SERIF_BOLD, 15)
-    font_head = _load_font(SERIF_BOLD, 16)
-
-    # ---------- Panneau GAUCHE : classe / valeur / jauge ----------
-    _draw_panel(draw, LEFT_X, PANEL_Y)
-    cx = LEFT_X + PANEL_W // 2
-
-    title = "Réserve d'énergie occulte"
-    draw.text((cx - _text_width(draw, title, font_title) // 2, PANEL_Y + 22), title, font=font_title, fill=GOLD)
-
-    classe_line = f"Classe {classe}"
-    draw.text((cx - _text_width(draw, classe_line, font_head) // 2, PANEL_Y + 58), classe_line, font=font_head, fill=CLAN_DIM)
-
-    value_str = _format_number(value)
-    draw.text((cx - _text_width(draw, value_str, font_big) // 2, PANEL_Y + 108), value_str, font=font_big, fill=GOLD)
-
-    unit = "d'énergie occulte"
-    draw.text((cx - _text_width(draw, unit, font_label) // 2, PANEL_Y + 154), unit, font=font_label, fill=CLAN_DIM)
-
-    # Jauge de position entre min et max
-    bar_x1 = LEFT_X + PADDING + 10
-    bar_x2 = LEFT_X + PANEL_W - PADDING - 10
-    bar_y = PANEL_Y + 214
-    bar_h = 10
-    draw.rounded_rectangle([bar_x1, bar_y, bar_x2, bar_y + bar_h], radius=5, fill=PANEL_BORDER)
-
-    span = maximum - minimum
-    frac = 0.0 if span <= 0 else max(0.0, min(1.0, (value - minimum) / span))
-    fill_x = bar_x1 + int((bar_x2 - bar_x1) * frac)
-    if fill_x > bar_x1:
-        draw.rounded_rectangle([bar_x1, bar_y, fill_x, bar_y + bar_h], radius=5, fill=GOLD_BORDER)
-    draw.ellipse([fill_x - 5, bar_y - 3, fill_x + 5, bar_y + bar_h + 3], fill=GOLD)
-
-    draw.text((bar_x1, bar_y + 20), _format_number(minimum), font=font_label, fill=CLAN_DIM)
-    max_str = _format_number(maximum)
-    draw.text((bar_x2 - _text_width(draw, max_str, font_label), bar_y + 20), max_str, font=font_label, fill=CLAN_DIM)
-
-    # ---------- Panneau DROIT : classement (+ natures si fournies) ----------
-    _draw_panel(draw, RIGHT_X, PANEL_Y)
-
-    draw.text((RIGHT_X + PADDING, PANEL_Y + 20), "Classement", font=font_head, fill=GOLD)
-    draw.line(
-        [RIGHT_X + PADDING, PANEL_Y + 46, RIGHT_X + PANEL_W - PADDING, PANEL_Y + 46],
-        fill=PANEL_BORDER, width=1,
-    )
-
-    row_y = PANEL_Y + 58
+    W, H = 900, 460
+    img = Image.new("RGBA", (W, H), BODY_BG)
+    draw = ImageDraw.Draw(img)
+    outer = (30, 30, W - 30, H - 30)
+    draw.rounded_rectangle(outer, radius=10, fill=BODY_BG, outline=BORDER, width=1)
+    head_h = 150
+    head_xy = (outer[0], outer[1], outer[2], outer[1] + head_h)
+    draw.rounded_rectangle(head_xy, radius=10, fill=HEAD_BG, outline=None)
+    draw.rectangle((outer[0], outer[1] + head_h - 10, outer[2], outer[1] + head_h), fill=HEAD_BG)
+    draw.line([(outer[0], outer[1] + head_h), (outer[2], outer[1] + head_h)], fill=BORDER, width=1)
+    f_sub = font(12)
+    f_val = font(22, bold=True)
+    sub = f"Réserve de classe {classe}"
+    sub_w = text_w(draw, sub, f_sub)
+    draw.text((W / 2 - sub_w / 2, outer[1] + 18), sub, font=f_sub, fill=MUTED_SUB)
+    val_text = f"{value} EO"
+    val_w = text_w(draw, val_text, f_val)
+    draw.text((W / 2 - val_w / 2, outer[1] + 38), val_text, font=f_val, fill=GOLD)
+    ratio = max(0.0, min(1.0, (value - range_min) / (range_max - range_min)))
+    gx0, gx1 = outer[0] + 90, outer[2] - 90
+    gy0 = outer[1] + 92
+    f_glabel = font(10)
+    draw.text((gx0, gy0 - 16), "Faible", font=f_glabel, fill=MUTED_SUB)
+    hw = text_w(draw, "Élevé", f_glabel)
+    draw.text((gx1 - hw, gy0 - 16), "Élevé", font=f_glabel, fill=MUTED_SUB)
+    draw_gauge(draw, gx0, gy0, gx1, gy0 + 10, ratio)
+    body_y0 = outer[1] + head_h
+    body_y1 = outer[3]
+    mid_x = (outer[0] + outer[2]) / 2
+    draw.line([(mid_x, body_y0), (mid_x, body_y1)], fill=BORDER, width=1)
+    f_h5 = font(12, bold=True)
+    f_row = font(13)
+    f_row_b = font(13, bold=True)
+    lx0 = outer[0] + 30
+    lx1 = mid_x - 30
+    ly = body_y0 + 24
+    draw.text((lx0, ly), "CLASSEMENT", font=f_h5, fill=MUTED_SUB)
+    ly += 32
     for rank, name, val, is_hit in ranking:
-        color = GOLD if is_hit else SPELL_DIM
-        font = font_row_bold if is_hit else font_row
-        left = f"#{rank}  {name}"
-        val_str = _format_number(val)
-        draw.text((RIGHT_X + PADDING, row_y), left, font=font, fill=color)
-        draw.text((RIGHT_X + PANEL_W - PADDING - _text_width(draw, val_str, font), row_y), val_str, font=font, fill=color)
-        row_y += 26
-
-    if energy_table:
-        row_y += 10
-        draw.line([RIGHT_X + PADDING, row_y, RIGHT_X + PANEL_W - PADDING, row_y], fill=PANEL_BORDER, width=1)
-        row_y += 14
-        draw.text((RIGHT_X + PADDING, row_y), "Nature de l'énergie", font=font_head, fill=GOLD)
-        row_y += 30
-        for name, pct, is_hit in energy_table:
-            color = GOLD if is_hit else SPELL_DIM
-            font = font_row_bold if is_hit else font_row
-            draw.text((RIGHT_X + PADDING, row_y), name, font=font, fill=color)
-            draw.text((RIGHT_X + PANEL_W - PADDING - _text_width(draw, pct, font), row_y), pct, font=font, fill=color)
-            row_y += 26
-
-    out_dir = os.path.dirname(output_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    image.save(output_path, "PNG")
-    return output_path
+        color = GOLD if is_hit else ROW_MUTED
+        f_use = f_row_b if is_hit else f_row
+        r_txt = str(rank)
+        circle_r = 11
+        draw.ellipse((lx0, ly - 2, lx0 + circle_r * 2, ly - 2 + circle_r * 2), outline=color, width=1)
+        rw = text_w(draw, r_txt, f_row)
+        draw.text((lx0 + circle_r - rw / 2, ly + 1), r_txt, font=f_row, fill=color)
+        draw.text((lx0 + 32, ly), name, font=f_use, fill=color)
+        vw = text_w(draw, str(val), f_use)
+        draw.text((lx1 - vw, ly), str(val), font=f_use, fill=color)
+        ly += 30
+    rx0 = mid_x + 30
+    rx1 = outer[2] - 30
+    ry = body_y0 + 24
+    draw.text((rx0, ry), "ÉNERGIE", font=f_h5, fill=MUTED_SUB)
+    ry += 32
+    for name, pct, is_hit in energy_table:
+        color = GOLD if is_hit else (163, 145, 95, 255)
+        f_use = f_row_b if is_hit else f_row
+        draw.text((rx0, ry), name, font=f_use, fill=color)
+        pw = text_w(draw, pct, f_use)
+        draw.text((rx1 - pw, ry), pct, font=f_use, fill=color)
+        ry += 28
+    img.save(out_path)
+    return out_path
