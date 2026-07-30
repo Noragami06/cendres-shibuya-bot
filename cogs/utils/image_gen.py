@@ -1,4 +1,5 @@
 from PIL import Image, ImageDraw, ImageFont
+import math
 import os
 
 def _load_font(size, bold=False):
@@ -285,4 +286,104 @@ def generate_reserve_image(classe: str, value: int, range_min: int, range_max: i
         draw.text((rx1 - pw, ry), pct, font=f_use, fill=color)
         ry += 28
     img.save(out_path)
+    return out_path
+
+
+def generate_slots_image(username: str, slots: list, out_path: str):
+    """
+    slots: liste de 3 dicts.
+      Vide   : {"filled": False}
+      Rempli : {"filled": True, "name": str, "camp_clan": str}
+    Style hybride : cadre à coins coupés + bordure dorée épaisse + gemme + ruban/accents fleuris.
+    """
+    SLOT_GOLD = (232, 197, 121, 255)
+    SLOT_GOLD_DIM = (150, 120, 60, 255)
+    SLOT_NAME_COLOR = (240, 224, 184, 255)
+    SLOT_MUTED = (140, 120, 85, 255)
+    SLOT_GEM_RED = (210, 40, 60, 255)
+    SLOT_BG = (12, 9, 6, 255)
+
+    def placeholder_portrait(pa_w, pa_h):
+        im = Image.new("RGB", (pa_w, pa_h), (35, 26, 15))
+        dd = ImageDraw.Draw(im)
+        for y in range(pa_h):
+            t = y / pa_h
+            c = (int(35 + 15 * t), int(26 + 10 * t), int(15 + 5 * t))
+            dd.line([(0, y), (pa_w, y)], fill=c)
+        return im
+
+    def slot_hybrid(size, filled, name="", sub=""):
+        W, H = size
+        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        cut = 18
+        outer = [(cut, 0), (W - cut, 0), (W, cut), (W, H - cut), (W - cut, H), (cut, H), (0, H - cut), (0, cut)]
+        mask = Image.new("L", (W, H), 0)
+        ImageDraw.Draw(mask).polygon(outer, fill=255)
+        base = Image.new("RGBA", (W, H), (24, 17, 9, 255))
+        img.paste(base, (0, 0), mask)
+
+        d = ImageDraw.Draw(img)
+        d.polygon(outer, outline=SLOT_GOLD, width=4)
+        inner_cut = cut - 5
+        inner = [(inner_cut + 5, 6), (W - inner_cut - 5, 6), (W - 6, inner_cut + 5), (W - 6, H - inner_cut - 5),
+                  (W - inner_cut - 5, H - 6), (inner_cut + 5, H - 6), (6, H - inner_cut - 5), (6, inner_cut + 5)]
+        d.polygon(inner, outline=SLOT_GOLD_DIM, width=1)
+
+        gem_cx, gem_r = W / 2, 9
+        d.polygon([(gem_cx, 2), (gem_cx + gem_r, 11), (gem_cx, 20), (gem_cx - gem_r, 11)], fill=SLOT_GEM_RED, outline=SLOT_GOLD)
+
+        for cx, cy in [(16, H - 16), (W - 16, H - 16)]:
+            d.ellipse((cx - 3, cy - 3, cx + 3, cy + 3), outline=SLOT_GOLD, width=1)
+            d.line((cx - 8, cy, cx + 8, cy), fill=SLOT_GOLD_DIM, width=1)
+            d.line((cx, cy - 8, cx, cy + 8), fill=SLOT_GOLD_DIM, width=1)
+
+        if filled:
+            pa = (16, 26, W - 16, H - 66)
+            portrait = placeholder_portrait(pa[2] - pa[0], pa[3] - pa[1])
+            img.paste(portrait, (pa[0], pa[1]))
+            d.rectangle((pa[0], pa[1], pa[2], pa[3]), outline=SLOT_GOLD_DIM, width=1)
+
+            ribbon_y = H - 58
+            d.polygon([(10, ribbon_y), (W - 10, ribbon_y), (W - 10, H - 14), (W / 2 + 12, H - 24),
+                        (W / 2, H - 14), (W / 2 - 12, H - 24), (10, H - 14)], fill=(40, 28, 12, 255), outline=SLOT_GOLD)
+            f_n = font(14, bold=True)
+            nw = text_w(d, name, f_n)
+            d.text((W / 2 - nw / 2, ribbon_y + 5), name, font=f_n, fill=SLOT_NAME_COLOR)
+            f_s = font(10)
+            sw = text_w(d, sub, f_s)
+            d.text((W / 2 - sw / 2, ribbon_y + 23), sub, font=f_s, fill=SLOT_MUTED)
+        else:
+            cx, cy, r = W / 2, H / 2, 46
+            d.ellipse((cx - r, cy - r, cx + r, cy + r), outline=SLOT_GOLD_DIM, width=1)
+            for ang in range(0, 360, 45):
+                rad = math.radians(ang)
+                x1, y1 = cx + (r - 6) * math.cos(rad), cy + (r - 6) * math.sin(rad)
+                x2, y2 = cx + (r + 2) * math.cos(rad), cy + (r + 2) * math.sin(rad)
+                d.line((x1, y1, x2, y2), fill=SLOT_GOLD_DIM, width=1)
+            f_plus = font(50, bold=True)
+            pw = text_w(d, "+", f_plus)
+            d.text((cx - pw / 2, cy - 40), "+", font=f_plus, fill=SLOT_GOLD)
+
+        return img
+
+    W, H = 900, 420
+    canvas = Image.new("RGBA", (W, H), SLOT_BG)
+    draw = ImageDraw.Draw(canvas)
+
+    f_title = font(22, bold=True)
+    title = "Sélection de personnage"
+    tw = text_w(draw, title, f_title)
+    draw.text((W / 2 - tw / 2, 34), title, font=f_title, fill=SLOT_GOLD)
+
+    slot_size = (220, 280)
+    gap = 40
+    total_w = slot_size[0] * 3 + gap * 2
+    start_x = (W - total_w) // 2
+    y = 100
+
+    for i, slot in enumerate(slots[:3]):
+        piece = slot_hybrid(slot_size, slot.get("filled", False), slot.get("name", ""), slot.get("camp_clan", ""))
+        canvas.alpha_composite(piece, (start_x + i * (slot_size[0] + gap), y))
+
+    canvas.save(out_path)
     return out_path
