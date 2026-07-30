@@ -774,6 +774,128 @@ def _reward_embed(text: str) -> discord.Embed:
     return discord.Embed(description=text, color=discord.Color.gold())
 
 
+# =====================================================================
+# ÉTAPE RCT (point 5) — construite à partir de la spec du parcours.
+# =====================================================================
+RCT_DESCRIPTION = (
+    "Le moment est venu de savoir si ton personnage maîtrise le **RCT** (Reverse Cursed Technique) "
+    "dès sa création. C'est une aptitude extrêmement rare.\n\n"
+    "Clique sur le bouton ci-dessous pour tenter ta chance."
+)
+
+# Textes de résultat (inventés — à ajuster librement).
+RCT_SUCCESS_TEXT = "✅ Incroyable ! {mention} maîtrise le **RCT** dès sa création, une aptitude rarissime."
+RCT_FAILURE_TEXT = "❌ {mention} ne maîtrise pas le **RCT** pour l'instant. Il faudra l'apprendre plus tard en jeu."
+
+
+def build_rct_embed() -> discord.Embed:
+    return discord.Embed(title="❤️‍🩹 Tentative de RCT", description=RCT_DESCRIPTION, color=discord.Color.red())
+
+
+async def send_rct_step(channel, member: discord.Member):
+    """Envoie l'embed de l'étape RCT avec le bouton Roll RCT. Appelé après CHAQUE récompense."""
+    await channel.send(embed=build_rct_embed(), view=RollRctView(member.id))
+
+
+class RollRctView(discord.ui.View):
+    """Bouton "Roll RCT" (conteneur simple, custom_id par joueur -> géré par le listener)."""
+
+    def __init__(self, user_id: int):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Roll RCT", emoji="🎲", style=discord.ButtonStyle.primary,
+            custom_id=f"depart_roll_rct:{user_id}",
+        ))
+
+
+class RerollRctView(discord.ui.View):
+    """Bouton "Reroll (X)" affiché après un échec s'il reste des charges (custom_id par joueur)."""
+
+    def __init__(self, user_id: int, charges: int):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label=f"Reroll ({charges})", emoji="🔁", style=discord.ButtonStyle.primary,
+            custom_id=f"depart_reroll_rct:{user_id}",
+        ))
+
+
+class ContinueFicheView(discord.ui.View):
+    """Bouton "Continuer" vers l'étape fiche (custom_id fixe, persistant via add_view)."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Continuer", emoji="➡️", style=discord.ButtonStyle.success, custom_id="depart_continuer_fiche")
+    async def continuer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # TODO: étape fiche (point 6) pas encore développée.
+        await interaction.response.send_message(
+            "La création de ta fiche arrive dans une prochaine étape.", ephemeral=False
+        )
+
+
+async def _run_rct_attempt(interaction: discord.Interaction):
+    """Animation d'analyse (7 cycles, 1 s) sur le message courant, puis tirage 1%/99% et résultat.
+    Édite toujours le message existant, n'en crée jamais de nouveau."""
+    message = interaction.message
+
+    for i in range(7):
+        dots = "." * (i % 4)  # "", ".", "..", "..." en boucle
+        anim = discord.Embed(
+            title="❤️‍🩹 Tentative de RCT",
+            description=f"🔎 Analyse en cours {dots}".rstrip(),
+            color=discord.Color.red(),
+        )
+        await message.edit(embed=anim, view=None)
+        await asyncio.sleep(1)
+
+    success = random.random() < 0.01  # 1% — probabilités jamais affichées ni modifiées
+
+    if success:
+        update_progress(interaction.user.id, rct=1)
+        result = discord.Embed(
+            title="❤️‍🩹 Résultat du RCT",
+            description=RCT_SUCCESS_TEXT.format(mention=interaction.user.mention),
+            color=discord.Color.green(),
+        )
+        await message.edit(embed=result, view=ContinueFicheView())
+        return
+
+    # Échec : bouton Reroll s'il reste des charges, sinon bouton Continuer.
+    charges = get_progress(interaction.user.id).get("reroll_rct_charges") or 0
+    result = discord.Embed(
+        title="❤️‍🩹 Résultat du RCT",
+        description=RCT_FAILURE_TEXT.format(mention=interaction.user.mention),
+        color=discord.Color.dark_red(),
+    )
+    if charges > 0:
+        await message.edit(embed=result, view=RerollRctView(interaction.user.id, charges))
+    else:
+        await message.edit(embed=result, view=ContinueFicheView())
+
+
+async def handle_roll_rct(interaction: discord.Interaction, custom_id: str):
+    owner_id = int(custom_id.split(":", 1)[1])
+    if interaction.user.id != owner_id:
+        await interaction.response.send_message("Ce bouton ne t'appartient pas.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    await _run_rct_attempt(interaction)
+
+
+async def handle_reroll_rct(interaction: discord.Interaction, custom_id: str):
+    owner_id = int(custom_id.split(":", 1)[1])
+    if interaction.user.id != owner_id:
+        await interaction.response.send_message("Ce bouton ne t'appartient pas.", ephemeral=True)
+        return
+    charges = get_progress(interaction.user.id).get("reroll_rct_charges") or 0
+    if charges <= 0:
+        await interaction.response.send_message("Tu n'as plus de tentative de reroll RCT.", ephemeral=True)
+        return
+    db.adjust_progress_counter(interaction.user.id, "reroll_rct_charges", -1)
+    await interaction.response.defer()
+    await _run_rct_attempt(interaction)
+
+
 async def apply_reward(interaction: discord.Interaction, reward: dict):
     """Applique l'effet de la récompense choisie selon reward['key']."""
     member = interaction.user
@@ -782,39 +904,36 @@ async def apply_reward(interaction: discord.Interaction, reward: dict):
     key = reward["key"]
     progress = get_progress(uid)
 
+    # --- Effet propre à chaque récompense (aucun return : l'enchaînement RCT est commun, plus bas) ---
     if key in ("argent", "xp"):
         # TODO: intégrer réellement ce montant dans le futur système économique/XP une fois développé.
         await channel.send(embed=_reward_embed(f"{member.mention} a choisi **{reward['qty']}** !"))
-        return
 
-    if key == "reroll_clan":
+    elif key == "reroll_clan":
         await reward_reroll_clan(interaction, progress)
-        return
-    if key == "reroll_sort":
-        await reward_reroll_sort(interaction, progress)
-        return
-    if key == "reroll_energie_nature":
-        await reward_reroll_energie_nature(interaction, progress)
-        return
 
-    if key == "reroll_energie_qte":
-        # Charge stockée + bouton de reroll (utilisable tant que reroll_energie_charges > 0).
+    elif key == "reroll_sort":
+        await reward_reroll_sort(interaction, progress)
+
+    elif key == "reroll_energie_nature":
+        await reward_reroll_energie_nature(interaction, progress)
+
+    elif key == "reroll_energie_qte":
+        # Charge stockée + bouton de reroll (action bonus indépendante, ne bloque PAS la progression).
         db.adjust_progress_counter(uid, "reroll_energie_charges", 1)
         await channel.send(
             embed=_reward_embed(f"{member.mention} a obtenu un Reroll de sa quantité d'énergie !"),
             view=RerollEnergieView(uid),
         )
-        return
 
-    if key == "reroll_rct":
-        # Charge stockée, utilisée automatiquement plus tard à l'étape RCT. Aucun bouton ici.
+    elif key == "reroll_rct":
+        # Charge stockée, utilisée automatiquement à l'étape RCT ci-dessous. Aucun bouton ici.
         db.adjust_progress_counter(uid, "reroll_rct_charges", 1)
         await channel.send(embed=_reward_embed(
             f"{member.mention} a obtenu une tentative supplémentaire pour le RCT !"
         ))
-        return
 
-    if key in ("parchemin_territoire", "parchemin_rct", "parchemin_nature"):
+    elif key in ("parchemin_territoire", "parchemin_rct", "parchemin_nature"):
         col = {
             "parchemin_territoire": "parchemins_territoire",
             "parchemin_rct": "parchemins_rct",
@@ -825,12 +944,15 @@ async def apply_reward(interaction: discord.Interaction, reward: dict):
         await channel.send(embed=_reward_embed(
             f"{member.mention} a obtenu **{reward['qty']} {reward['name']}** !"
         ))
-        return
 
-    # Objets (relique_X / arme_X)
-    # TODO: pas de système d'inventaire pour l'instant, juste enregistré pour la future fiche.
-    add_progress_item(uid, reward["name"])
-    await channel.send(embed=_reward_embed(f"{member.mention} a obtenu : **{reward['name']}** !"))
+    else:
+        # Objets (relique_X / arme_X)
+        # TODO: pas de système d'inventaire pour l'instant, juste enregistré pour la future fiche.
+        add_progress_item(uid, reward["name"])
+        await channel.send(embed=_reward_embed(f"{member.mention} a obtenu : **{reward['name']}** !"))
+
+    # --- Enchaînement commun : TOUTES les récompenses mènent ensuite à l'étape RCT, sans exception. ---
+    await send_rct_step(channel, member)
 
 
 async def reward_reroll_clan(interaction, progress):
@@ -1672,6 +1794,7 @@ class Depart(commands.Cog):
         self.bot.add_view(ClanRollHybrideView())
         self.bot.add_view(ContinueEnergyView())
         self.bot.add_view(RewardContinueView())
+        self.bot.add_view(ContinueFicheView())
         self.bot.add_view(ReserveClassView())
         self.bot.add_view(DMClanQuestionView())
         self.bot.add_view(DMClanSelectView())
@@ -1687,6 +1810,10 @@ class Depart(commands.Cog):
         custom_id = interaction.data.get("custom_id", "")
         if custom_id.startswith("depart_reroll_energie:"):
             await handle_reroll_energie(interaction, custom_id)
+        elif custom_id.startswith("depart_roll_rct:"):
+            await handle_roll_rct(interaction, custom_id)
+        elif custom_id.startswith("depart_reroll_rct:"):
+            await handle_reroll_rct(interaction, custom_id)
 
     @app_commands.command(name="départ", description="Démarre la création de ton personnage")
     async def depart(self, interaction: discord.Interaction):
