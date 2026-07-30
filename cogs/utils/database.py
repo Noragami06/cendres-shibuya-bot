@@ -98,6 +98,12 @@ CREATE TABLE IF NOT EXISTS depart_character_progress (
     nature TEXT,
     items_json TEXT,
     pending_rerolls_json TEXT,
+    reroll_rct_charges INTEGER DEFAULT 0,
+    reroll_energie_charges INTEGER DEFAULT 0,
+    parchemins_territoire INTEGER DEFAULT 0,
+    parchemins_rct INTEGER DEFAULT 0,
+    parchemins_nature INTEGER DEFAULT 0,
+    rct INTEGER DEFAULT 0,
     updated_at TEXT
 );
 
@@ -150,11 +156,26 @@ def _copy_validated_characters_from_old(conn):
     )
 
 
-def _ensure_progress_slot_number(conn):
-    """Ajoute la colonne slot_number à depart_character_progress si elle manque (DB existante)."""
+# Colonnes de depart_character_progress ajoutées après coup (migration des DB existantes).
+_PROGRESS_EXTRA_COLUMNS = [
+    ("slot_number", "INTEGER"),
+    ("reroll_rct_charges", "INTEGER DEFAULT 0"),
+    ("reroll_energie_charges", "INTEGER DEFAULT 0"),
+    ("parchemins_territoire", "INTEGER DEFAULT 0"),
+    ("parchemins_rct", "INTEGER DEFAULT 0"),
+    ("parchemins_nature", "INTEGER DEFAULT 0"),
+    ("rct", "INTEGER DEFAULT 0"),
+]
+
+
+def _ensure_progress_columns(conn):
+    """Ajoute à depart_character_progress les colonnes manquantes (DB existante)."""
     cols = _column_names(conn, "depart_character_progress")
-    if cols and "slot_number" not in cols:
-        conn.execute("ALTER TABLE depart_character_progress ADD COLUMN slot_number INTEGER")
+    if not cols:
+        return
+    for name, decl in _PROGRESS_EXTRA_COLUMNS:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE depart_character_progress ADD COLUMN {name} {decl}")
 
 
 def init_db():
@@ -164,7 +185,7 @@ def init_db():
         conn.executescript(SCHEMA)
         if needs_vc_copy:
             _copy_validated_characters_from_old(conn)
-        _ensure_progress_slot_number(conn)
+        _ensure_progress_columns(conn)
 
 
 # =====================================================================
@@ -408,7 +429,17 @@ def delete_pending_choice(user_id: int):
 # =====================================================================
 # DEPART CHARACTER PROGRESS
 # =====================================================================
-_PROGRESS_SCALAR_COLS = ("guild_id", "slot_number", "camp", "path", "clan", "sort", "eo_classe", "eo_value", "nature")
+_PROGRESS_SCALAR_COLS = (
+    "guild_id", "slot_number", "camp", "path", "clan", "sort", "eo_classe", "eo_value", "nature",
+    "reroll_rct_charges", "reroll_energie_charges",
+    "parchemins_territoire", "parchemins_rct", "parchemins_nature", "rct",
+)
+
+# Colonnes compteurs que l'on incrémente/décrémente atomiquement.
+_PROGRESS_COUNTER_COLS = {
+    "reroll_rct_charges", "reroll_energie_charges",
+    "parchemins_territoire", "parchemins_rct", "parchemins_nature",
+}
 
 
 def get_character_progress(user_id: int) -> dict:
@@ -431,7 +462,26 @@ def get_character_progress(user_id: int) -> dict:
         "nature": row["nature"],
         "items": json.loads(row["items_json"]) if row["items_json"] else [],
         "pending_rerolls": json.loads(row["pending_rerolls_json"]) if row["pending_rerolls_json"] else [],
+        "reroll_rct_charges": row["reroll_rct_charges"] or 0,
+        "reroll_energie_charges": row["reroll_energie_charges"] or 0,
+        "parchemins_territoire": row["parchemins_territoire"] or 0,
+        "parchemins_rct": row["parchemins_rct"] or 0,
+        "parchemins_nature": row["parchemins_nature"] or 0,
+        "rct": row["rct"] or 0,
     }
+
+
+def adjust_progress_counter(user_id: int, column: str, delta: int):
+    """Incrémente/décrémente atomiquement une colonne compteur (crée la ligne au besoin)."""
+    if column not in _PROGRESS_COUNTER_COLS:
+        raise ValueError(f"Colonne compteur inconnue : {column}")
+    with get_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO depart_character_progress (user_id) VALUES (?)", (user_id,))
+        conn.execute(
+            f"UPDATE depart_character_progress SET {column} = COALESCE({column}, 0) + ?, updated_at = ? "
+            "WHERE user_id = ?",
+            (delta, datetime.utcnow().isoformat(), user_id),
+        )
 
 
 def upsert_character_progress(user_id: int, fields: dict):

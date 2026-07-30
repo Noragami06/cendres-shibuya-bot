@@ -146,24 +146,26 @@ def add_progress_pending_reroll(user_id: int, key: str):
 
 # ---------- Récompenses ----------
 REWARD_TABLE = [
-    {"key": "argent", "label": "Argent", "pct": 20.75, "category": "currency"},
-    {"key": "xp", "label": "XP", "pct": 15.56, "category": "currency"},
-    {"key": "reroll_clan", "label": "Reroll Clan", "pct": 11.41, "category": "reroll"},
-    {"key": "reroll_sort", "label": "Reroll Sort", "pct": 9.34, "category": "reroll"},
-    {"key": "reroll_energie_qte", "label": "Reroll Quantité d'énergie", "pct": 7.78, "category": "reroll"},
-    {"key": "reroll_energie_nature", "label": "Reroll Nature d'énergie", "pct": 6.74, "category": "reroll"},
-    {"key": "reroll_territoire", "label": "Reroll Territoire", "pct": 5.71, "category": "reroll_todo"},
-    {"key": "reroll_rct", "label": "Reroll RCT", "pct": 4.67, "category": "reroll_todo"},
-    {"key": "relique_4", "label": "Relique de classe 4", "pct": 3.94, "category": "item"},
-    {"key": "relique_3", "label": "Relique de classe 3", "pct": 3.32, "category": "item"},
-    {"key": "relique_2", "label": "Relique de classe 2", "pct": 2.70, "category": "item"},
-    {"key": "arme_4", "label": "Arme de classe 4", "pct": 2.18, "category": "item"},
-    {"key": "arme_3", "label": "Arme de classe 3", "pct": 1.76, "category": "item"},
-    {"key": "arme_2", "label": "Arme de classe 2", "pct": 1.35, "category": "item"},
-    {"key": "arme_1", "label": "Arme de classe 1", "pct": 1.04, "category": "item"},
-    {"key": "relique_1", "label": "Relique de classe 1", "pct": 0.78, "category": "item"},
-    {"key": "arme_s", "label": "Arme de classe S", "pct": 0.57, "category": "item"},
-    {"key": "relique_s", "label": "Relique de classe S", "pct": 0.40, "category": "item"},
+    {"key": "argent", "label": "Argent", "pct": 13.76, "category": "currency"},
+    {"key": "xp", "label": "XP", "pct": 11.99, "category": "currency"},
+    {"key": "reroll_clan", "label": "Reroll Clan", "pct": 10.44, "category": "reroll"},
+    {"key": "reroll_sort", "label": "Reroll Sort", "pct": 9.10, "category": "reroll"},
+    {"key": "reroll_energie_qte", "label": "Reroll Quantité d'énergie", "pct": 7.92, "category": "reroll"},
+    {"key": "reroll_energie_nature", "label": "Reroll Nature d'énergie", "pct": 6.90, "category": "reroll"},
+    {"key": "reroll_rct", "label": "Reroll RCT", "pct": 6.01, "category": "reroll"},
+    {"key": "parchemin_territoire", "label": "Parchemin de territoire", "pct": 5.24, "category": "parchemin"},
+    {"key": "parchemin_rct", "label": "Parchemin de RCT", "pct": 4.56, "category": "parchemin"},
+    {"key": "parchemin_nature", "label": "Parchemin de nature d'énergie", "pct": 3.97, "category": "parchemin"},
+    {"key": "relique_4", "label": "Relique de classe 4", "pct": 3.46, "category": "item"},
+    {"key": "relique_3", "label": "Relique de classe 3", "pct": 3.02, "category": "item"},
+    {"key": "relique_2", "label": "Relique de classe 2", "pct": 2.63, "category": "item"},
+    {"key": "arme_4", "label": "Arme de classe 4", "pct": 2.29, "category": "item"},
+    {"key": "arme_3", "label": "Arme de classe 3", "pct": 1.99, "category": "item"},
+    {"key": "arme_2", "label": "Arme de classe 2", "pct": 1.74, "category": "item"},
+    {"key": "arme_1", "label": "Arme de classe 1", "pct": 1.51, "category": "item"},
+    {"key": "relique_1", "label": "Relique de classe 1", "pct": 1.32, "category": "item"},
+    {"key": "arme_s", "label": "Arme de classe S", "pct": 1.15, "category": "item"},
+    {"key": "relique_s", "label": "Relique de classe S", "pct": 1.00, "category": "item"},
 ]
 
 ARGENT_MIN, ARGENT_MAX = 10000, 100000
@@ -178,6 +180,10 @@ def resolve_reward(reward_def: dict) -> dict:
     if reward_def["key"] == "xp":
         amount = random.randint(XP_MIN, XP_MAX)
         return {"key": "xp", "name": "XP", "qty": f"{amount} XP", "amount": amount}
+    if reward_def.get("category") == "parchemin":
+        # Quantité tirée dès l'offre pour que la carte et le gain réel correspondent.
+        amount = random.randint(1, 5)
+        return {"key": reward_def["key"], "name": reward_def["label"], "qty": f"x{amount}", "amount": amount}
     return {"key": reward_def["key"], "name": reward_def["label"], "qty": "x1", "amount": None}
 
 
@@ -787,21 +793,37 @@ async def apply_reward(interaction: discord.Interaction, reward: dict):
     if key == "reroll_sort":
         await reward_reroll_sort(interaction, progress)
         return
-    if key == "reroll_energie_qte":
-        await reward_reroll_energie_qte(interaction, progress)
-        return
     if key == "reroll_energie_nature":
         await reward_reroll_energie_nature(interaction, progress)
         return
 
-    if key in ("reroll_territoire", "reroll_rct"):
-        # TODO: aucun effet pour l'instant, les étapes Territoire et RCT ne sont pas encore
-        # développées ; cette récompense sera appliquée plus tard (manuellement ou automatiquement
-        # une fois ces étapes codées).
-        add_progress_pending_reroll(uid, key)
+    if key == "reroll_energie_qte":
+        # Charge stockée + bouton de reroll (utilisable tant que reroll_energie_charges > 0).
+        db.adjust_progress_counter(uid, "reroll_energie_charges", 1)
+        await channel.send(
+            embed=_reward_embed(f"{member.mention} a obtenu un Reroll de sa quantité d'énergie !"),
+            view=RerollEnergieView(uid),
+        )
+        return
+
+    if key == "reroll_rct":
+        # Charge stockée, utilisée automatiquement plus tard à l'étape RCT. Aucun bouton ici.
+        db.adjust_progress_counter(uid, "reroll_rct_charges", 1)
         await channel.send(embed=_reward_embed(
-            f"{member.mention} a obtenu **{reward['name']}**. Elle est enregistrée et sera appliquée "
-            "quand cette étape sera disponible."
+            f"{member.mention} a obtenu une tentative supplémentaire pour le RCT !"
+        ))
+        return
+
+    if key in ("parchemin_territoire", "parchemin_rct", "parchemin_nature"):
+        col = {
+            "parchemin_territoire": "parchemins_territoire",
+            "parchemin_rct": "parchemins_rct",
+            "parchemin_nature": "parchemins_nature",
+        }[key]
+        qty = reward.get("amount") or 1  # quantité 1-5 tirée par resolve_reward
+        db.adjust_progress_counter(uid, col, qty)
+        await channel.send(embed=_reward_embed(
+            f"{member.mention} a obtenu **{reward['qty']} {reward['name']}** !"
         ))
         return
 
@@ -914,19 +936,69 @@ async def reward_reroll_sort(interaction, progress):
     await channel.send(embed=_reward_embed(f"{member.mention} a rerollé son sort : **{label}** !"))
 
 
-async def reward_reroll_energie_qte(interaction, progress):
-    member = interaction.user
+class RerollEnergieView(discord.ui.View):
+    """Bouton "Reroll énergie" (conteneur simple). Le clic est traité par le listener on_interaction
+    du cog : custom_id dynamique par joueur -> vraie persistance après un redémarrage du bot."""
+
+    def __init__(self, user_id: int):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Reroll énergie",
+            emoji="🔄",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"depart_reroll_energie:{user_id}",
+        ))
+
+
+# Montée de classe garantie à chaque reroll d'énergie (sauf S qui reste S).
+ENERGIE_LADDER = {"classe_4": "classe_3", "classe_3": "classe_2", "classe_2": "classe_1", "classe_1": "classe_s"}
+
+
+async def handle_reroll_energie(interaction: discord.Interaction, custom_id: str):
+    owner_id = int(custom_id.split(":", 1)[1])
+    if interaction.user.id != owner_id:
+        await interaction.response.send_message("Ce bouton ne t'appartient pas.", ephemeral=True)
+        return
+
+    progress = get_progress(interaction.user.id)
+    charges = progress.get("reroll_energie_charges") or 0
+    if charges <= 0:
+        await interaction.response.send_message("Tu n'as plus de charge de reroll disponible.", ephemeral=True)
+        return
+
+    eo_classe = progress.get("eo_classe")
+    eo_value = progress.get("eo_value")
+    nature = progress.get("nature")  # nature totalement inchangée
+    if not eo_classe:
+        await interaction.response.send_message("Tu n'as pas encore de réserve d'énergie à reroll.", ephemeral=True)
+        return
+
+    if eo_classe == "classe_s":
+        new_classe = "classe_s"
+        # Garantit une valeur >= à l'actuelle, jamais inférieure.
+        new_value = random.randint(eo_value, EO_CLASS_TABLE["classe_s"]["max"])
+    else:
+        new_classe = ENERGIE_LADDER[eo_classe]
+        info = EO_CLASS_TABLE[new_classe]
+        new_value = random.randint(info["min"], info["max"])
+
+    db.adjust_progress_counter(interaction.user.id, "reroll_energie_charges", -1)
+    update_progress(interaction.user.id, eo_classe=new_classe, eo_value=new_value)
+
+    await interaction.response.defer()
     channel = interaction.channel
-    uid = member.id
+    await render_and_send_reserve_image(channel, interaction.user, new_classe, new_value, nature, nature is not None)
+    label = new_classe.replace("classe_", "").upper()
+    await channel.send(embed=_reward_embed(
+        f"{interaction.user.mention} a rerollé sa réserve : nouvelle classe {label}, {new_value:,} EO !"
+    ))
 
-    class_pool = {k: v["pct"] for k, v in EO_CLASS_TABLE.items()}
-    eo_classe = weighted_choice(class_pool)
-    value = random.randint(EO_CLASS_TABLE[eo_classe]["min"], EO_CLASS_TABLE[eo_classe]["max"])
-    nature = progress.get("nature")  # nature inchangée
-
-    update_progress(uid, eo_classe=eo_classe, eo_value=value)
-    await render_and_send_reserve_image(channel, member, eo_classe, value, nature, nature is not None)
-    await channel.send(embed=_reward_embed(f"{member.mention} a rerollé sa quantité d'énergie occulte !"))
+    # Plus de charge : on retire le bouton du message d'origine. Sinon on le laisse actif.
+    if charges - 1 <= 0:
+        try:
+            await interaction.message.edit(view=None)
+        except discord.HTTPException:
+            pass
 
 
 async def reward_reroll_energie_nature(interaction, progress):
@@ -1606,6 +1678,15 @@ class Depart(commands.Cog):
         # Enregistrée avec les 4 boutons pour couvrir tous les custom_id après redémarrage,
         # même si le message réellement envoyé n'en affichait que 3.
         self.bot.add_view(DMSortView(show_partial=True))
+
+    @commands.Cog.listener()
+    async def on_interaction(self, interaction: discord.Interaction):
+        # Boutons à custom_id dynamique (par joueur) : dispatch par préfixe, persistant après redémarrage.
+        if interaction.type != discord.InteractionType.component:
+            return
+        custom_id = interaction.data.get("custom_id", "")
+        if custom_id.startswith("depart_reroll_energie:"):
+            await handle_reroll_energie(interaction, custom_id)
 
     @app_commands.command(name="départ", description="Démarre la création de ton personnage")
     async def depart(self, interaction: discord.Interaction):
