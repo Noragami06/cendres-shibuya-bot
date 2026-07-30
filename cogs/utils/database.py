@@ -70,9 +70,12 @@ CREATE TABLE IF NOT EXISTS depart_pending_choices (
 );
 
 CREATE TABLE IF NOT EXISTS validated_characters (
-    user_id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
     guild_id INTEGER,
-    display_name TEXT,
+    slot_number INTEGER,
+    discord_username TEXT,
+    character_name TEXT,
     camp TEXT,
     clan TEXT,
     sort TEXT,
@@ -85,6 +88,7 @@ CREATE TABLE IF NOT EXISTS validated_characters (
 CREATE TABLE IF NOT EXISTS depart_character_progress (
     user_id INTEGER PRIMARY KEY,
     guild_id INTEGER,
+    slot_number INTEGER,
     camp TEXT,
     path TEXT,
     clan TEXT,
@@ -118,10 +122,49 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+def _column_names(conn, table: str):
+    return [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+def _pre_migrate_validated_characters(conn) -> bool:
+    """Si l'ancienne table validated_characters (user_id PK, sans colonne id) existe et contient
+    des données, on la renomme en _old pour que le nouveau schéma puisse être créé. Retourne True
+    si une copie des données devra être faite après création du nouveau schéma."""
+    cols = _column_names(conn, "validated_characters")
+    if cols and "id" not in cols:
+        conn.execute("ALTER TABLE validated_characters RENAME TO validated_characters_old")
+        return True
+    return False
+
+
+def _copy_validated_characters_from_old(conn):
+    """Recopie les anciennes lignes dans le nouveau schéma : slot_number=1,
+    discord_username=display_name, character_name=NULL. Conserve _old comme sauvegarde."""
+    conn.execute(
+        """INSERT INTO validated_characters
+           (user_id, guild_id, slot_number, discord_username, character_name,
+            camp, clan, sort, eo_classe, eo_value, nature, validated_at)
+           SELECT user_id, guild_id, 1, display_name, NULL,
+                  camp, clan, sort, eo_classe, eo_value, nature, validated_at
+           FROM validated_characters_old"""
+    )
+
+
+def _ensure_progress_slot_number(conn):
+    """Ajoute la colonne slot_number à depart_character_progress si elle manque (DB existante)."""
+    cols = _column_names(conn, "depart_character_progress")
+    if cols and "slot_number" not in cols:
+        conn.execute("ALTER TABLE depart_character_progress ADD COLUMN slot_number INTEGER")
+
+
 def init_db():
-    """Crée les tables manquantes. N'efface jamais de données existantes."""
+    """Crée les tables manquantes et applique les migrations légères. N'efface jamais de données."""
     with get_connection() as conn:
+        needs_vc_copy = _pre_migrate_validated_characters(conn)
         conn.executescript(SCHEMA)
+        if needs_vc_copy:
+            _copy_validated_characters_from_old(conn)
+        _ensure_progress_slot_number(conn)
 
 
 # =====================================================================
@@ -365,7 +408,7 @@ def delete_pending_choice(user_id: int):
 # =====================================================================
 # DEPART CHARACTER PROGRESS
 # =====================================================================
-_PROGRESS_SCALAR_COLS = ("guild_id", "camp", "path", "clan", "sort", "eo_classe", "eo_value", "nature")
+_PROGRESS_SCALAR_COLS = ("guild_id", "slot_number", "camp", "path", "clan", "sort", "eo_classe", "eo_value", "nature")
 
 
 def get_character_progress(user_id: int) -> dict:
@@ -378,6 +421,7 @@ def get_character_progress(user_id: int) -> dict:
         return {}
     return {
         "guild_id": row["guild_id"],
+        "slot_number": row["slot_number"],
         "camp": row["camp"],
         "path": row["path"],
         "clan": row["clan"],
@@ -489,3 +533,26 @@ def get_pending_reserve_choice(user_id: int):
 def delete_pending_reserve_choice(user_id: int):
     with get_connection() as conn:
         conn.execute("DELETE FROM depart_pending_reserve_choice WHERE user_id = ?", (user_id,))
+
+
+# =====================================================================
+# VALIDATED CHARACTERS (personnages validés, jusqu'à 3 slots par joueur)
+# =====================================================================
+def get_validated_characters(user_id: int, guild_id: int):
+    """Slots occupés d'un joueur sur un serveur, triés par numéro de slot croissant."""
+    with get_connection() as conn:
+        return conn.execute(
+            """SELECT slot_number, character_name, camp, clan
+               FROM validated_characters WHERE user_id = ? AND guild_id = ?
+               ORDER BY slot_number ASC""",
+            (user_id, guild_id),
+        ).fetchall()
+
+
+def get_class_ranking(eo_classe: str):
+    """Classement (pseudo Discord + valeur EO) des personnages validés d'une classe donnée."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT discord_username, eo_value FROM validated_characters WHERE eo_classe = ? ORDER BY eo_value DESC",
+            (eo_classe,),
+        ).fetchall()

@@ -11,6 +11,7 @@ from cogs.utils.image_gen import (
     generate_clan_sort_image,
     generate_reserve_image,
     generate_recompense_image,
+    generate_slots_image,
 )
 
 
@@ -709,14 +710,10 @@ async def render_and_send_reserve_image(channel, member, eo_classe, value, natur
     # TODO: l'insertion dans validated_characters se fera uniquement à l'étape de validation
     # de la fiche par le staff (point 7 du parcours, pas encore développée). Tant que la table
     # est vide, chaque joueur qui teste se retrouve seul en 1ère position, ce qui est normal.
-    with db.get_connection() as conn:
-        validated = conn.execute(
-            "SELECT display_name, eo_value FROM validated_characters WHERE eo_classe = ? ORDER BY eo_value DESC",
-            (eo_classe,),
-        ).fetchall()
+    validated = db.get_class_ranking(eo_classe)
 
     merged = [(member.name, value, True)]
-    merged += [(row["display_name"], row["eo_value"], False) for row in validated]
+    merged += [(row["discord_username"], row["eo_value"], False) for row in validated]
     merged.sort(key=lambda entry: entry[1], reverse=True)  # tri numérique AVANT le formatage
     # Valeurs formatées avec virgules (séparateur de milliers) pour l'affichage.
     ranking = [(rank, name, f"{val:,}", hit) for rank, (name, val, hit) in enumerate(merged[:4], start=1)]
@@ -1549,6 +1546,30 @@ class CampView(discord.ui.View):
         )
 
 
+class StartCreationView(discord.ui.View):
+    """Bouton unique "Créer le Xème perso" de l'écran de sélection. Persistant, une variante par slot."""
+
+    _LABELS = {1: "Créer le 1er perso", 2: "Créer le 2ème perso", 3: "Créer le 3ème perso"}
+
+    def __init__(self, slot_number: int):
+        super().__init__(timeout=None)
+        self.slot_number = slot_number
+        self.start.label = self._LABELS.get(slot_number, "Créer un perso")
+        self.start.custom_id = f"depart_start_creation:{slot_number}"
+
+    @discord.ui.button(label="Créer un perso", style=discord.ButtonStyle.success)
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Slot lu depuis le custom_id (fiable même après un redémarrage du bot).
+        slot_number = int(interaction.data["custom_id"].split(":", 1)[1])
+        update_progress(interaction.user.id, slot_number=slot_number, guild_id=interaction.guild.id)
+
+        # Embed de lecture (Étape 1), déplacé ici : comportement inchangé (envoi, 5s, bouton Commencer).
+        embed = build_depart_embed()
+        await interaction.response.send_message(embed=embed)
+        await asyncio.sleep(5)
+        await interaction.edit_original_response(embed=embed, view=DepartView())
+
+
 class DepartView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1567,6 +1588,10 @@ class Depart(commands.Cog):
     async def cog_load(self):
         # Amorce l'état des clans si la base est vide (nouvelle installation).
         db.seed_clan_state(DEFAULT_CLAN_STATE)
+
+        # Écran de sélection : une vue persistante par slot (custom_id depart_start_creation:{1,2,3}).
+        for slot in (1, 2, 3):
+            self.bot.add_view(StartCreationView(slot))
 
         self.bot.add_view(DepartView())
         self.bot.add_view(CampView())
@@ -1591,16 +1616,47 @@ class Depart(commands.Cog):
             )
             return
 
-        embed = build_depart_embed()
+        # Écran de sélection de personnage (3 slots).
+        rows = db.get_validated_characters(interaction.user.id, interaction.guild.id)
+        by_slot = {row["slot_number"]: row for row in rows}
 
-        # Premier envoi : aucun bouton
-        await interaction.response.send_message(embed=embed)
+        slots = []
+        for n in (1, 2, 3):
+            row = by_slot.get(n)
+            if row:
+                camp = row["camp"] or ""
+                clan = row["clan"]
+                camp_clan = f"{camp} — {clan}" if clan else camp
+                slots.append({"filled": True, "name": row["character_name"], "camp_clan": camp_clan})
+            else:
+                slots.append({"filled": False})
 
-        # Laisse au joueur le temps de lire avant de révéler le bouton
-        await asyncio.sleep(5)
+        path = _tmp_image_path("slots")
+        generate_slots_image(interaction.user.name, slots, path)
 
-        # Édite le même message pour y ajouter le bouton persistant
-        await interaction.edit_original_response(embed=embed, view=DepartView())
+        # 1er message : l'image de sélection seule, sans embed.
+        await interaction.response.send_message(file=discord.File(path, filename="slots.png"))
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+        # Tous les slots pris : on s'arrête, aucun bouton.
+        if all(s["filled"] for s in slots):
+            await interaction.channel.send(
+                "Tous tes emplacements sont pris. Tu ne peux pas créer de nouveau personnage pour le moment."
+            )
+            return
+
+        # Sinon : bouton vers le premier slot libre.
+        first_free = next(n for n in (1, 2, 3) if not slots[n - 1]["filled"])
+        await interaction.channel.send(
+            embed=discord.Embed(
+                description="Prêt à créer ton personnage ? Clique sur le bouton ci-dessous.",
+                color=discord.Color.blurple(),
+            ),
+            view=StartCreationView(first_free),
+        )
 
 
 async def setup(bot):
