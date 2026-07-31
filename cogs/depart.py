@@ -1149,7 +1149,17 @@ def _fiche_portrait_filename(uid: int, slot: int) -> str:
     return f"portrait_{uid}_{slot}.png"
 
 
-def build_fiche_embed(progress: dict, guild, member, uid: int) -> discord.Embed:
+ORIGINE_LABELS = {
+    "hybride_exorciste": "Chez les exorcistes",
+    "hybride_fleaux": "Chez les fléaux",
+    "hybride_seul": "Livré à soi-même",
+    "hybride_humains": "Chez les humains",
+}
+
+
+def build_fiche_embed(progress: dict, guild, member, uid: int,
+                      statut_display: str = "🕒 En attente de validation",
+                      valide_par_display: str = "—") -> discord.Embed:
     clan_key = progress.get("clan")
     has_clan = has_clan_from_progress(progress)
     clan_display = clan_key.capitalize() if has_clan else "Sans clan"
@@ -1182,48 +1192,63 @@ def build_fiche_embed(progress: dict, guild, member, uid: int) -> discord.Embed:
     reco_display = progress.get("recompense") or "Aucune"
     histoire = progress.get("histoire")
 
-    # Alias vers les noms utilisés dans la mise en page ci-dessous.
+    # Valeurs de mise en page (tout passe par la description, aucun field).
     slot_number = slot
     camp_display = camp
+    camp_key = (progress.get("camp") or "").lower()
     grade_display = grade
     recompense_display = reco_display
+    origine_display = ORIGINE_LABELS.get(progress.get("path"), "—")
     date_creation = datetime.utcnow().strftime("%d/%m/%Y")
     nom_fichier_image = _fiche_portrait_filename(uid, slot)
 
-    embed = discord.Embed(title="📜 Fiche de personnage", color=discord.Color.from_rgb(201, 165, 92))
+    description = (
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"✦ IDENTITÉ ✦\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"**Prénom :** {prenom}\n"
+        f"**Nom :** {nom_final}\n"
+        f"**Âge :** {age_display}\n"
+        f"**Emplacement :** Slot {slot_number}\n"
+        f"**Camp :** {camp_display}\n"
+    )
 
-    embed.add_field(name="✦ Identité", value="​", inline=False)
-    embed.add_field(name="Prénom", value=prenom, inline=True)
-    embed.add_field(name="Nom", value=nom_final, inline=True)
-    embed.add_field(name="Emplacement", value=f"Slot {slot_number}", inline=True)
-    embed.add_field(name="Âge", value=age_display, inline=True)
-    embed.add_field(name="Camp", value=camp_display, inline=True)
-    embed.add_field(name="​", value="​", inline=True)
+    if camp_key == "hybride":
+        description += f"**Origine :** {origine_display}\n"
 
-    embed.add_field(name="✦ Appartenance", value="​", inline=False)
-    embed.add_field(name="Clan", value=clan_display, inline=True)
-    embed.add_field(name="Grade", value=grade_display, inline=True)
-    embed.add_field(name="​", value="​", inline=True)
+    description += (
+        f"\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"✦ APPARTENANCE ✦\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"**Clan :** {clan_display}\n"
+        f"**Grade :** {grade_display}\n"
+        f"\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"✦ POUVOIRS ✦\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"**Sort :** {sort_display}\n"
+        f"**Nature :** {nature_display}\n"
+        f"**Réserve :** {reserve_display}\n"
+        f"**RCT :** {rct_display}\n"
+        f"\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"✦ RÉCOMPENSE DE DÉPART ✦\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"**Récompense :** {recompense_display}\n"
+    )
 
-    embed.add_field(name="✦ Pouvoirs", value="​", inline=False)
-    embed.add_field(name="Sort", value=sort_display, inline=True)
-    embed.add_field(name="Nature", value=nature_display, inline=True)
-    embed.add_field(name="Réserve", value=reserve_display, inline=True)
-    embed.add_field(name="RCT", value=rct_display, inline=True)
-    embed.add_field(name="​", value="​", inline=True)
-    embed.add_field(name="​", value="​", inline=True)
+    description += (
+        f"\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"✦ STATUT ✦\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"**Statut :** {statut_display}\n"
+        f"**Validé par :** {valide_par_display}\n"
+        f"**Créée le :** {date_creation}\n"
+    )
 
-    embed.add_field(name="✦ Récompense de départ", value="​", inline=False)
-    embed.add_field(name="Récompense", value=recompense_display, inline=True)
-
-    if histoire:
-        embed.add_field(name="✦ Histoire", value="​", inline=False)
-        embed.add_field(name="Histoire", value=histoire[:1024], inline=False)
-
-    embed.add_field(name="✦ Statut", value="​", inline=False)
-    embed.add_field(name="Statut", value="🕒 En attente de validation", inline=True)
-    embed.add_field(name="Créée le", value=date_creation, inline=True)
-
+    embed = discord.Embed(
+        title="📜 Fiche de personnage",
+        description=description,
+        color=discord.Color.from_rgb(201, 165, 92),
+    )
     portrait_path = progress.get("portrait_path")
     if portrait_path and os.path.exists(portrait_path):
         embed.set_image(url=f"attachment://{nom_fichier_image}")
@@ -1254,6 +1279,11 @@ async def finalize_fiche(client, uid: int):
             await staff_channel.send(content=content, embed=embed, file=discord.File(portrait_path, filename=filename), view=view)
         else:
             await staff_channel.send(content=content, embed=embed, view=view)
+
+        # Histoire envoyée en message séparé (texte brut), pour ne pas alourdir l'embed.
+        histoire = progress.get("histoire")
+        if histoire:
+            await staff_channel.send(f"📖 Histoire de {member_mention} :\n{histoire}")
 
     origin = client.get_channel(progress.get("origin_channel_id"))
     if origin:
@@ -1296,12 +1326,11 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
     update_progress(target_uid, fiche_status="validated")
 
     # 3) Renvoie le même embed (même image) dans le salon des fiches validées, sans boutons.
-    #    Sur cette copie uniquement, le statut passe à « ✅ Validée ».
-    embed = build_fiche_embed(progress, guild, member, target_uid)
-    for i, field in enumerate(embed.fields):
-        if field.name == "Statut":
-            embed.set_field_at(i, name=field.name, value="✅ Validée", inline=field.inline)
-            break
+    #    Sur cette copie uniquement : statut « ✅ Validée » et mention du valideur.
+    embed = build_fiche_embed(
+        progress, guild, member, target_uid,
+        statut_display="✅ Validée", valide_par_display=interaction.user.mention,
+    )
     portrait_path = progress.get("portrait_path")
     filename = _fiche_portrait_filename(target_uid, slot)
     validated_channel = interaction.client.get_channel(FICHE_VALIDATED_CHANNEL_ID)
