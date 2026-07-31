@@ -1182,39 +1182,52 @@ def build_fiche_embed(progress: dict, guild, member, uid: int) -> discord.Embed:
     reco_display = progress.get("recompense") or "Aucune"
     histoire = progress.get("histoire")
 
-    embed = discord.Embed(title="📜 Fiche de personnage", color=discord.Color.blurple())
+    # Alias vers les noms utilisés dans la mise en page ci-dessous.
+    slot_number = slot
+    camp_display = camp
+    grade_display = grade
+    recompense_display = reco_display
+    date_creation = datetime.utcnow().strftime("%d/%m/%Y")
+    nom_fichier_image = _fiche_portrait_filename(uid, slot)
+
+    embed = discord.Embed(title="📜 Fiche de personnage", color=discord.Color.from_rgb(201, 165, 92))
 
     embed.add_field(name="✦ Identité", value="​", inline=False)
     embed.add_field(name="Prénom", value=prenom, inline=True)
     embed.add_field(name="Nom", value=nom_final, inline=True)
-    embed.add_field(name="Emplacement", value=f"Slot {slot}", inline=True)
+    embed.add_field(name="Emplacement", value=f"Slot {slot_number}", inline=True)
     embed.add_field(name="Âge", value=age_display, inline=True)
-    embed.add_field(name="Camp", value=camp, inline=True)
+    embed.add_field(name="Camp", value=camp_display, inline=True)
+    embed.add_field(name="​", value="​", inline=True)
 
     embed.add_field(name="✦ Appartenance", value="​", inline=False)
     embed.add_field(name="Clan", value=clan_display, inline=True)
-    embed.add_field(name="Grade", value=grade, inline=True)
+    embed.add_field(name="Grade", value=grade_display, inline=True)
+    embed.add_field(name="​", value="​", inline=True)
 
     embed.add_field(name="✦ Pouvoirs", value="​", inline=False)
     embed.add_field(name="Sort", value=sort_display, inline=True)
     embed.add_field(name="Nature", value=nature_display, inline=True)
     embed.add_field(name="Réserve", value=reserve_display, inline=True)
     embed.add_field(name="RCT", value=rct_display, inline=True)
+    embed.add_field(name="​", value="​", inline=True)
+    embed.add_field(name="​", value="​", inline=True)
 
     embed.add_field(name="✦ Récompense de départ", value="​", inline=False)
-    embed.add_field(name="Récompense", value=reco_display, inline=False)
+    embed.add_field(name="Récompense", value=recompense_display, inline=True)
 
     if histoire:
-        text = histoire if len(histoire) <= 1024 else histoire[:1021] + "..."
-        embed.add_field(name="✦ Histoire", value=text, inline=False)
+        embed.add_field(name="✦ Histoire", value="​", inline=False)
+        embed.add_field(name="Histoire", value=histoire[:1024], inline=False)
 
     embed.add_field(name="✦ Statut", value="​", inline=False)
     embed.add_field(name="Statut", value="🕒 En attente de validation", inline=True)
-    embed.add_field(name="Créée le", value=datetime.utcnow().strftime("%d/%m/%Y"), inline=True)
+    embed.add_field(name="Créée le", value=date_creation, inline=True)
 
     portrait_path = progress.get("portrait_path")
     if portrait_path and os.path.exists(portrait_path):
-        embed.set_image(url=f"attachment://{_fiche_portrait_filename(uid, slot)}")
+        embed.set_image(url=f"attachment://{nom_fichier_image}")
+    embed.set_footer(text="Cendres de Shibuya — Fiche de personnage")
 
     return embed
 
@@ -2392,7 +2405,13 @@ class Depart(commands.Cog):
                 camp = row["camp"] or ""
                 clan = row["clan"]
                 camp_clan = f"{camp} — {clan}" if clan else camp
-                slots.append({"filled": True, "name": row["character_name"], "camp_clan": camp_clan})
+                portrait_path = row["portrait_path"] if "portrait_path" in row.keys() else None
+                slots.append({
+                    "filled": True,
+                    "name": row["character_name"],
+                    "camp_clan": camp_clan,
+                    "portrait_path": portrait_path,
+                })
             else:
                 slots.append({"filled": False})
 

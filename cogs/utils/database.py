@@ -670,7 +670,7 @@ def get_validated_characters(user_id: int, guild_id: int):
     """Slots occupés d'un joueur sur un serveur, triés par numéro de slot croissant."""
     with get_connection() as conn:
         return conn.execute(
-            """SELECT slot_number, character_name, camp, clan
+            """SELECT slot_number, character_name, camp, clan, portrait_path
                FROM validated_characters WHERE user_id = ? AND guild_id = ?
                ORDER BY slot_number ASC""",
             (user_id, guild_id),

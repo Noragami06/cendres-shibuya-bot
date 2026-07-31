@@ -14,6 +14,7 @@ PANEL_CHANNEL_ID = 1523648386878672982        # Salon où le panel est envoyé
 CONFIRM_CHANNEL_ID = 1523649007753236491      # Salon des demandes de confirmation
 TICKET_CATEGORY_ID = 1523648386052653056      # Catégorie des salons de tickets
 OWNER_DM_ID = 396615332346855428              # Toi - reçoit le MP à la suppression
+DEPART_ROLE_ID = 1521961072334999663          # Joueurs sans fiche encore validée (upload autorisé dans leur ticket)
 
 REASONS = {
     "fiche": {"label": "Fiche", "color": discord.Color.green(), "emoji": "📄"},
@@ -151,6 +152,13 @@ async def create_ticket_channel(interaction, requester, ticket_type, reason_text
         access_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
         guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True),
     }
+
+    # Les joueurs "départ" (fiche pas encore validée) peuvent uploader images/embeds dans CE ticket uniquement.
+    if any(role.id == DEPART_ROLE_ID for role in requester.roles):
+        overwrites[requester] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True,
+            attach_files=True, embed_links=True
+        )
 
     channel = await category.create_text_channel(name=channel_name, overwrites=overwrites)
 

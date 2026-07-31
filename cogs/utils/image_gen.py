@@ -1,4 +1,4 @@
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 import math
 import os
 
@@ -312,7 +312,7 @@ def generate_slots_image(username: str, slots: list, out_path: str):
             dd.line([(0, y), (pa_w, y)], fill=c)
         return im
 
-    def slot_hybrid(size, filled, name="", sub=""):
+    def slot_hybrid(size, filled, name="", sub="", portrait_path=None):
         W, H = size
         img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         cut = 18
@@ -339,7 +339,11 @@ def generate_slots_image(username: str, slots: list, out_path: str):
 
         if filled:
             pa = (16, 26, W - 16, H - 66)
-            portrait = placeholder_portrait(pa[2] - pa[0], pa[3] - pa[1])
+            if portrait_path and os.path.exists(portrait_path):
+                portrait = Image.open(portrait_path).convert("RGB")
+                portrait = ImageOps.fit(portrait, (pa[2] - pa[0], pa[3] - pa[1]), method=Image.LANCZOS)
+            else:
+                portrait = placeholder_portrait(pa[2] - pa[0], pa[3] - pa[1])
             img.paste(portrait, (pa[0], pa[1]))
             d.rectangle((pa[0], pa[1], pa[2], pa[3]), outline=SLOT_GOLD_DIM, width=1)
 
@@ -382,7 +386,7 @@ def generate_slots_image(username: str, slots: list, out_path: str):
     y = 100
 
     for i, slot in enumerate(slots[:3]):
-        piece = slot_hybrid(slot_size, slot.get("filled", False), slot.get("name", ""), slot.get("camp_clan", ""))
+        piece = slot_hybrid(slot_size, slot.get("filled", False), slot.get("name", ""), slot.get("camp_clan", ""), slot.get("portrait_path"))
         canvas.alpha_composite(piece, (start_x + i * (slot_size[0] + gap), y))
 
     canvas.save(out_path)
