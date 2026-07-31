@@ -229,7 +229,12 @@ class TicketControlView(discord.ui.View):
             return
 
         ticket_id = ticket["id"]
-        await interaction.response.send_message("Suppression en cours, sauvegarde de la conversation...")
+        # Unique réponse à l'interaction (edit du message de contrôle). Tout ce qui suit
+        # (transcript, DB, DM) prend du temps : une 2e interaction.response.* déclencherait
+        # "Unknown interaction" (10062). On n'utilise donc plus interaction.response après ici.
+        await interaction.response.edit_message(
+            content="Suppression en cours, sauvegarde de la discussion...", embed=None, view=None
+        )
 
         transcript_path = await save_transcript(interaction.channel, ticket_id)
         db.update_ticket_transcript(ticket_id, "deleted", transcript_path)

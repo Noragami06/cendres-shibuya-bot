@@ -6,4 +6,5 @@ data/transcripts/
 data/bot.db
 data/*.bak
 data/*.json.bak
+data/portraits/
 temp/

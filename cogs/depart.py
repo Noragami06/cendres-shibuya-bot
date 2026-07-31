@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 import asyncio
+import io
 import os
 import random
 import re
@@ -9,6 +10,7 @@ import uuid
 from datetime import datetime, timedelta
 
 import aiohttp
+from PIL import Image
 
 from cogs.utils import database as db
 from cogs.utils.image_gen import (
@@ -1173,18 +1175,26 @@ async def _head_content_type(url: str):
         return None
 
 
-async def _download_image(url: str, dest: str) -> bool:
+async def _download_image_bytes(url: str):
+    """Télécharge l'image et retourne ses bytes bruts, ou None en cas d'échec."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                 if resp.status != 200:
-                    return False
-                data = await resp.read()
-        with open(dest, "wb") as f:
-            f.write(data)
-        return True
+                    return None
+                return await resp.read()
     except Exception:
-        return False
+        return None
+
+
+def compress_portrait(image_bytes: bytes, max_dimension: int = 1024, quality: int = 85) -> bytes:
+    """Redimensionne (max 1024 px) et recompresse l'image en JPEG pour limiter le poids sur disque."""
+    img = Image.open(io.BytesIO(image_bytes))
+    img = img.convert("RGB")  # nécessaire pour sauvegarder en JPEG même si l'original est PNG avec transparence
+    img.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
+    output = io.BytesIO()
+    img.save(output, format="JPEG", quality=quality, optimize=True)
+    return output.getvalue()
 
 
 async def _resolve_portrait_url(message: discord.Message):
@@ -1223,11 +1233,24 @@ async def handle_fiche_portrait(client, message: discord.Message, progress: dict
 
     os.makedirs(PORTRAIT_DIR, exist_ok=True)
     slot = progress.get("slot_number") or 1
-    dest = os.path.join(PORTRAIT_DIR, f"{uid}_{slot}.png")
-    if not await _download_image(url, dest):
+
+    raw = await _download_image_bytes(url)
+    if raw is None:
         await message.channel.send("Impossible de télécharger l'image, réessaie avec un autre fichier ou lien.")
         update_progress(uid, fiche_deadline=_fiche_deadline_iso())
         return
+
+    # Compression + conversion JPEG systématique : le portrait est TOUJOURS sauvegardé en .jpg.
+    try:
+        jpeg_bytes = compress_portrait(raw)
+    except Exception:
+        await message.channel.send("Cette image est illisible ou corrompue, réessaie avec un autre fichier.")
+        update_progress(uid, fiche_deadline=_fiche_deadline_iso())
+        return
+
+    dest = os.path.join(PORTRAIT_DIR, f"{uid}_{slot}.jpg")
+    with open(dest, "wb") as f:
+        f.write(jpeg_bytes)
 
     update_progress(uid, portrait_path=dest)
     await _delete_fiche_question(client, progress)
@@ -1241,7 +1264,7 @@ async def handle_fiche_portrait(client, message: discord.Message, progress: dict
 
 # ---------- Construction & envoi de la fiche ----------
 def _fiche_portrait_filename(uid: int, slot: int) -> str:
-    return f"portrait_{uid}_{slot}.png"
+    return f"portrait_{uid}_{slot}.jpg"
 
 
 ORIGINE_LABELS = {
