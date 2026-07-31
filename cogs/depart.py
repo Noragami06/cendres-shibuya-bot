@@ -1,10 +1,14 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import asyncio
 import os
 import random
+import re
 import uuid
+from datetime import datetime, timedelta
+
+import aiohttp
 
 from cogs.utils import database as db
 from cogs.utils.image_gen import (
@@ -69,6 +73,35 @@ GRADE_ROLES = [
 
 # Utilisateur bénéficiant du flux spécial en message privé
 SPECIAL_USER_ID = 396615332346855428
+
+# ---------- Fiche de personnage ----------
+FICHE_STAFF_CHANNEL_ID = 1521243474371022939       # salon où la fiche arrive pour validation
+FICHE_STAFF_ROLE_ID = 1521229332075512039          # rôle staff (mention + seul autorisé à valider/refuser)
+FICHE_VALIDATED_CHANNEL_ID = 1521817179954221066   # salon des fiches validées
+
+PORTRAIT_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "portraits")
+FICHE_TIMEOUT_MINUTES = 5
+IMAGE_EXT_OK = (".jpg", ".jpeg", ".png")
+
+FICHE_INTRO_TEXT = (
+    "Tes rolls sont finis. Après ce message, ta fiche va commencer. Tu auras 5 minutes par question, "
+    "au delà de ce délai ta fiche sera annulée, il te suffira de recliquer sur le bouton ci dessous "
+    "pour recommencer.\n\n"
+    "Avant de te lancer, prépare :\n"
+    "- Une image\n"
+    "- Un nom de famille (si tu es sans clan ou que tu as déserté ton clan)\n"
+    "- Un prénom\n"
+    "- Un âge\n\n"
+    "Une fois tout prêt, clique sur le bouton pour commencer ta fiche."
+)
+
+QUESTION_TEXTS = {
+    "nom": "Quel est le nom de famille de ton personnage ?",
+    "prenom": "Quel est le prénom de ton personnage ?",
+    "age": "Quel âge a ton personnage ?",
+    "histoire_text": "Envoie l'histoire de ton personnage dans ce salon.",
+    "portrait": "Envoie l'image de ton personnage (JPG ou PNG uniquement, en pièce jointe ou en lien direct, pas de GIF).",
+}
 
 DEPART_IMAGE_URL = "https://c.tenor.com/4fjag09ZNgEAAAAC/tenor.gif"
 
@@ -827,9 +860,470 @@ class ContinueFicheView(discord.ui.View):
 
     @discord.ui.button(label="Continuer", emoji="➡️", style=discord.ButtonStyle.success, custom_id="depart_continuer_fiche")
     async def continuer(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # TODO: étape fiche (point 6) pas encore développée.
-        await interaction.response.send_message(
-            "La création de ta fiche arrive dans une prochaine étape.", ephemeral=False
+        # Mémorise le salon d'origine (où arriveront les questions) puis envoie l'écran "Vers la fiche".
+        update_progress(interaction.user.id, origin_channel_id=interaction.channel.id)
+        embed = discord.Embed(title="📜 Vers la fiche", description=FICHE_INTRO_TEXT, color=discord.Color.blurple())
+        await interaction.response.send_message(embed=embed, view=FaireFicheView(interaction.user.id))
+
+
+# =====================================================================
+# FICHE DE PERSONNAGE
+# =====================================================================
+def get_fiche_steps(has_clan: bool) -> list:
+    steps = []
+    if not has_clan:
+        steps.append("nom")
+    steps += ["prenom", "age", "histoire_ask", "portrait"]
+    return steps
+
+
+def has_clan_from_progress(progress: dict) -> bool:
+    clan = progress.get("clan")
+    return clan is not None and clan != "sans_clan"
+
+
+def next_fiche_stage(current: str, has_clan: bool):
+    """Étape suivante. 'histoire_text' n'est pas dans la liste : après elle on va à ce qui suit
+    'histoire_ask' (portrait)."""
+    steps = get_fiche_steps(has_clan)
+    if current == "histoire_text":
+        idx = steps.index("histoire_ask")
+        return steps[idx + 1] if idx + 1 < len(steps) else None
+    if current in steps:
+        idx = steps.index(current)
+        return steps[idx + 1] if idx + 1 < len(steps) else None
+    return None
+
+
+def _fiche_deadline_iso() -> str:
+    return (datetime.utcnow() + timedelta(minutes=FICHE_TIMEOUT_MINUTES)).isoformat()
+
+
+def _is_fiche_staff(member) -> bool:
+    return any(role.id == FICHE_STAFF_ROLE_ID for role in getattr(member, "roles", []))
+
+
+def compute_recommended_grade(guild, member, clan_role_id) -> str:
+    if clan_role_id is None:
+        return "Aucun (sans clan)"
+    if member is None:
+        return "Membre principal ou secondaire (à discuter avec le staff en MP)"
+    role_ids = {role.id for role in member.roles}
+    # Les 6 premiers grades nommés (Chef, Bras droit/gauche, Héritier, Bras droit/gauche héritier).
+    for name, rid in GRADE_ROLES[:6]:
+        if rid in role_ids:
+            return name
+    if MEMBRES_PRINCIPAUX_ROLE_ID in role_ids:
+        return "Membre principal"
+    return "Membre principal ou secondaire (à discuter avec le staff en MP)"
+
+
+# ---------- Vues (conteneurs simples, custom_id par joueur -> listener) ----------
+class FaireFicheView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Faire ma fiche", emoji="📝", style=discord.ButtonStyle.success,
+            custom_id=f"depart_start_fiche:{user_id}",
+        ))
+
+
+class HistoireAskView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Oui", style=discord.ButtonStyle.success, custom_id=f"depart_histoire_oui:{user_id}",
+        ))
+        self.add_item(discord.ui.Button(
+            label="Non", style=discord.ButtonStyle.secondary, custom_id=f"depart_histoire_non:{user_id}",
+        ))
+
+
+class FicheReviewView(discord.ui.View):
+    def __init__(self, user_id: int, slot_number: int):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Validé", emoji="✅", style=discord.ButtonStyle.success,
+            custom_id=f"depart_fiche_valide:{user_id}:{slot_number}",
+        ))
+        self.add_item(discord.ui.Button(
+            label="Refusé", emoji="❌", style=discord.ButtonStyle.danger,
+            custom_id=f"depart_fiche_refuse:{user_id}",
+        ))
+
+
+# ---------- Envoi des questions ----------
+async def _delete_fiche_question(client, progress: dict):
+    """Supprime le dernier message de question du bot (si connu et accessible)."""
+    channel = client.get_channel(progress.get("origin_channel_id"))
+    qid = progress.get("fiche_question_msg_id")
+    if channel and qid:
+        try:
+            msg = await channel.fetch_message(qid)
+            await msg.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+
+async def send_fiche_question(client, user_id: int):
+    """Envoie la question correspondant au fiche_stage courant dans le salon d'origine."""
+    progress = get_progress(user_id)
+    channel = client.get_channel(progress.get("origin_channel_id"))
+    if channel is None:
+        return
+    stage = progress.get("fiche_stage")
+
+    if stage == "histoire_ask":
+        embed = discord.Embed(
+            description="Souhaites tu ajouter une histoire à ton personnage ? (facultatif)",
+            color=discord.Color.blurple(),
+        )
+        msg = await channel.send(embed=embed, view=HistoireAskView(user_id))
+    else:
+        text = QUESTION_TEXTS.get(stage)
+        if text is None:
+            return
+        msg = await channel.send(text)
+
+    update_progress(user_id, fiche_question_msg_id=msg.id)
+
+
+# ---------- Handlers de boutons ----------
+async def handle_start_fiche(interaction: discord.Interaction, custom_id: str):
+    owner_id = int(custom_id.split(":", 1)[1])
+    if interaction.user.id != owner_id:
+        await interaction.response.send_message("Ce bouton ne t'appartient pas.", ephemeral=True)
+        return
+
+    progress = get_progress(interaction.user.id)
+    has_clan = has_clan_from_progress(progress)
+    steps = get_fiche_steps(has_clan)
+
+    # Repart toujours de zéro (même après annulation ou refus).
+    update_progress(
+        interaction.user.id,
+        nom=None, prenom=None, age=None, histoire=None, portrait_path=None,
+        fiche_status="in_progress", fiche_stage=steps[0],
+        fiche_deadline=_fiche_deadline_iso(),
+        origin_channel_id=interaction.channel.id,
+    )
+    await interaction.response.send_message("C'est parti ! Réponds aux questions ci-dessous.", ephemeral=True)
+    await send_fiche_question(interaction.client, interaction.user.id)
+
+
+async def handle_histoire(interaction: discord.Interaction, custom_id: str, choice: str):
+    owner_id = int(custom_id.split(":", 1)[1])
+    if interaction.user.id != owner_id:
+        await interaction.response.send_message("Ce bouton ne t'appartient pas.", ephemeral=True)
+        return
+
+    progress = get_progress(interaction.user.id)
+    if progress.get("fiche_status") != "in_progress" or progress.get("fiche_stage") != "histoire_ask":
+        await interaction.response.send_message("Cette étape n'est plus active.", ephemeral=True)
+        return
+
+    has_clan = has_clan_from_progress(progress)
+    await interaction.response.defer()
+    await _delete_fiche_question(interaction.client, progress)  # retire l'embed Oui/Non
+
+    if choice == "oui":
+        update_progress(interaction.user.id, fiche_stage="histoire_text", fiche_deadline=_fiche_deadline_iso())
+    else:
+        nxt = next_fiche_stage("histoire_ask", has_clan)  # -> portrait
+        update_progress(interaction.user.id, histoire=None, fiche_stage=nxt, fiche_deadline=_fiche_deadline_iso())
+        await interaction.followup.send("Très bien.", ephemeral=True)
+
+    await send_fiche_question(interaction.client, interaction.user.id)
+
+
+# ---------- Réponses texte / image ----------
+async def handle_fiche_text_answer(client, message: discord.Message, progress: dict, stage: str):
+    uid = message.author.id
+
+    if stage == "age":
+        content = message.content.strip()
+        if not content.isdigit() or int(content) <= 0:
+            # Âge invalide : on ne supprime rien, on ne change pas d'étape, la deadline n'est PAS reset.
+            await message.channel.send("Merci d'entrer un âge valide (nombre entier).")
+            return
+        update_progress(uid, age=int(content))
+    elif stage == "nom":
+        update_progress(uid, nom=message.content.strip())
+    elif stage == "prenom":
+        update_progress(uid, prenom=message.content.strip())
+    elif stage == "histoire_text":
+        update_progress(uid, histoire=message.content.strip())
+
+    await _delete_fiche_question(client, progress)
+    try:
+        await message.delete()
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    has_clan = has_clan_from_progress(progress)
+    nxt = next_fiche_stage(stage, has_clan)
+    if nxt is None:
+        await finalize_fiche(client, uid)
+        return
+    update_progress(uid, fiche_stage=nxt, fiche_deadline=_fiche_deadline_iso())
+    await send_fiche_question(client, uid)
+
+
+async def _head_content_type(url: str):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.head(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                return (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    except Exception:
+        return None
+
+
+async def _download_image(url: str, dest: str) -> bool:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status != 200:
+                    return False
+                data = await resp.read()
+        with open(dest, "wb") as f:
+            f.write(data)
+        return True
+    except Exception:
+        return False
+
+
+async def _resolve_portrait_url(message: discord.Message):
+    """Retourne une URL d'image JPG/PNG valide (pièce jointe ou lien), ou None. Refuse les GIF."""
+    for att in message.attachments:
+        name = (att.filename or "").lower()
+        if name.endswith(".gif"):
+            return None
+        if name.endswith(IMAGE_EXT_OK):
+            return att.url
+
+    match = re.search(r"https?://\S+", message.content or "")
+    if match:
+        link = match.group(0)
+        low = link.lower().split("?")[0]
+        if low.endswith(".gif"):
+            return None
+        if low.endswith(IMAGE_EXT_OK):
+            return link
+        ctype = await _head_content_type(link)
+        if ctype in ("image/jpeg", "image/png"):
+            return link
+    return None
+
+
+async def handle_fiche_portrait(client, message: discord.Message, progress: dict):
+    uid = message.author.id
+    url = await _resolve_portrait_url(message)
+
+    if url is None:
+        await message.channel.send(
+            "Format non accepté, envoie une image en JPG ou PNG (pièce jointe ou lien direct), pas de GIF."
+        )
+        update_progress(uid, fiche_deadline=_fiche_deadline_iso())  # laisse le temps de rectifier
+        return
+
+    os.makedirs(PORTRAIT_DIR, exist_ok=True)
+    slot = progress.get("slot_number") or 1
+    dest = os.path.join(PORTRAIT_DIR, f"{uid}_{slot}.png")
+    if not await _download_image(url, dest):
+        await message.channel.send("Impossible de télécharger l'image, réessaie avec un autre fichier ou lien.")
+        update_progress(uid, fiche_deadline=_fiche_deadline_iso())
+        return
+
+    update_progress(uid, portrait_path=dest)
+    await _delete_fiche_question(client, progress)
+    try:
+        await message.delete()
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    await finalize_fiche(client, uid)
+
+
+# ---------- Construction & envoi de la fiche ----------
+def _fiche_portrait_filename(uid: int, slot: int) -> str:
+    return f"portrait_{uid}_{slot}.png"
+
+
+def build_fiche_embed(progress: dict, guild, member, uid: int) -> discord.Embed:
+    clan_key = progress.get("clan")
+    has_clan = has_clan_from_progress(progress)
+    clan_display = clan_key.capitalize() if has_clan else "Sans clan"
+    nom_final = clan_key.capitalize() if has_clan else (progress.get("nom") or "—")
+    prenom = progress.get("prenom") or "—"
+    age = progress.get("age")
+    age_display = str(age) if age is not None else "—"
+    slot = progress.get("slot_number") or 1
+    camp = (progress.get("camp") or "—").capitalize()
+
+    clan_role_id = None
+    if has_clan:
+        info = load_clan_state()["clans"].get(clan_key)
+        clan_role_id = info["role_id"] if info else None
+    grade = compute_recommended_grade(guild, member, clan_role_id)
+
+    sort_key = progress.get("sort")
+    sort_display = SORT_LABELS.get(sort_key, "Aucun") if sort_key else "Aucun"
+    nature = progress.get("nature")
+    nature_display = NATURE_DISPLAY_NAMES.get(nature, "Aucune") if nature else "Aucune"
+
+    eo_classe = progress.get("eo_classe")
+    eo_value = progress.get("eo_value")
+    if eo_classe and eo_value is not None:
+        reserve_display = f"Classe {eo_classe.replace('classe_', '').upper()} — {eo_value:,} EO"
+    else:
+        reserve_display = "Aucune"
+
+    rct_display = "Maîtrisé" if progress.get("rct") else "Non maîtrisé"
+    reco_display = progress.get("recompense") or "Aucune"
+    histoire = progress.get("histoire")
+
+    embed = discord.Embed(title="📜 Fiche de personnage", color=discord.Color.blurple())
+
+    embed.add_field(name="✦ Identité", value="​", inline=False)
+    embed.add_field(name="Prénom", value=prenom, inline=True)
+    embed.add_field(name="Nom", value=nom_final, inline=True)
+    embed.add_field(name="Emplacement", value=f"Slot {slot}", inline=True)
+    embed.add_field(name="Âge", value=age_display, inline=True)
+    embed.add_field(name="Camp", value=camp, inline=True)
+
+    embed.add_field(name="✦ Appartenance", value="​", inline=False)
+    embed.add_field(name="Clan", value=clan_display, inline=True)
+    embed.add_field(name="Grade", value=grade, inline=True)
+
+    embed.add_field(name="✦ Pouvoirs", value="​", inline=False)
+    embed.add_field(name="Sort", value=sort_display, inline=True)
+    embed.add_field(name="Nature", value=nature_display, inline=True)
+    embed.add_field(name="Réserve", value=reserve_display, inline=True)
+    embed.add_field(name="RCT", value=rct_display, inline=True)
+
+    embed.add_field(name="✦ Récompense de départ", value="​", inline=False)
+    embed.add_field(name="Récompense", value=reco_display, inline=False)
+
+    if histoire:
+        text = histoire if len(histoire) <= 1024 else histoire[:1021] + "..."
+        embed.add_field(name="✦ Histoire", value=text, inline=False)
+
+    embed.add_field(name="✦ Statut", value="​", inline=False)
+    embed.add_field(name="Statut", value="🕒 En attente de validation", inline=True)
+    embed.add_field(name="Créée le", value=datetime.utcnow().strftime("%d/%m/%Y"), inline=True)
+
+    portrait_path = progress.get("portrait_path")
+    if portrait_path and os.path.exists(portrait_path):
+        embed.set_image(url=f"attachment://{_fiche_portrait_filename(uid, slot)}")
+
+    return embed
+
+
+async def finalize_fiche(client, uid: int):
+    progress = get_progress(uid)
+    guild = client.get_guild(progress.get("guild_id")) if progress.get("guild_id") else None
+    member = guild.get_member(uid) if guild else None
+
+    update_progress(uid, fiche_status="pending_review", fiche_stage=None)
+
+    embed = build_fiche_embed(progress, guild, member, uid)
+    slot = progress.get("slot_number") or 1
+    portrait_path = progress.get("portrait_path")
+    filename = _fiche_portrait_filename(uid, slot)
+
+    member_mention = member.mention if member else f"<@{uid}>"
+    content = f"<@&{FICHE_STAFF_ROLE_ID}> Fiche de {member_mention}"
+    view = FicheReviewView(uid, slot)
+
+    staff_channel = client.get_channel(FICHE_STAFF_CHANNEL_ID)
+    if staff_channel:
+        if portrait_path and os.path.exists(portrait_path):
+            await staff_channel.send(content=content, embed=embed, file=discord.File(portrait_path, filename=filename), view=view)
+        else:
+            await staff_channel.send(content=content, embed=embed, view=view)
+
+    origin = client.get_channel(progress.get("origin_channel_id"))
+    if origin:
+        await origin.send(f"{member_mention} Ta fiche a été envoyée au staff pour validation.")
+
+
+async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
+    parts = custom_id.split(":")
+    target_uid = int(parts[1])
+    slot = int(parts[2])
+
+    if not _is_fiche_staff(interaction.user):
+        await interaction.response.send_message("Tu n'as pas la permission.", ephemeral=True)
+        return
+
+    progress = get_progress(target_uid)
+    guild = interaction.guild
+    member = guild.get_member(target_uid) if guild else None
+
+    # 1) Retire les boutons + note (acquitte l'interaction rapidement).
+    original_content = interaction.message.content or ""
+    await interaction.response.edit_message(
+        content=f"{original_content}\n✅ Validée par {interaction.user.mention}", view=None
+    )
+
+    # 2) Insertion dans validated_characters.
+    has_clan = has_clan_from_progress(progress)
+    nom_final = progress.get("clan").capitalize() if has_clan else (progress.get("nom") or "")
+    prenom = progress.get("prenom") or ""
+    character_name = f"{prenom} {nom_final}".strip()
+    discord_username = member.name if member else str(target_uid)
+    db.insert_validated_character(
+        user_id=target_uid, guild_id=progress.get("guild_id"), slot_number=slot,
+        discord_username=discord_username, character_name=character_name,
+        camp=progress.get("camp"), clan=progress.get("clan"), sort=progress.get("sort"),
+        eo_classe=progress.get("eo_classe"), eo_value=progress.get("eo_value"),
+        nature=progress.get("nature"), portrait_path=progress.get("portrait_path"),
+        validated_at=datetime.utcnow().isoformat(),
+    )
+    update_progress(target_uid, fiche_status="validated")
+
+    # 3) Renvoie le même embed (même image) dans le salon des fiches validées, sans boutons.
+    embed = build_fiche_embed(progress, guild, member, target_uid)
+    portrait_path = progress.get("portrait_path")
+    filename = _fiche_portrait_filename(target_uid, slot)
+    validated_channel = interaction.client.get_channel(FICHE_VALIDATED_CHANNEL_ID)
+    if validated_channel:
+        if portrait_path and os.path.exists(portrait_path):
+            await validated_channel.send(embed=embed, file=discord.File(portrait_path, filename=filename))
+        else:
+            await validated_channel.send(embed=embed)
+
+    # 4) Notifie le joueur.
+    origin = interaction.client.get_channel(progress.get("origin_channel_id"))
+    member_mention = member.mention if member else f"<@{target_uid}>"
+    if origin:
+        await origin.send(f"{member_mention} Ta fiche a été validée par le staff ! Bienvenue.")
+
+
+async def handle_fiche_refuse(interaction: discord.Interaction, custom_id: str):
+    target_uid = int(custom_id.split(":")[1])
+
+    if not _is_fiche_staff(interaction.user):
+        await interaction.response.send_message("Tu n'as pas la permission.", ephemeral=True)
+        return
+
+    progress = get_progress(target_uid)
+    original_content = interaction.message.content or ""
+    await interaction.response.edit_message(
+        content=f"{original_content}\n❌ Refusée par {interaction.user.mention}", view=None
+    )
+
+    # Repart de zéro pour la prochaine tentative.
+    update_progress(
+        target_uid, fiche_status="not_started", fiche_stage=None,
+        nom=None, prenom=None, age=None, histoire=None, portrait_path=None,
+    )
+
+    origin = interaction.client.get_channel(progress.get("origin_channel_id"))
+    if origin:
+        await origin.send(
+            f"<@{target_uid}> Ta fiche a été refusée par le staff. Tu peux recommencer en cliquant "
+            "sur le bouton \"Faire ma fiche\" ci dessus."
         )
 
 
@@ -903,6 +1397,11 @@ async def apply_reward(interaction: discord.Interaction, reward: dict):
     uid = member.id
     key = reward["key"]
     progress = get_progress(uid)
+
+    # Mémorise la récompense choisie pour l'afficher plus tard dans la fiche.
+    qty = reward.get("qty")
+    reco_display = reward["name"] if (not qty or qty == "x1") else f"{reward['name']} — {qty}"
+    update_progress(uid, recompense=reco_display)
 
     # --- Effet propre à chaque récompense (aucun return : l'enchaînement RCT est commun, plus bas) ---
     if key in ("argent", "xp"):
@@ -1802,6 +2301,13 @@ class Depart(commands.Cog):
         # même si le message réellement envoyé n'en affichait que 3.
         self.bot.add_view(DMSortView(show_partial=True))
 
+        # Tâche d'annulation des fiches expirées.
+        if not self.fiche_expiry_loop.is_running():
+            self.fiche_expiry_loop.start()
+
+    async def cog_unload(self):
+        self.fiche_expiry_loop.cancel()
+
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
         # Boutons à custom_id dynamique (par joueur) : dispatch par préfixe, persistant après redémarrage.
@@ -1814,6 +2320,57 @@ class Depart(commands.Cog):
             await handle_roll_rct(interaction, custom_id)
         elif custom_id.startswith("depart_reroll_rct:"):
             await handle_reroll_rct(interaction, custom_id)
+        elif custom_id.startswith("depart_start_fiche:"):
+            await handle_start_fiche(interaction, custom_id)
+        elif custom_id.startswith("depart_histoire_oui:"):
+            await handle_histoire(interaction, custom_id, "oui")
+        elif custom_id.startswith("depart_histoire_non:"):
+            await handle_histoire(interaction, custom_id, "non")
+        elif custom_id.startswith("depart_fiche_valide:"):
+            await handle_fiche_valide(interaction, custom_id)
+        elif custom_id.startswith("depart_fiche_refuse:"):
+            await handle_fiche_refuse(interaction, custom_id)
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        # Réponses texte/image aux questions de la fiche.
+        if message.author.bot or message.guild is None:
+            return
+        progress = get_progress(message.author.id)
+        if progress.get("fiche_status") != "in_progress":
+            return
+        if message.channel.id != progress.get("origin_channel_id"):
+            return
+
+        stage = progress.get("fiche_stage")
+        if stage in ("nom", "prenom", "age", "histoire_text"):
+            await handle_fiche_text_answer(self.bot, message, progress, stage)
+        elif stage == "portrait":
+            await handle_fiche_portrait(self.bot, message, progress)
+        # stage == "histoire_ask" : on attend un clic de bouton, on ignore le texte.
+
+    @tasks.loop(seconds=30)
+    async def fiche_expiry_loop(self):
+        now_iso = datetime.utcnow().isoformat()
+        for row in db.get_expired_fiches(now_iso):
+            uid = row["user_id"]
+            update_progress(
+                uid, fiche_status="not_started", fiche_stage=None,
+                nom=None, prenom=None, age=None, histoire=None, portrait_path=None,
+            )
+            channel = self.bot.get_channel(row["origin_channel_id"])
+            if channel:
+                try:
+                    await channel.send(
+                        f"<@{uid}> Le temps est écoulé, ta fiche a été annulée. Tu peux recommencer en "
+                        "cliquant sur le bouton \"Faire ma fiche\" ci dessus."
+                    )
+                except discord.HTTPException:
+                    pass
+
+    @fiche_expiry_loop.before_loop
+    async def _before_fiche_expiry(self):
+        await self.bot.wait_until_ready()
 
     @app_commands.command(name="départ", description="Démarre la création de ton personnage")
     async def depart(self, interaction: discord.Interaction):

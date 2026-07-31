@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS validated_characters (
     eo_classe TEXT,
     eo_value INTEGER,
     nature TEXT,
+    portrait_path TEXT,
     validated_at TEXT
 );
 
@@ -104,6 +105,17 @@ CREATE TABLE IF NOT EXISTS depart_character_progress (
     parchemins_rct INTEGER DEFAULT 0,
     parchemins_nature INTEGER DEFAULT 0,
     rct INTEGER DEFAULT 0,
+    recompense TEXT,
+    nom TEXT,
+    prenom TEXT,
+    age INTEGER,
+    histoire TEXT,
+    portrait_path TEXT,
+    fiche_status TEXT DEFAULT 'not_started',
+    fiche_stage TEXT,
+    fiche_deadline TEXT,
+    fiche_question_msg_id INTEGER,
+    origin_channel_id INTEGER,
     updated_at TEXT
 );
 
@@ -165,6 +177,22 @@ _PROGRESS_EXTRA_COLUMNS = [
     ("parchemins_rct", "INTEGER DEFAULT 0"),
     ("parchemins_nature", "INTEGER DEFAULT 0"),
     ("rct", "INTEGER DEFAULT 0"),
+    ("recompense", "TEXT"),
+    ("nom", "TEXT"),
+    ("prenom", "TEXT"),
+    ("age", "INTEGER"),
+    ("histoire", "TEXT"),
+    ("portrait_path", "TEXT"),
+    ("fiche_status", "TEXT DEFAULT 'not_started'"),
+    ("fiche_stage", "TEXT"),
+    ("fiche_deadline", "TEXT"),
+    ("fiche_question_msg_id", "INTEGER"),
+    ("origin_channel_id", "INTEGER"),
+]
+
+# Colonnes de validated_characters ajoutées après coup.
+_VALIDATED_EXTRA_COLUMNS = [
+    ("portrait_path", "TEXT"),
 ]
 
 
@@ -178,6 +206,16 @@ def _ensure_progress_columns(conn):
             conn.execute(f"ALTER TABLE depart_character_progress ADD COLUMN {name} {decl}")
 
 
+def _ensure_validated_columns(conn):
+    """Ajoute à validated_characters les colonnes manquantes (DB existante)."""
+    cols = _column_names(conn, "validated_characters")
+    if not cols:
+        return
+    for name, decl in _VALIDATED_EXTRA_COLUMNS:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE validated_characters ADD COLUMN {name} {decl}")
+
+
 def init_db():
     """Crée les tables manquantes et applique les migrations légères. N'efface jamais de données."""
     with get_connection() as conn:
@@ -186,6 +224,7 @@ def init_db():
         if needs_vc_copy:
             _copy_validated_characters_from_old(conn)
         _ensure_progress_columns(conn)
+        _ensure_validated_columns(conn)
 
 
 # =====================================================================
@@ -433,6 +472,8 @@ _PROGRESS_SCALAR_COLS = (
     "guild_id", "slot_number", "camp", "path", "clan", "sort", "eo_classe", "eo_value", "nature",
     "reroll_rct_charges", "reroll_energie_charges",
     "parchemins_territoire", "parchemins_rct", "parchemins_nature", "rct",
+    "recompense", "nom", "prenom", "age", "histoire", "portrait_path",
+    "fiche_status", "fiche_stage", "fiche_deadline", "fiche_question_msg_id", "origin_channel_id",
 )
 
 # Colonnes compteurs que l'on incrémente/décrémente atomiquement.
@@ -468,7 +509,44 @@ def get_character_progress(user_id: int) -> dict:
         "parchemins_rct": row["parchemins_rct"] or 0,
         "parchemins_nature": row["parchemins_nature"] or 0,
         "rct": row["rct"] or 0,
+        "recompense": row["recompense"],
+        "nom": row["nom"],
+        "prenom": row["prenom"],
+        "age": row["age"],
+        "histoire": row["histoire"],
+        "portrait_path": row["portrait_path"],
+        "fiche_status": row["fiche_status"],
+        "fiche_stage": row["fiche_stage"],
+        "fiche_deadline": row["fiche_deadline"],
+        "fiche_question_msg_id": row["fiche_question_msg_id"],
+        "origin_channel_id": row["origin_channel_id"],
     }
+
+
+def get_expired_fiches(now_iso: str):
+    """Fiches en cours dont la deadline est dépassée."""
+    with get_connection() as conn:
+        return conn.execute(
+            """SELECT user_id, guild_id, origin_channel_id, slot_number
+               FROM depart_character_progress
+               WHERE fiche_status = 'in_progress'
+                 AND fiche_deadline IS NOT NULL AND fiche_deadline < ?""",
+            (now_iso,),
+        ).fetchall()
+
+
+def insert_validated_character(user_id, guild_id, slot_number, discord_username, character_name,
+                               camp, clan, sort, eo_classe, eo_value, nature, portrait_path, validated_at):
+    """Insère un personnage validé (un joueur peut en avoir plusieurs, un par slot)."""
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO validated_characters
+               (user_id, guild_id, slot_number, discord_username, character_name,
+                camp, clan, sort, eo_classe, eo_value, nature, portrait_path, validated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, guild_id, slot_number, discord_username, character_name,
+             camp, clan, sort, eo_classe, eo_value, nature, portrait_path, validated_at),
+        )
 
 
 def adjust_progress_counter(user_id: int, column: str, delta: int):
