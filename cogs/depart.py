@@ -201,6 +201,68 @@ REWARD_TABLE = [
     {"key": "relique_s", "label": "Relique de classe S", "pct": 1.00, "category": "item"},
 ]
 
+# Tables spécifiques par chemin (pas de reroll_clan/reroll_sort/RCT quand le chemin n'en a pas).
+REWARD_TABLE_HYBRIDE_EXORCISTE = [
+    {"key": "argent", "label": "Argent", "pct": 15.14, "category": "currency"},
+    {"key": "xp", "label": "XP", "pct": 13.19, "category": "currency"},
+    {"key": "reroll_clan", "label": "Reroll Clan", "pct": 11.49, "category": "reroll"},
+    {"key": "reroll_energie_qte", "label": "Reroll Quantité d'énergie", "pct": 8.71, "category": "reroll"},
+    {"key": "reroll_energie_nature", "label": "Reroll Nature d'énergie", "pct": 7.59, "category": "reroll"},
+    {"key": "reroll_rct", "label": "Reroll RCT", "pct": 6.61, "category": "reroll"},
+    {"key": "parchemin_territoire", "label": "Parchemin de territoire", "pct": 5.76, "category": "parchemin"},
+    {"key": "parchemin_rct", "label": "Parchemin de RCT", "pct": 5.02, "category": "parchemin"},
+    {"key": "parchemin_nature", "label": "Parchemin de nature d'énergie", "pct": 4.37, "category": "parchemin"},
+    {"key": "relique_4", "label": "Relique de classe 4", "pct": 3.81, "category": "item"},
+    {"key": "relique_3", "label": "Relique de classe 3", "pct": 3.32, "category": "item"},
+    {"key": "relique_2", "label": "Relique de classe 2", "pct": 2.89, "category": "item"},
+    {"key": "arme_4", "label": "Arme de classe 4", "pct": 2.52, "category": "item"},
+    {"key": "arme_3", "label": "Arme de classe 3", "pct": 2.19, "category": "item"},
+    {"key": "arme_2", "label": "Arme de classe 2", "pct": 1.91, "category": "item"},
+    {"key": "arme_1", "label": "Arme de classe 1", "pct": 1.66, "category": "item"},
+    {"key": "relique_1", "label": "Relique de classe 1", "pct": 1.45, "category": "item"},
+    {"key": "arme_s", "label": "Arme de classe S", "pct": 1.27, "category": "item"},
+    {"key": "relique_s", "label": "Relique de classe S", "pct": 1.10, "category": "item"},
+]
+
+REWARD_TABLE_HYBRIDE_FLEAUX = [
+    {"key": "xp", "label": "XP", "pct": 21.36, "category": "currency"},
+    {"key": "reroll_energie_qte", "label": "Reroll Quantité d'énergie", "pct": 14.11, "category": "reroll"},
+    {"key": "reroll_energie_nature", "label": "Reroll Nature d'énergie", "pct": 12.29, "category": "reroll"},
+    {"key": "parchemin_territoire", "label": "Parchemin de territoire", "pct": 9.34, "category": "parchemin"},
+    {"key": "parchemin_nature", "label": "Parchemin de nature d'énergie", "pct": 7.07, "category": "parchemin"},
+    {"key": "relique_4", "label": "Relique de classe 4", "pct": 6.16, "category": "item"},
+    {"key": "relique_3", "label": "Relique de classe 3", "pct": 5.38, "category": "item"},
+    {"key": "relique_2", "label": "Relique de classe 2", "pct": 4.69, "category": "item"},
+    {"key": "arme_4", "label": "Arme de classe 4", "pct": 4.08, "category": "item"},
+    {"key": "arme_3", "label": "Arme de classe 3", "pct": 3.55, "category": "item"},
+    {"key": "arme_2", "label": "Arme de classe 2", "pct": 3.10, "category": "item"},
+    {"key": "arme_1", "label": "Arme de classe 1", "pct": 2.69, "category": "item"},
+    {"key": "relique_1", "label": "Relique de classe 1", "pct": 2.35, "category": "item"},
+    {"key": "arme_s", "label": "Arme de classe S", "pct": 2.05, "category": "item"},
+    {"key": "relique_s", "label": "Relique de classe S", "pct": 1.78, "category": "item"},
+]
+
+REWARD_TABLE_HYBRIDE_SEUL = [
+    {"key": "argent", "label": "Argent", "pct": 17.10, "category": "currency"},
+    {"key": "xp", "label": "XP", "pct": 14.90, "category": "currency"},
+    {"key": "reroll_energie_qte", "label": "Reroll Quantité d'énergie", "pct": 9.84, "category": "reroll"},
+    {"key": "reroll_energie_nature", "label": "Reroll Nature d'énergie", "pct": 8.58, "category": "reroll"},
+    {"key": "reroll_rct", "label": "Reroll RCT", "pct": 7.47, "category": "reroll"},
+    {"key": "parchemin_territoire", "label": "Parchemin de territoire", "pct": 6.51, "category": "parchemin"},
+    {"key": "parchemin_rct", "label": "Parchemin de RCT", "pct": 5.67, "category": "parchemin"},
+    {"key": "parchemin_nature", "label": "Parchemin de nature d'énergie", "pct": 4.93, "category": "parchemin"},
+    {"key": "relique_4", "label": "Relique de classe 4", "pct": 4.30, "category": "item"},
+    {"key": "relique_3", "label": "Relique de classe 3", "pct": 3.75, "category": "item"},
+    {"key": "relique_2", "label": "Relique de classe 2", "pct": 3.27, "category": "item"},
+    {"key": "arme_4", "label": "Arme de classe 4", "pct": 2.85, "category": "item"},
+    {"key": "arme_3", "label": "Arme de classe 3", "pct": 2.47, "category": "item"},
+    {"key": "arme_2", "label": "Arme de classe 2", "pct": 2.16, "category": "item"},
+    {"key": "arme_1", "label": "Arme de classe 1", "pct": 1.88, "category": "item"},
+    {"key": "relique_1", "label": "Relique de classe 1", "pct": 1.64, "category": "item"},
+    {"key": "arme_s", "label": "Arme de classe S", "pct": 1.43, "category": "item"},
+    {"key": "relique_s", "label": "Relique de classe S", "pct": 1.25, "category": "item"},
+]
+
 ARGENT_MIN, ARGENT_MAX = 10000, 100000
 XP_MIN, XP_MAX = 1000, 10000
 
@@ -220,15 +282,15 @@ def resolve_reward(reward_def: dict) -> dict:
     return {"key": reward_def["key"], "name": reward_def["label"], "qty": "x1", "amount": None}
 
 
-def pick_two_distinct_rewards():
-    """Tire deux récompenses différentes selon les poids de REWARD_TABLE."""
-    keys = [r["key"] for r in REWARD_TABLE]
-    weights = [r["pct"] for r in REWARD_TABLE]
+def pick_two_distinct_rewards(table=REWARD_TABLE):
+    """Tire deux récompenses différentes selon les poids de la table fournie."""
+    keys = [r["key"] for r in table]
+    weights = [r["pct"] for r in table]
     first_key = random.choices(keys, weights=weights, k=1)[0]
     remaining = [(k, w) for k, w in zip(keys, weights) if k != first_key]
     second_key = random.choices([k for k, w in remaining], weights=[w for k, w in remaining], k=1)[0]
-    first_def = next(r for r in REWARD_TABLE if r["key"] == first_key)
-    second_def = next(r for r in REWARD_TABLE if r["key"] == second_key)
+    first_def = next(r for r in table if r["key"] == first_key)
+    second_def = next(r for r in table if r["key"] == second_key)
     return resolve_reward(first_def), resolve_reward(second_def)
 
 
@@ -722,15 +784,22 @@ async def roll_and_send_reserve(source, member: discord.Member, guild: discord.G
     if with_nature:
         await channel.send(embed=build_nature_embed(member, nature))
 
-        # 3e message : bouton "Continuer" vers l'étape récompense (persistant).
-        await channel.send(
-            embed=discord.Embed(
-                description="Clique pour continuer ton parcours.", color=discord.Color.blurple()
-            ),
-            view=RewardContinueView(),
-        )
-
     update_progress(member.id, eo_classe=eo_classe, eo_value=value, nature=nature)
+
+    # 3e message : bouton "Continuer" vers l'étape récompense, propre au chemin.
+    path = get_progress(member.id).get("path")
+    if path == "hybride_fleaux":
+        continue_view = ContinueRecompenseFleauxView()
+    elif path == "hybride_seul":
+        continue_view = ContinueRecompenseSeulView()
+    else:
+        continue_view = RewardContinueView()
+    await channel.send(
+        embed=discord.Embed(
+            description="Clique pour continuer ton parcours.", color=discord.Color.blurple()
+        ),
+        view=continue_view,
+    )
 
 
 def build_nature_embed(member: discord.Member, nature: str) -> discord.Embed:
@@ -852,8 +921,18 @@ class RerollRctView(discord.ui.View):
         ))
 
 
+def build_vers_la_fiche_embed() -> discord.Embed:
+    return discord.Embed(title="📜 Vers la fiche", description=FICHE_INTRO_TEXT, color=discord.Color.blurple())
+
+
+async def send_vers_la_fiche(channel, member: discord.Member):
+    """Enchaîne directement vers l'écran "Vers la fiche" (chemins sans RCT / sans tirage)."""
+    update_progress(member.id, origin_channel_id=channel.id)
+    await channel.send(embed=build_vers_la_fiche_embed(), view=FaireFicheView(member.id))
+
+
 class ContinueFicheView(discord.ui.View):
-    """Bouton "Continuer" vers l'étape fiche (custom_id fixe, persistant via add_view)."""
+    """Bouton "Continuer" vers l'étape fiche après le RCT (custom_id fixe, persistant via add_view)."""
 
     def __init__(self):
         super().__init__(timeout=None)
@@ -862,8 +941,24 @@ class ContinueFicheView(discord.ui.View):
     async def continuer(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Mémorise le salon d'origine (où arriveront les questions) puis envoie l'écran "Vers la fiche".
         update_progress(interaction.user.id, origin_channel_id=interaction.channel.id)
-        embed = discord.Embed(title="📜 Vers la fiche", description=FICHE_INTRO_TEXT, color=discord.Color.blurple())
-        await interaction.response.send_message(embed=embed, view=FaireFicheView(interaction.user.id))
+        await interaction.response.send_message(
+            embed=build_vers_la_fiche_embed(), view=FaireFicheView(interaction.user.id)
+        )
+
+
+class ContinueFicheDirectView(discord.ui.View):
+    """Bouton "Continuer" direct vers la fiche pour les chemins Humain / Hybride chez les humains
+    (aucun clan/sort/réserve/nature/RCT/récompense). custom_id fixe, persistant via add_view."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Continuer", emoji="➡️", style=discord.ButtonStyle.success, custom_id="depart_continuer_fiche_direct")
+    async def continuer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        update_progress(interaction.user.id, origin_channel_id=interaction.channel.id)
+        await interaction.response.send_message(
+            embed=build_vers_la_fiche_embed(), view=FaireFicheView(interaction.user.id)
+        )
 
 
 # =====================================================================
@@ -1156,6 +1251,42 @@ ORIGINE_LABELS = {
     "hybride_humains": "Chez les humains",
 }
 
+# Libellé du sous-type d'hybride pour l'affichage "Hybride (…)".
+HYBRIDE_TYPE_LABELS = {
+    "humains": "Humain",
+    "exorciste": "Exorciste",
+    "fleaux": "Fléaux",
+    "seul": "Livré à soi même",
+}
+
+
+def _hybride_type_of(progress: dict):
+    """Sous-type d'hybride : colonne dédiée si présente, sinon déduit du chemin (hybride_xxx)."""
+    ht = progress.get("hybride_type")
+    if ht:
+        return ht
+    path = progress.get("path") or ""
+    if path.startswith("hybride_"):
+        return path[len("hybride_"):]
+    return None
+
+
+def format_camp_label(camp, hybride_type=None) -> str:
+    """Affichage du camp : "Hybride (Type)" pour un hybride, sinon "Exorciste"/"Humain"."""
+    camp = (camp or "").lower()
+    if camp == "hybride":
+        label = HYBRIDE_TYPE_LABELS.get(hybride_type)
+        return f"Hybride ({label})" if label else "Hybride"
+    if camp == "exorciste":
+        return "Exorciste"
+    if camp == "humain":
+        return "Humain"
+    return camp.capitalize() if camp else "—"
+
+
+def format_camp_display(progress: dict) -> str:
+    return format_camp_label(progress.get("camp"), _hybride_type_of(progress))
+
 
 def build_fiche_embed(progress: dict, guild, member, uid: int,
                       statut_display: str = "🕒 En attente de validation",
@@ -1168,7 +1299,7 @@ def build_fiche_embed(progress: dict, guild, member, uid: int,
     age = progress.get("age")
     age_display = str(age) if age is not None else "—"
     slot = progress.get("slot_number") or 1
-    camp = (progress.get("camp") or "—").capitalize()
+    camp = format_camp_display(progress)
 
     clan_role_id = None
     if has_clan:
@@ -1191,6 +1322,15 @@ def build_fiche_embed(progress: dict, guild, member, uid: int,
     rct_display = "Maîtrisé" if progress.get("rct") else "Non maîtrisé"
     reco_display = progress.get("recompense") or "Aucune"
     histoire = progress.get("histoire")
+
+    # Chemins Humain / Hybride chez les humains : aucun tirage n'a eu lieu -> "///" partout,
+    # sans tenter de calculer un grade/une réserve inexistants (évite tout crash sur des champs vides).
+    no_roll = progress.get("path") in ("humain", "hybride_humains") or (
+        progress.get("clan") is None and progress.get("eo_classe") is None
+    )
+    if no_roll:
+        clan_display = grade = sort_display = "///"
+        nature_display = reserve_display = rct_display = reco_display = "///"
 
     # Valeurs de mise en page (tout passe par la description, aucun field).
     slot_number = slot
@@ -1320,7 +1460,8 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
         discord_username=discord_username, character_name=character_name,
         camp=progress.get("camp"), clan=progress.get("clan"), sort=progress.get("sort"),
         eo_classe=progress.get("eo_classe"), eo_value=progress.get("eo_value"),
-        nature=progress.get("nature"), portrait_path=progress.get("portrait_path"),
+        nature=progress.get("nature"), hybride_type=_hybride_type_of(progress),
+        portrait_path=progress.get("portrait_path"),
         validated_at=datetime.utcnow().isoformat(),
     )
     update_progress(target_uid, fiche_status="validated")
@@ -1497,8 +1638,14 @@ async def apply_reward(interaction: discord.Interaction, reward: dict):
         add_progress_item(uid, reward["name"])
         await channel.send(embed=_reward_embed(f"{member.mention} a obtenu : **{reward['name']}** !"))
 
-    # --- Enchaînement commun : TOUTES les récompenses mènent ensuite à l'étape RCT, sans exception. ---
-    await send_rct_step(channel, member)
+    # --- Enchaînement selon le chemin ---
+    # Fléaux / Livré à soi même : pas d'étape RCT, on va directement vers la fiche.
+    # Exorciste / Hybride-exorciste : étape RCT comme avant.
+    path = get_progress(uid).get("path")
+    if path in ("hybride_fleaux", "hybride_seul"):
+        await send_vers_la_fiche(channel, member)
+    else:
+        await send_rct_step(channel, member)
 
 
 async def reward_reroll_clan(interaction, progress):
@@ -1677,10 +1824,47 @@ async def reward_reroll_energie_nature(interaction, progress):
     await channel.send(embed=build_nature_embed(member, new_nature))
 
 
+# Table de récompenses associée à chaque chemin.
+REWARD_TABLE_BY_PATH = {
+    "exorciste": REWARD_TABLE,
+    "hybride_exorciste": REWARD_TABLE_HYBRIDE_EXORCISTE,
+    "hybride_fleaux": REWARD_TABLE_HYBRIDE_FLEAUX,
+    "hybride_seul": REWARD_TABLE_HYBRIDE_SEUL,
+}
+
+
+async def start_reward_choice(interaction: discord.Interaction, table):
+    """Tire deux récompenses distinctes dans `table`, affiche la carte A/B + les boutons de choix."""
+    if not interaction.response.is_done():
+        await interaction.response.defer()
+    uid = interaction.user.id
+    option_a, option_b = pick_two_distinct_rewards(table)
+    store_pending_rewards(uid, option_a, option_b)
+
+    img = _tmp_image_path("recompense")
+    generate_recompense_image(option_a, option_b, img)
+    await interaction.channel.send(file=discord.File(img, filename="recompense.png"))
+    try:
+        os.remove(img)
+    except OSError:
+        pass
+
+    embed = discord.Embed(
+        title="🎁 Choix de récompense",
+        description=(
+            "Il est temps de faire un choix. Deux récompenses s'offrent à toi, mais tu ne "
+            "peux en garder qu'une seule. Prends le temps de bien réfléchir avant de cliquer, "
+            "ce choix est définitif une fois validé."
+        ),
+        color=discord.Color.gold(),
+    )
+    await interaction.channel.send(embed=embed, view=RewardChoiceView(uid))
+
+
 # ---------- Vues ----------
 class RewardContinueView(discord.ui.View):
-    """Bouton "Continuer" affiché après l'étape nature, qui déclenche l'étape récompense
-    (exorciste / hybride-exorciste) ou un message temporaire (livré à soi même)."""
+    """Bouton "Continuer" après l'étape nature (chemins exorciste / hybride-exorciste),
+    qui déclenche l'étape récompense avec la table propre au chemin."""
 
     def __init__(self):
         super().__init__(timeout=None)
@@ -1688,37 +1872,34 @@ class RewardContinueView(discord.ui.View):
     @discord.ui.button(label="Continuer", emoji="➡️", style=discord.ButtonStyle.success, custom_id="depart_continuer_recompense")
     async def continuer(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        progress = get_progress(interaction.user.id)
-        path = progress.get("path")
-
-        if path in ("exorciste", "hybride_exorciste"):
-            option_a, option_b = pick_two_distinct_rewards()
-            store_pending_rewards(interaction.user.id, option_a, option_b)
-
-            img = _tmp_image_path("recompense")
-            generate_recompense_image(option_a, option_b, img)
-            await interaction.channel.send(file=discord.File(img, filename="recompense.png"))
-            try:
-                os.remove(img)
-            except OSError:
-                pass
-
-            embed = discord.Embed(
-                title="🎁 Choix de récompense",
-                description=(
-                    "Il est temps de faire un choix. Deux récompenses s'offrent à toi, mais tu ne "
-                    "peux en garder qu'une seule. Prends le temps de bien réfléchir avant de cliquer, "
-                    "ce choix est définitif une fois validé."
-                ),
-                color=discord.Color.gold(),
-            )
-            await interaction.channel.send(embed=embed, view=RewardChoiceView(interaction.user.id))
-
-        elif path == "hybride_seul":
-            # TODO: système de récompense propre à Livré à soi même, pas encore défini
-            await interaction.channel.send("La suite arrive dans une prochaine étape.")
+        path = get_progress(interaction.user.id).get("path")
+        table = REWARD_TABLE_BY_PATH.get(path)
+        if table is not None:
+            await start_reward_choice(interaction, table)
         else:
             await interaction.channel.send("La suite arrive dans une prochaine étape.")
+
+
+class ContinueRecompenseFleauxView(discord.ui.View):
+    """Bouton "Continuer" (chemin Hybride chez les fléaux) → tirage récompense fléaux."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Continuer", emoji="➡️", style=discord.ButtonStyle.success, custom_id="depart_continuer_recompense_fleaux")
+    async def continuer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await start_reward_choice(interaction, REWARD_TABLE_HYBRIDE_FLEAUX)
+
+
+class ContinueRecompenseSeulView(discord.ui.View):
+    """Bouton "Continuer" (chemin Livré à soi même) → tirage récompense seul."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Continuer", emoji="➡️", style=discord.ButtonStyle.success, custom_id="depart_continuer_recompense_seul")
+    async def continuer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await start_reward_choice(interaction, REWARD_TABLE_HYBRIDE_SEUL)
 
 
 class RewardChoiceView(discord.ui.View):
@@ -1953,7 +2134,7 @@ class ClanRollHybrideView(discord.ui.View):
 
         # d) Sans clan : aucun rôle attribué (ni clan, ni marqueur de clan).
         if result_key == "sans_clan":
-            update_progress(interaction.user.id, camp="hybride", path="hybride_exorciste", clan="sans_clan", sort="sort_inne")
+            update_progress(interaction.user.id, camp="hybride", path="hybride_exorciste", hybride_type="exorciste", clan="sans_clan", sort="sort_inne")
             spell_data = build_hybride_spell_data(partial_heredit=False)
             await send_roll_result(
                 interaction, state, "sans_clan", None, "Sort inné", {}, {}, spell_data_override=spell_data
@@ -1969,7 +2150,7 @@ class ClanRollHybrideView(discord.ui.View):
 
         # L'hybride occupe une vraie place du clan : mêmes règles de fermeture/réouverture.
         update_clan_state_after_join(guild, result_key)
-        update_progress(interaction.user.id, camp="hybride", path="hybride_exorciste", clan=result_key, sort="sort_inne")
+        update_progress(interaction.user.id, camp="hybride", path="hybride_exorciste", hybride_type="exorciste", clan=result_key, sort="sort_inne")
 
         # b/e) Sort toujours "Sort inné", table verrouillée pour l'affichage.
         spell_data = build_hybride_spell_data(info["partial_heredit"])
@@ -2200,11 +2381,21 @@ class EducationView(discord.ui.View):
 
     @discord.ui.button(label="Chez les humains", emoji="🏙️", style=discord.ButtonStyle.secondary, custom_id="depart_edu_humains")
     async def humains(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # TODO: voie "humains" — passage direct à la création de la fiche.
-        await interaction.response.send_message(
-            f"{interaction.user.mention} a grandi 🏙️ chez les humains. La suite arrive bientôt.",
-            ephemeral=False,
+        # Aucun tirage : passage direct à la fiche. (Rôles non attribués pour l'instant.)
+        update_progress(
+            interaction.user.id, camp="hybride", path="hybride_humains", hybride_type="humains",
+            clan=None, sort=None, eo_classe=None, eo_value=None, nature=None, rct=None, recompense=None,
         )
+        embed = discord.Embed(
+            title="🏙️ Hybride élevé chez les humains",
+            description=(
+                f"{interaction.user.mention} a grandi parmi les humains, sans jamais découvrir le "
+                "monde de l'énergie occulte. Aucun tirage n'est nécessaire.\n\n"
+                "Clique sur **Continuer** pour passer à la création de ta fiche."
+            ),
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.send_message(embed=embed, view=ContinueFicheDirectView())
 
     @discord.ui.button(label="Chez les exorcistes", emoji="⚔️", style=discord.ButtonStyle.primary, custom_id="depart_hybride_exorcistes")
     async def exorcistes(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2216,13 +2407,13 @@ class EducationView(discord.ui.View):
     @discord.ui.button(label="Chez les fléaux", emoji="👹", style=discord.ButtonStyle.danger, custom_id="depart_hybride_fleaux")
     async def fleaux(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Voie "fléaux" : pas de clan, réserve d'énergie occulte SANS nature, déclenchée directement.
-        update_progress(interaction.user.id, camp="hybride", path="hybride_fleaux")
+        update_progress(interaction.user.id, camp="hybride", path="hybride_fleaux", hybride_type="fleaux")
         await roll_and_send_reserve(interaction, interaction.user, interaction.guild, with_nature=False)
 
     @discord.ui.button(label="Livré à soi même", emoji="🌪️", style=discord.ButtonStyle.secondary, custom_id="depart_hybride_seul")
     async def livre(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Voie "livré à soi même" : réserve d'énergie occulte AVEC nature, déclenchée directement.
-        update_progress(interaction.user.id, camp="hybride", path="hybride_seul")
+        update_progress(interaction.user.id, camp="hybride", path="hybride_seul", hybride_type="seul")
         await roll_and_send_reserve(interaction, interaction.user, interaction.guild, with_nature=True)
 
 
@@ -2276,14 +2467,20 @@ class CampView(discord.ui.View):
 
     @discord.ui.button(label="Humain", emoji="🧑", style=discord.ButtonStyle.secondary, custom_id="depart_camp_humain")
     async def humain(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await apply_camp_role(interaction, ROLE_HUMAIN):
-            return
-        # TODO: étape suivante — génération directe de la fiche (sera codée dans une prochaine étape).
-        await interaction.response.send_message(
-            f"{interaction.user.mention} a choisi la voie d'humain ! 🧑 "
-            "Direction directe vers la fiche de personnage, cette étape arrive bientôt.",
-            ephemeral=False,
+        # Rôles de camp NON attribués pour l'instant (traités globalement plus tard).
+        update_progress(
+            interaction.user.id, camp="humain", path="humain", hybride_type=None,
+            clan=None, sort=None, eo_classe=None, eo_value=None, nature=None, rct=None, recompense=None,
         )
+        embed = discord.Embed(
+            title="🧑 Humain",
+            description=(
+                f"{interaction.user.mention} a choisi la voie de l'humain. Aucun tirage n'est "
+                "nécessaire.\n\nClique sur **Continuer** pour passer à la création de ta fiche."
+            ),
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.send_message(embed=embed, view=ContinueFicheDirectView())
 
 
 class SelectionView(discord.ui.View):
@@ -2312,6 +2509,22 @@ class SelectionView(discord.ui.View):
                 style=discord.ButtonStyle.danger,
                 custom_id=f"depart_delete_char:{user_id}",
             ))
+
+
+class DeleteConfirmView(discord.ui.View):
+    """Confirmation ✅/❌ avant la suppression définitive d'un personnage.
+    custom_id dynamique par joueur -> géré par le listener on_interaction (persistant)."""
+
+    def __init__(self, user_id: int, slot: int):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="✅ Confirmer", style=discord.ButtonStyle.danger,
+            custom_id=f"depart_delete_confirm:{user_id}:{slot}",
+        ))
+        self.add_item(discord.ui.Button(
+            label="❌ Annuler", style=discord.ButtonStyle.secondary,
+            custom_id=f"depart_delete_cancel:{user_id}",
+        ))
 
 
 async def handle_start_creation(interaction: discord.Interaction, custom_id: str):
@@ -2356,7 +2569,10 @@ class Depart(commands.Cog):
         self.bot.add_view(ClanRollHybrideView())
         self.bot.add_view(ContinueEnergyView())
         self.bot.add_view(RewardContinueView())
+        self.bot.add_view(ContinueRecompenseFleauxView())
+        self.bot.add_view(ContinueRecompenseSeulView())
         self.bot.add_view(ContinueFicheView())
+        self.bot.add_view(ContinueFicheDirectView())
         self.bot.add_view(ReserveClassView())
         self.bot.add_view(DMClanQuestionView())
         self.bot.add_view(DMClanSelectView())
@@ -2381,6 +2597,10 @@ class Depart(commands.Cog):
             await handle_start_creation(interaction, custom_id)
         elif custom_id.startswith("depart_delete_char:"):
             await self.handle_delete_char(interaction, custom_id)
+        elif custom_id.startswith("depart_delete_confirm:"):
+            await self.handle_delete_confirm(interaction, custom_id)
+        elif custom_id.startswith("depart_delete_cancel:"):
+            await self.handle_delete_cancel(interaction, custom_id)
         elif custom_id.startswith("depart_reroll_energie:"):
             await handle_reroll_energie(interaction, custom_id)
         elif custom_id.startswith("depart_roll_rct:"):
@@ -2464,9 +2684,39 @@ class Depart(commands.Cog):
             )
             return
 
-        db.delete_validated_character(message.author.id, message.guild.id, num)
+        # Slot valide : on demande confirmation avant toute suppression définitive.
         self._awaiting_delete.pop(message.author.id, None)
-        await message.channel.send(f"Le personnage du slot {num} a été supprimé définitivement.")
+        char = next((r for r in rows if r["slot_number"] == num), None)
+        char_name = char["character_name"] if char else "?"
+        embed = discord.Embed(
+            title="⚠️ Confirmation de suppression",
+            description=(
+                f"Es-tu sûr de vouloir supprimer définitivement le personnage du slot "
+                f"{num} (**{char_name}**) ? Cette action est irréversible."
+            ),
+            color=discord.Color.red(),
+        )
+        await message.channel.send(embed=embed, view=DeleteConfirmView(message.author.id, num))
+
+    async def handle_delete_confirm(self, interaction: discord.Interaction, custom_id: str):
+        parts = custom_id.split(":")
+        target_uid = int(parts[1])
+        slot = int(parts[2])
+        if interaction.user.id != target_uid:
+            await interaction.response.send_message("Ce bouton ne t'est pas destiné.", ephemeral=True)
+            return
+        db.delete_validated_character(target_uid, interaction.guild.id, slot)
+        await interaction.response.edit_message(
+            content=f"Le personnage du slot {slot} a été supprimé définitivement.",
+            embed=None, view=None,
+        )
+
+    async def handle_delete_cancel(self, interaction: discord.Interaction, custom_id: str):
+        target_uid = int(custom_id.split(":")[1])
+        if interaction.user.id != target_uid:
+            await interaction.response.send_message("Ce bouton ne t'est pas destiné.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="Suppression annulée.", embed=None, view=None)
 
     @tasks.loop(seconds=30)
     async def fiche_expiry_loop(self):
@@ -2508,9 +2758,10 @@ class Depart(commands.Cog):
         for n in (1, 2, 3):
             row = by_slot.get(n)
             if row:
-                camp = row["camp"] or ""
+                htype = row["hybride_type"] if "hybride_type" in row.keys() else None
+                camp_label = format_camp_label(row["camp"], htype)
                 clan = row["clan"]
-                camp_clan = f"{camp} — {clan}" if clan else camp
+                camp_clan = f"{camp_label} — {clan}" if clan else camp_label
                 portrait_path = row["portrait_path"] if "portrait_path" in row.keys() else None
                 slots.append({
                     "filled": True,

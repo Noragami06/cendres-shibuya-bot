@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS validated_characters (
     eo_classe TEXT,
     eo_value INTEGER,
     nature TEXT,
+    hybride_type TEXT,
     portrait_path TEXT,
     validated_at TEXT
 );
@@ -92,6 +93,7 @@ CREATE TABLE IF NOT EXISTS depart_character_progress (
     slot_number INTEGER,
     camp TEXT,
     path TEXT,
+    hybride_type TEXT,
     clan TEXT,
     sort TEXT,
     eo_classe TEXT,
@@ -171,6 +173,7 @@ def _copy_validated_characters_from_old(conn):
 # Colonnes de depart_character_progress ajoutées après coup (migration des DB existantes).
 _PROGRESS_EXTRA_COLUMNS = [
     ("slot_number", "INTEGER"),
+    ("hybride_type", "TEXT"),
     ("reroll_rct_charges", "INTEGER DEFAULT 0"),
     ("reroll_energie_charges", "INTEGER DEFAULT 0"),
     ("parchemins_territoire", "INTEGER DEFAULT 0"),
@@ -193,6 +196,7 @@ _PROGRESS_EXTRA_COLUMNS = [
 # Colonnes de validated_characters ajoutées après coup.
 _VALIDATED_EXTRA_COLUMNS = [
     ("portrait_path", "TEXT"),
+    ("hybride_type", "TEXT"),
 ]
 
 
@@ -469,7 +473,7 @@ def delete_pending_choice(user_id: int):
 # DEPART CHARACTER PROGRESS
 # =====================================================================
 _PROGRESS_SCALAR_COLS = (
-    "guild_id", "slot_number", "camp", "path", "clan", "sort", "eo_classe", "eo_value", "nature",
+    "guild_id", "slot_number", "camp", "path", "hybride_type", "clan", "sort", "eo_classe", "eo_value", "nature",
     "reroll_rct_charges", "reroll_energie_charges",
     "parchemins_territoire", "parchemins_rct", "parchemins_nature", "rct",
     "recompense", "nom", "prenom", "age", "histoire", "portrait_path",
@@ -496,6 +500,7 @@ def get_character_progress(user_id: int) -> dict:
         "slot_number": row["slot_number"],
         "camp": row["camp"],
         "path": row["path"],
+        "hybride_type": row["hybride_type"],
         "clan": row["clan"],
         "sort": row["sort"],
         "eo_classe": row["eo_classe"],
@@ -536,16 +541,17 @@ def get_expired_fiches(now_iso: str):
 
 
 def insert_validated_character(user_id, guild_id, slot_number, discord_username, character_name,
-                               camp, clan, sort, eo_classe, eo_value, nature, portrait_path, validated_at):
+                               camp, clan, sort, eo_classe, eo_value, nature, hybride_type,
+                               portrait_path, validated_at):
     """Insère un personnage validé (un joueur peut en avoir plusieurs, un par slot)."""
     with get_connection() as conn:
         conn.execute(
             """INSERT INTO validated_characters
                (user_id, guild_id, slot_number, discord_username, character_name,
-                camp, clan, sort, eo_classe, eo_value, nature, portrait_path, validated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                camp, clan, sort, eo_classe, eo_value, nature, hybride_type, portrait_path, validated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (user_id, guild_id, slot_number, discord_username, character_name,
-             camp, clan, sort, eo_classe, eo_value, nature, portrait_path, validated_at),
+             camp, clan, sort, eo_classe, eo_value, nature, hybride_type, portrait_path, validated_at),
         )
 
 
@@ -670,7 +676,7 @@ def get_validated_characters(user_id: int, guild_id: int):
     """Slots occupés d'un joueur sur un serveur, triés par numéro de slot croissant."""
     with get_connection() as conn:
         return conn.execute(
-            """SELECT slot_number, character_name, camp, clan, portrait_path
+            """SELECT slot_number, character_name, camp, clan, hybride_type, portrait_path
                FROM validated_characters WHERE user_id = ? AND guild_id = ?
                ORDER BY slot_number ASC""",
             (user_id, guild_id),
