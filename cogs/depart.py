@@ -1296,7 +1296,12 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
     update_progress(target_uid, fiche_status="validated")
 
     # 3) Renvoie le même embed (même image) dans le salon des fiches validées, sans boutons.
+    #    Sur cette copie uniquement, le statut passe à « ✅ Validée ».
     embed = build_fiche_embed(progress, guild, member, target_uid)
+    for i, field in enumerate(embed.fields):
+        if field.name == "Statut":
+            embed.set_field_at(i, name=field.name, value="✅ Validée", inline=field.inline)
+            break
     portrait_path = progress.get("portrait_path")
     filename = _fiche_portrait_filename(target_uid, slot)
     validated_channel = interaction.client.get_channel(FICHE_VALIDATED_CHANNEL_ID)
@@ -2252,28 +2257,44 @@ class CampView(discord.ui.View):
         )
 
 
-class StartCreationView(discord.ui.View):
-    """Bouton unique "Créer le Xème perso" de l'écran de sélection. Persistant, une variante par slot."""
+class SelectionView(discord.ui.View):
+    """Écran de sélection : bouton « Créer le Xème perso » (si un slot est libre) et/ou
+    « 🗑️ Supprimer un personnage » (si au moins un slot est occupé).
 
-    _LABELS = {1: "Créer le 1er perso", 2: "Créer le 2ème perso", 3: "Créer le 3ème perso"}
+    Les deux boutons ont un custom_id dynamique (slot pour la création, user_id pour la
+    suppression) et sont gérés par le listener on_interaction du cog — c'est le mécanisme
+    de persistance utilisé partout dans ce bot, bot.add_view() ne pouvant pas enregistrer
+    un custom_id contenant un user_id inconnu à l'avance.
+    """
 
-    def __init__(self, slot_number: int):
+    _CREATE_LABELS = {1: "Créer le 1er perso", 2: "Créer le 2ème perso", 3: "Créer le 3ème perso"}
+
+    def __init__(self, user_id: int, first_free=None, show_delete: bool = False):
         super().__init__(timeout=None)
-        self.slot_number = slot_number
-        self.start.label = self._LABELS.get(slot_number, "Créer un perso")
-        self.start.custom_id = f"depart_start_creation:{slot_number}"
+        if first_free is not None:
+            self.add_item(discord.ui.Button(
+                label=self._CREATE_LABELS.get(first_free, "Créer un perso"),
+                style=discord.ButtonStyle.success,
+                custom_id=f"depart_start_creation:{first_free}",
+            ))
+        if show_delete:
+            self.add_item(discord.ui.Button(
+                label="🗑️ Supprimer un personnage",
+                style=discord.ButtonStyle.danger,
+                custom_id=f"depart_delete_char:{user_id}",
+            ))
 
-    @discord.ui.button(label="Créer un perso", style=discord.ButtonStyle.success)
-    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Slot lu depuis le custom_id (fiable même après un redémarrage du bot).
-        slot_number = int(interaction.data["custom_id"].split(":", 1)[1])
-        update_progress(interaction.user.id, slot_number=slot_number, guild_id=interaction.guild.id)
 
-        # Embed de lecture (Étape 1), déplacé ici : comportement inchangé (envoi, 5s, bouton Commencer).
-        embed = build_depart_embed()
-        await interaction.response.send_message(embed=embed)
-        await asyncio.sleep(5)
-        await interaction.edit_original_response(embed=embed, view=DepartView())
+async def handle_start_creation(interaction: discord.Interaction, custom_id: str):
+    # Slot lu depuis le custom_id (fiable même après un redémarrage du bot).
+    slot_number = int(custom_id.split(":", 1)[1])
+    update_progress(interaction.user.id, slot_number=slot_number, guild_id=interaction.guild.id)
+
+    # Embed de lecture (Étape 1) : comportement inchangé (envoi, 5s, bouton Commencer).
+    embed = build_depart_embed()
+    await interaction.response.send_message(embed=embed)
+    await asyncio.sleep(5)
+    await interaction.edit_original_response(embed=embed, view=DepartView())
 
 
 class DepartView(discord.ui.View):
@@ -2290,15 +2311,15 @@ class DepartView(discord.ui.View):
 class Depart(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        # user_id -> channel_id : joueurs à qui l'on demande le numéro de slot à supprimer.
+        self._awaiting_delete = {}
 
     async def cog_load(self):
         # Amorce l'état des clans si la base est vide (nouvelle installation).
         db.seed_clan_state(DEFAULT_CLAN_STATE)
 
-        # Écran de sélection : une vue persistante par slot (custom_id depart_start_creation:{1,2,3}).
-        for slot in (1, 2, 3):
-            self.bot.add_view(StartCreationView(slot))
-
+        # Les boutons de l'écran de sélection (création/suppression) ont un custom_id
+        # dynamique : ils sont gérés par le listener on_interaction, pas par add_view.
         self.bot.add_view(DepartView())
         self.bot.add_view(CampView())
         self.bot.add_view(EducationView())
@@ -2327,7 +2348,11 @@ class Depart(commands.Cog):
         if interaction.type != discord.InteractionType.component:
             return
         custom_id = interaction.data.get("custom_id", "")
-        if custom_id.startswith("depart_reroll_energie:"):
+        if custom_id.startswith("depart_start_creation:"):
+            await handle_start_creation(interaction, custom_id)
+        elif custom_id.startswith("depart_delete_char:"):
+            await self.handle_delete_char(interaction, custom_id)
+        elif custom_id.startswith("depart_reroll_energie:"):
             await handle_reroll_energie(interaction, custom_id)
         elif custom_id.startswith("depart_roll_rct:"):
             await handle_roll_rct(interaction, custom_id)
@@ -2349,6 +2374,13 @@ class Depart(commands.Cog):
         # Réponses texte/image aux questions de la fiche.
         if message.author.bot or message.guild is None:
             return
+
+        # Suppression de personnage : on attend le numéro de slot dans le même salon.
+        pending_channel = self._awaiting_delete.get(message.author.id)
+        if pending_channel is not None and message.channel.id == pending_channel:
+            await self.handle_delete_slot_answer(message)
+            return
+
         progress = get_progress(message.author.id)
         if progress.get("fiche_status") != "in_progress":
             return
@@ -2361,6 +2393,51 @@ class Depart(commands.Cog):
         elif stage == "portrait":
             await handle_fiche_portrait(self.bot, message, progress)
         # stage == "histoire_ask" : on attend un clic de bouton, on ignore le texte.
+
+    async def handle_delete_char(self, interaction: discord.Interaction, custom_id: str):
+        target_uid = int(custom_id.split(":", 1)[1])
+        if interaction.user.id != target_uid:
+            await interaction.response.send_message("Ce bouton ne t'est pas destiné.", ephemeral=True)
+            return
+
+        rows = db.get_validated_characters(interaction.user.id, interaction.guild.id)
+        if not rows:
+            await interaction.response.send_message(
+                "Tu n'as aucun personnage à supprimer.", ephemeral=True
+            )
+            return
+
+        lines = "\n".join(f"**Slot {r['slot_number']}** — {r['character_name']}" for r in rows)
+        embed = discord.Embed(
+            title="🗑️ Supprimer un personnage",
+            description=(
+                f"{lines}\n\n"
+                "Quel numéro de slot veux-tu supprimer ? Réponds avec **1**, **2** ou **3**."
+            ),
+            color=discord.Color.red(),
+        )
+        self._awaiting_delete[interaction.user.id] = interaction.channel.id
+        await interaction.response.send_message(embed=embed)
+
+    async def handle_delete_slot_answer(self, message: discord.Message):
+        content = message.content.strip()
+        rows = db.get_validated_characters(message.author.id, message.guild.id)
+        filled = {r["slot_number"] for r in rows}
+
+        if not content.isdigit() or int(content) not in (1, 2, 3):
+            await message.channel.send("Merci de répondre avec **1**, **2** ou **3**.")
+            return
+
+        num = int(content)
+        if num not in filled:
+            await message.channel.send(
+                f"Aucun personnage sur le slot {num}. Réponds avec le numéro d'un slot occupé."
+            )
+            return
+
+        db.delete_validated_character(message.author.id, message.guild.id, num)
+        self._awaiting_delete.pop(message.author.id, None)
+        await message.channel.send(f"Le personnage du slot {num} a été supprimé définitivement.")
 
     @tasks.loop(seconds=30)
     async def fiche_expiry_loop(self):
@@ -2425,21 +2502,24 @@ class Depart(commands.Cog):
         except OSError:
             pass
 
-        # Tous les slots pris : on s'arrête, aucun bouton.
+        any_filled = any(s["filled"] for s in slots)
+
+        # Tous les slots pris : pas de création possible, mais on propose la suppression.
         if all(s["filled"] for s in slots):
             await interaction.channel.send(
-                "Tous tes emplacements sont pris. Tu ne peux pas créer de nouveau personnage pour le moment."
+                "Tous tes emplacements sont pris. Tu ne peux pas créer de nouveau personnage pour le moment.",
+                view=SelectionView(interaction.user.id, first_free=None, show_delete=True),
             )
             return
 
-        # Sinon : bouton vers le premier slot libre.
+        # Sinon : bouton vers le premier slot libre (+ suppression si au moins un slot occupé).
         first_free = next(n for n in (1, 2, 3) if not slots[n - 1]["filled"])
         await interaction.channel.send(
             embed=discord.Embed(
                 description="Prêt à créer ton personnage ? Clique sur le bouton ci-dessous.",
                 color=discord.Color.blurple(),
             ),
-            view=StartCreationView(first_free),
+            view=SelectionView(interaction.user.id, first_free=first_free, show_delete=any_filled),
         )
 
 

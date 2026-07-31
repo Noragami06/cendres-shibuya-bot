@@ -677,6 +677,16 @@ def get_validated_characters(user_id: int, guild_id: int):
         ).fetchall()
 
 
+def delete_validated_character(user_id: int, guild_id: int, slot_number: int) -> int:
+    """Supprime définitivement le personnage d'un slot. Renvoie le nombre de lignes supprimées."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "DELETE FROM validated_characters WHERE user_id = ? AND guild_id = ? AND slot_number = ?",
+            (user_id, guild_id, slot_number),
+        )
+        return cur.rowcount
+
+
 def get_class_ranking(eo_classe: str):
     """Classement (pseudo Discord + valeur EO) des personnages validés d'une classe donnée."""
     with get_connection() as conn:
