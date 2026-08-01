@@ -250,12 +250,43 @@ class PinErrorView(discord.ui.View):
         super().__init__(timeout=None)
         self.add_item(discord.ui.Button(
             label="Réessayer", emoji="🔁", style=discord.ButtonStyle.danger,
-            custom_id=f"banque_pin_open:{character_id}:{user_id}",
+            custom_id=f"banque_pin_retry:{character_id}:{user_id}",
         ))
         self.add_item(discord.ui.Button(
             label="Recevoir mon code", emoji="📩", style=discord.ButtonStyle.secondary,
             custom_id=f"banque_resend_pin:{character_id}:{user_id}",
         ))
+
+
+class PinKeypadView(discord.ui.View):
+    """Clavier numérique de saisie du code (persistant, custom_id dynamiques par personnage/joueur)."""
+
+    def __init__(self, character_id: int, user_id: int):
+        super().__init__(timeout=None)
+        base = f"{character_id}:{user_id}"
+        for row, digits in enumerate((["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"])):
+            for dg in digits:
+                self.add_item(discord.ui.Button(
+                    label=dg, style=discord.ButtonStyle.secondary,
+                    custom_id=f"banque_pin_digit:{base}:{dg}", row=row,
+                ))
+        self.add_item(discord.ui.Button(
+            label="⌫", style=discord.ButtonStyle.danger,
+            custom_id=f"banque_pin_clear:{base}", row=3,
+        ))
+        self.add_item(discord.ui.Button(
+            label="0", style=discord.ButtonStyle.secondary,
+            custom_id=f"banque_pin_digit:{base}:0", row=3,
+        ))
+        self.add_item(discord.ui.Button(
+            label="✅", style=discord.ButtonStyle.success,
+            custom_id=f"banque_pin_confirm:{base}", row=3,
+        ))
+
+
+def _pin_values(buffer: str) -> list:
+    """Liste de 4 éléments : "*" pour chaque position saisie, "" pour les positions vides."""
+    return ["*" if i < len(buffer) else "" for i in range(4)]
 
 
 class AccountView(discord.ui.View):
@@ -340,38 +371,20 @@ class AdminTargetView(discord.ui.View):
         await self._apply(interaction, "livret")
 
 
-class PinModal(discord.ui.Modal):
-    def __init__(self, cog, character_id: int, user_id: int):
-        super().__init__(title="Code secret — Banque Phénix")
-        self.cog = cog
-        self.character_id = character_id
-        self.user_id = user_id
-        self.code = discord.ui.TextInput(
-            label="Code secret", placeholder="4 chiffres",
-            min_length=4, max_length=4, style=discord.TextStyle.short,
-        )
-        self.add_item(self.code)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        account = get_account(self.character_id)
-        entered = self.code.value.strip()
-        if account and entered == account["pin_code"]:
-            set_session(self.user_id, self.character_id)
-            await interaction.response.send_message("✅ Code correct, accès autorisé.", ephemeral=True)
-            await self.cog.show_account_screen(interaction.channel, self.character_id)
-        else:
-            embed = discord.Embed(description="❌ Code incorrect.", color=discord.Color.red())
-            await interaction.response.send_message(
-                embed=embed, view=PinErrorView(self.character_id, self.user_id), ephemeral=True
-            )
-
-
 # =====================================================================
 # COG
 # =====================================================================
 class Banque(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        # Saisie du code en cours par utilisateur : {user_id: "chiffres tapés"}.
+        self.pin_buffers = {}
+
+    async def cog_load(self):
+        # NOTE : les boutons du clavier ont un custom_id contenant character_id/user_id (inconnus
+        # à l'avance), donc bot.add_view() ne peut pas les enregistrer génériquement. La persistance
+        # réelle est assurée par le listener on_interaction ci-dessous (comme tous les boutons banque).
+        pass
 
     # ---------- attente d'une réponse texte dans le salon ----------
     async def wait_message(self, channel, author, timeout: int = WAIT_TIMEOUT):
@@ -454,13 +467,18 @@ class Banque(commands.Cog):
         except OSError:
             pass
 
-    # ---------- écran de compte ----------
-    async def show_account_screen(self, channel, character_id):
+    # ---------- rendu d'images ----------
+    def _render_pin(self, character_id, buffer: str) -> str:
+        """Génère l'image du clavier PIN reflétant le buffer courant, retourne le chemin temp."""
+        char = get_character(character_id)
+        path = _tmp_path("pin")
+        generate_pin_image(char["portrait_path"] if char else None, _pin_values(buffer), path)
+        return path
+
+    def _build_account_image(self, character_id):
+        """Génère l'image de l'écran de compte, retourne (chemin, AccountView)."""
         account = get_account(character_id)
         char = get_character(character_id)
-        if not account or not char:
-            await channel.send("Compte introuvable.")
-            return
         prenom, nom_clan = _display_names(char)
         txs = get_recent_transactions(character_id, 4)
         transactions = [
@@ -471,10 +489,15 @@ class Banque(commands.Cog):
         generate_economie_image(
             prenom, nom_clan, account["solde_courant"], account["solde_livret"], transactions, path
         )
-        await channel.send(
-            file=discord.File(path, filename="compte.png"),
-            view=AccountView(character_id, account["user_id"]),
-        )
+        return path, AccountView(character_id, account["user_id"])
+
+    # ---------- écran de compte ----------
+    async def show_account_screen(self, channel, character_id):
+        if not get_account(character_id) or not get_character(character_id):
+            await channel.send("Compte introuvable.")
+            return
+        path, view = self._build_account_image(character_id)
+        await channel.send(file=discord.File(path, filename="compte.png"), view=view)
         try:
             os.remove(path)
         except OSError:
@@ -550,6 +573,14 @@ class Banque(commands.Cog):
             await self.handle_create(interaction, cid)
         elif cid.startswith("banque_pin_open:"):
             await self.handle_pin_open(interaction, cid)
+        elif cid.startswith("banque_pin_digit:"):
+            await self.handle_pin_digit(interaction, cid)
+        elif cid.startswith("banque_pin_clear:"):
+            await self.handle_pin_clear(interaction, cid)
+        elif cid.startswith("banque_pin_confirm:"):
+            await self.handle_pin_confirm(interaction, cid)
+        elif cid.startswith("banque_pin_retry:"):
+            await self.handle_pin_retry(interaction, cid)
         elif cid.startswith("banque_resend_pin:"):
             await self.handle_resend_pin(interaction, cid)
         elif cid.startswith("banque_iban:"):
@@ -660,7 +691,106 @@ class Banque(commands.Cog):
         if interaction.user.id != user_id:
             await interaction.response.send_message("Ce compte n'est pas le tien.", ephemeral=True)
             return
-        await interaction.response.send_modal(PinModal(self, character_id, user_id))
+        # Ouvre le clavier : buffer vide + image PIN vierge, sur le message existant.
+        self.pin_buffers[user_id] = ""
+        path = self._render_pin(character_id, "")
+        await interaction.response.edit_message(
+            content="🔒 Entre ton code secret à l'aide du clavier ci dessous.",
+            attachments=[discord.File(path, filename="pin.png")],
+            view=PinKeypadView(character_id, user_id),
+        )
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    async def _refresh_keypad(self, interaction, character_id, user_id):
+        """Régénère l'image du clavier avec le buffer courant et édite le message."""
+        buf = self.pin_buffers.get(user_id, "")
+        path = self._render_pin(character_id, buf)
+        await interaction.response.edit_message(
+            attachments=[discord.File(path, filename="pin.png")],
+            view=PinKeypadView(character_id, user_id),
+        )
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    async def handle_pin_digit(self, interaction, cid):
+        parts = cid.split(":")  # banque_pin_digit:{cid}:{uid}:{digit}
+        character_id, user_id, digit = int(parts[1]), int(parts[2]), parts[3]
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce clavier ne t'appartient pas.", ephemeral=True)
+            return
+        buf = self.pin_buffers.get(user_id, "")
+        if len(buf) >= 4:
+            await interaction.response.defer()  # buffer plein : on ignore le clic
+            return
+        self.pin_buffers[user_id] = buf + digit
+        await self._refresh_keypad(interaction, character_id, user_id)
+
+    async def handle_pin_clear(self, interaction, cid):
+        parts = cid.split(":")  # banque_pin_clear:{cid}:{uid}
+        character_id, user_id = int(parts[1]), int(parts[2])
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce clavier ne t'appartient pas.", ephemeral=True)
+            return
+        buf = self.pin_buffers.get(user_id, "")
+        self.pin_buffers[user_id] = buf[:-1] if buf else ""
+        await self._refresh_keypad(interaction, character_id, user_id)
+
+    async def handle_pin_confirm(self, interaction, cid):
+        parts = cid.split(":")  # banque_pin_confirm:{cid}:{uid}
+        character_id, user_id = int(parts[1]), int(parts[2])
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce clavier ne t'appartient pas.", ephemeral=True)
+            return
+        buf = self.pin_buffers.get(user_id, "")
+        if len(buf) != 4:
+            await interaction.response.send_message("Entre les 4 chiffres avant de valider.", ephemeral=True)
+            return
+
+        account = get_account(character_id)
+        if account and buf == account["pin_code"]:
+            self.pin_buffers[user_id] = ""
+            set_session(user_id, character_id)
+            # Passe directement à l'écran de compte, sur le même message.
+            path, view = self._build_account_image(character_id)
+            await interaction.response.edit_message(
+                content=None, embed=None,
+                attachments=[discord.File(path, filename="compte.png")], view=view,
+            )
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        else:
+            self.pin_buffers[user_id] = ""
+            embed = discord.Embed(description="❌ Code incorrect.", color=discord.Color.red())
+            await interaction.response.edit_message(
+                content=None, embed=embed, attachments=[], view=PinErrorView(character_id, user_id)
+            )
+
+    async def handle_pin_retry(self, interaction, cid):
+        parts = cid.split(":")  # banque_pin_retry:{cid}:{uid}
+        character_id, user_id = int(parts[1]), int(parts[2])
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce clavier ne t'appartient pas.", ephemeral=True)
+            return
+        # Relance un buffer vide et réaffiche le clavier avec le pillow remis à zéro.
+        self.pin_buffers[user_id] = ""
+        path = self._render_pin(character_id, "")
+        await interaction.response.edit_message(
+            content="🔒 Entre ton code secret à l'aide du clavier ci dessous.",
+            embed=None,
+            attachments=[discord.File(path, filename="pin.png")],
+            view=PinKeypadView(character_id, user_id),
+        )
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
     async def handle_resend_pin(self, interaction, cid):
         _, character_id, user_id = cid.split(":")
