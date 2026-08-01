@@ -61,6 +61,10 @@ CLAN_MEMBER_ROLE_ID = 1521961709517148220
 HERITIER_ROLE_ID = 1521963035898548455
 MEMBRES_PRINCIPAUX_ROLE_ID = 1521963104903233658  # Grade attribué d'office à l'hybride élevé chez les exorcistes
 
+# Rôles RCT attribués à la validation de la fiche (selon depart_character_progress.rct)
+RCT_POSSEDE_ROLE_ID = 1522181335337402408
+RCT_NON_POSSEDE_ROLE_ID = 1522181321961635964
+
 # Grades de clan (ordre d'affichage)
 GRADE_ROLES = [
     ("Chef du clan", 1521963027925172344),
@@ -72,6 +76,58 @@ GRADE_ROLES = [
     ("Membres principaux", 1521963104903233658),
     ("Membres secondaires", 1521963107918807140),
 ]
+
+GRADE_LABEL_TO_ROLE_ID = {name: rid for name, rid in GRADE_ROLES}
+
+# Grades sélectionnables à l'étape "grade" de la fiche (Héritier exclu : réservé au sort héréditaire ;
+# Chef exclu). Les 4 premiers sont à capacité 1 (disparaissent s'ils sont occupés), les 2 derniers
+# sont illimités (toujours proposés).
+GRADE_SINGLE_CAP = [
+    ("Bras droit", 1521963034434601040),
+    ("Bras gauche", 1521963034736726158),
+    ("Bras droit héritier", 1521963040155766835),
+    ("Bras gauche héritier", 1521963040809943120),
+]
+GRADE_UNLIMITED = [
+    ("Membres principaux", 1521963104903233658),
+    ("Membres secondaires", 1521963107918807140),
+]
+
+# Capacité de chaque grade (None = illimité). Sert de source unique si une limite est ajoutée un jour.
+GRADE_CAPS = {
+    "Bras droit": 1,
+    "Bras gauche": 1,
+    "Bras droit héritier": 1,
+    "Bras gauche héritier": 1,
+    "Membres principaux": None,
+    "Membres secondaires": None,
+}
+
+
+def compute_vacant_grades(guild_id: int, clan_key: str):
+    """Liste (label, role_id) des grades encore disponibles pour ce clan.
+    La disponibilité est calculée UNIQUEMENT depuis validated_characters (jamais depuis les rôles
+    Discord en direct), puisque les rôles ne sont attribués qu'à la validation de la fiche."""
+    vacant = []
+    for name, rid in GRADE_SINGLE_CAP:
+        cap = GRADE_CAPS.get(name, 1)
+        taken = db.count_validated_grade(guild_id, clan_key, name) if (guild_id and clan_key) else 0
+        if cap is None or taken < cap:
+            vacant.append((name, rid))
+    vacant += GRADE_UNLIMITED
+    return vacant
+
+
+def compute_auto_grade_hybride(clan: str, guild_id: int = None) -> str:
+    """Grade automatique d'un hybride élevé chez les exorcistes (aucune question posée).
+    Renvoie "Membres principaux" tant que ce grade n'a pas atteint une éventuelle limite pour ce clan
+    (illimité aujourd'hui), sinon "Membres secondaires" (cas théorique)."""
+    principaux = "Membres principaux"
+    cap = GRADE_CAPS.get(principaux)  # None aujourd'hui = illimité
+    taken = db.count_validated_grade(guild_id, clan, principaux) if (guild_id and clan) else 0
+    if cap is None or taken < cap:
+        return principaux
+    return "Membres secondaires"
 
 # Utilisateur bénéficiant du flux spécial en message privé
 SPECIAL_USER_ID = 396615332346855428
@@ -284,8 +340,11 @@ def resolve_reward(reward_def: dict) -> dict:
     return {"key": reward_def["key"], "name": reward_def["label"], "qty": "x1", "amount": None}
 
 
-def pick_two_distinct_rewards(table=REWARD_TABLE):
-    """Tire deux récompenses différentes selon les poids de la table fournie."""
+def pick_two_distinct_rewards(table=REWARD_TABLE, exclude_keys: set = None):
+    """Tire deux récompenses différentes selon les poids de la table fournie.
+    exclude_keys : clés de récompense à retirer du pool avant tirage (ex: {"reroll_clan"})."""
+    if exclude_keys:
+        table = [r for r in table if r["key"] not in exclude_keys]
     keys = [r["key"] for r in table]
     weights = [r["pct"] for r in table]
     first_key = random.choices(keys, weights=weights, k=1)[0]
@@ -966,23 +1025,33 @@ class ContinueFicheDirectView(discord.ui.View):
 # =====================================================================
 # FICHE DE PERSONNAGE
 # =====================================================================
-def get_fiche_steps(has_clan: bool) -> list:
-    steps = []
-    if not has_clan:
-        steps.append("nom")
-    steps += ["prenom", "age", "histoire_ask", "portrait"]
-    return steps
-
-
 def has_clan_from_progress(progress: dict) -> bool:
     clan = progress.get("clan")
     return clan is not None and clan != "sans_clan"
 
 
-def next_fiche_stage(current: str, has_clan: bool):
+def get_fiche_steps(progress: dict) -> list:
+    """Étapes du questionnaire de fiche pour ce joueur.
+    - "nom" seulement si pas de clan (avec clan, le nom = celui du clan).
+    - "grade" seulement pour l'EXORCISTE CLASSIQUE avec un clan précis ET non-héritier
+      (l'héritier a déjà son grade). L'hybride-exorciste n'a PAS de question de grade :
+      son grade est déterminé automatiquement (compute_auto_grade_hybride) au tirage du clan."""
+    has_clan = has_clan_from_progress(progress)
+    path = progress.get("path")
+    steps = []
+    if not has_clan:
+        steps.append("nom")
+    steps += ["prenom", "age", "histoire_ask"]
+    if path == "exorciste" and has_clan and not progress.get("sera_heritier"):
+        steps.append("grade")
+    steps.append("portrait")
+    return steps
+
+
+def next_fiche_stage(current: str, progress: dict):
     """Étape suivante. 'histoire_text' n'est pas dans la liste : après elle on va à ce qui suit
-    'histoire_ask' (portrait)."""
-    steps = get_fiche_steps(has_clan)
+    'histoire_ask' (grade ou portrait)."""
+    steps = get_fiche_steps(progress)
     if current == "histoire_text":
         idx = steps.index("histoire_ask")
         return steps[idx + 1] if idx + 1 < len(steps) else None
@@ -1036,6 +1105,43 @@ class HistoireAskView(discord.ui.View):
         ))
 
 
+class GradeSelectView(discord.ui.View):
+    """Menu déroulant des grades vacants d'un clan (étape "grade" de la fiche).
+    custom_id par joueur -> géré par le listener on_interaction."""
+
+    def __init__(self, user_id: int, vacant):
+        super().__init__(timeout=None)
+        options = [discord.SelectOption(label=name, value=name) for name, rid in vacant][:25]
+        self.add_item(discord.ui.Select(
+            placeholder="Choisis ton grade...",
+            min_values=1, max_values=1, options=options,
+            custom_id=f"depart_grade_select:{user_id}",
+        ))
+
+
+async def handle_grade_select(interaction: discord.Interaction, custom_id: str):
+    owner_id = int(custom_id.split(":", 1)[1])
+    if interaction.user.id != owner_id:
+        await interaction.response.send_message("Ce menu ne t'appartient pas.", ephemeral=True)
+        return
+
+    progress = get_progress(interaction.user.id)
+    if progress.get("fiche_status") != "in_progress" or progress.get("fiche_stage") != "grade":
+        await interaction.response.send_message("Cette étape n'est plus active.", ephemeral=True)
+        return
+
+    grade = interaction.data.get("values", [None])[0]
+    update_progress(interaction.user.id, grade_choisi=grade)
+
+    await interaction.response.defer()
+    await _delete_fiche_question(interaction.client, progress)
+
+    nxt = next_fiche_stage("grade", progress)  # -> portrait
+    update_progress(interaction.user.id, fiche_stage=nxt, fiche_deadline=_fiche_deadline_iso())
+    await interaction.followup.send("Enregistré.", ephemeral=True)
+    await send_fiche_question(interaction.client, interaction.user.id)
+
+
 class FicheReviewView(discord.ui.View):
     def __init__(self, user_id: int, slot_number: int):
         super().__init__(timeout=None)
@@ -1076,6 +1182,15 @@ async def send_fiche_question(client, user_id: int):
             color=discord.Color.blurple(),
         )
         msg = await channel.send(embed=embed, view=HistoireAskView(user_id))
+    elif stage == "grade":
+        clan_key = progress.get("clan")
+        guild_id = getattr(getattr(channel, "guild", None), "id", None)
+        vacant = compute_vacant_grades(guild_id, clan_key)
+        embed = discord.Embed(
+            description=f"Quel grade souhaites tu occuper dans le clan **{(clan_key or '').capitalize()}** ?",
+            color=discord.Color.blurple(),
+        )
+        msg = await channel.send(embed=embed, view=GradeSelectView(user_id, vacant))
     else:
         text = QUESTION_TEXTS.get(stage)
         if text is None:
@@ -1093,13 +1208,12 @@ async def handle_start_fiche(interaction: discord.Interaction, custom_id: str):
         return
 
     progress = get_progress(interaction.user.id)
-    has_clan = has_clan_from_progress(progress)
-    steps = get_fiche_steps(has_clan)
+    steps = get_fiche_steps(progress)
 
     # Repart toujours de zéro (même après annulation ou refus).
     update_progress(
         interaction.user.id,
-        nom=None, prenom=None, age=None, histoire=None, portrait_path=None,
+        nom=None, prenom=None, age=None, histoire=None, portrait_path=None, grade_choisi=None,
         fiche_status="in_progress", fiche_stage=steps[0],
         fiche_deadline=_fiche_deadline_iso(),
         origin_channel_id=interaction.channel.id,
@@ -1119,14 +1233,13 @@ async def handle_histoire(interaction: discord.Interaction, custom_id: str, choi
         await interaction.response.send_message("Cette étape n'est plus active.", ephemeral=True)
         return
 
-    has_clan = has_clan_from_progress(progress)
     await interaction.response.defer()
     await _delete_fiche_question(interaction.client, progress)  # retire l'embed Oui/Non
 
     if choice == "oui":
         update_progress(interaction.user.id, fiche_stage="histoire_text", fiche_deadline=_fiche_deadline_iso())
     else:
-        nxt = next_fiche_stage("histoire_ask", has_clan)  # -> portrait
+        nxt = next_fiche_stage("histoire_ask", progress)  # -> grade ou portrait
         update_progress(interaction.user.id, histoire=None, fiche_stage=nxt, fiche_deadline=_fiche_deadline_iso())
         await interaction.followup.send("Très bien.", ephemeral=True)
 
@@ -1157,8 +1270,7 @@ async def handle_fiche_text_answer(client, message: discord.Message, progress: d
     except (discord.Forbidden, discord.HTTPException):
         pass
 
-    has_clan = has_clan_from_progress(progress)
-    nxt = next_fiche_stage(stage, has_clan)
+    nxt = next_fiche_stage(stage, progress)
     if nxt is None:
         await finalize_fiche(client, uid)
         return
@@ -1324,11 +1436,15 @@ def build_fiche_embed(progress: dict, guild, member, uid: int,
     slot = progress.get("slot_number") or 1
     camp = format_camp_display(progress)
 
-    clan_role_id = None
-    if has_clan:
-        info = load_clan_state()["clans"].get(clan_key)
-        clan_role_id = info["role_id"] if info else None
-    grade = compute_recommended_grade(guild, member, clan_role_id)
+    # Grade : Héritier si désigné, sinon le grade choisi via la fiche, sinon selon présence d'un clan.
+    if progress.get("sera_heritier"):
+        grade = "Héritier"
+    elif progress.get("grade_choisi"):
+        grade = progress.get("grade_choisi")
+    elif has_clan:
+        grade = "À définir avec le staff"
+    else:
+        grade = "Aucun (sans clan)"
 
     sort_key = progress.get("sort")
     sort_display = SORT_LABELS.get(sort_key, "Aucun") if sort_key else "Aucun"
@@ -1453,6 +1569,97 @@ async def finalize_fiche(client, uid: int):
         await origin.send(f"{member_mention} Ta fiche a été envoyée au staff pour validation.")
 
 
+async def assign_validation_roles(guild: discord.Guild, member: discord.Member, progress: dict) -> bool:
+    """Attribue TOUS les rôles Discord au moment de la validation (camp, clan, grade/héritier, RCT).
+    Ne lève jamais : en cas d'erreur, logue dans le terminal et continue (l'insertion en base ne
+    doit pas être bloquée). C'est aussi ici que la place de clan devient réellement occupée
+    (comptage / fermeture / redistribution).
+
+    Retourne True si un CONFLIT D'HÉRITIER a été détecté (le clan a déjà un héritier validé) :
+    dans ce cas le joueur reçoit "Membres principaux" au lieu du rôle Héritier."""
+    heir_conflict = False
+    if guild is None or member is None:
+        print(f"[fiche] Rôles non attribués : guild/member introuvable (uid={member.id if member else '?'}).")
+        return heir_conflict
+
+    camp = (progress.get("camp") or "").lower()
+    path = progress.get("path")
+    clan_key = progress.get("clan")
+
+    roles_to_add = []
+
+    def collect(role_id):
+        role = guild.get_role(role_id)
+        if role is None:
+            print(f"[fiche] Rôle introuvable sur le serveur : {role_id}")
+        else:
+            roles_to_add.append(role)
+
+    # 1) Rôle de camp
+    camp_role_id = {"exorciste": ROLE_EXORCISTE, "hybride": ROLE_HYBRIDE, "humain": ROLE_HUMAIN}.get(camp)
+    if camp_role_id:
+        collect(camp_role_id)
+
+    # 2) Rôle de clan (exorciste classique ou hybride chez les exorcistes, avec un clan précis)
+    clan_role_id = None
+    newly_assigned_clan = False
+    if path in ("exorciste", "hybride_exorciste") and clan_key and clan_key != "sans_clan":
+        info = load_clan_state()["clans"].get(clan_key)
+        clan_role_id = info["role_id"] if info else None
+        if clan_role_id:
+            # Exception "Reroll Clan" : si le membre porte DÉJÀ le rôle du clan (attribué au moment
+            # du reroll), on ne le réattribue pas et on ne recompte pas la place (déjà occupée).
+            already_has_clan = any(r.id == clan_role_id for r in member.roles)
+            if not already_has_clan:
+                collect(clan_role_id)
+                collect(CLAN_MEMBER_ROLE_ID)
+                newly_assigned_clan = True
+            # Grade / héritier : attribués dans tous les cas (idempotent si déjà présent).
+            if progress.get("sera_heritier"):
+                # Anti double-héritier : un membre valide porte-t-il déjà clan + Héritier ?
+                existing_heir = any(
+                    {clan_role_id, HERITIER_ROLE_ID} <= {r.id for r in m.roles}
+                    for m in guild.members
+                )
+                if existing_heir:
+                    heir_conflict = True
+                    collect(MEMBRES_PRINCIPAUX_ROLE_ID)  # grade de repli
+                else:
+                    collect(HERITIER_ROLE_ID)
+            elif progress.get("grade_choisi"):
+                grade_rid = GRADE_LABEL_TO_ROLE_ID.get(progress.get("grade_choisi"))
+                if grade_rid:
+                    collect(grade_rid)
+                else:
+                    print(f"[fiche] Grade inconnu, non attribué : {progress.get('grade_choisi')!r}")
+
+    # 3) Rôle RCT
+    collect(RCT_POSSEDE_ROLE_ID if progress.get("rct") else RCT_NON_POSSEDE_ROLE_ID)
+
+    try:
+        if roles_to_add:
+            await member.add_roles(*roles_to_add, reason="Validation de fiche /depart")
+    except discord.Forbidden:
+        print(f"[fiche] Permission manquante pour attribuer les rôles à {member} ({member.id}). "
+              "Rôles à corriger manuellement.")
+        return heir_conflict
+    except Exception as e:
+        import traceback
+        print(f"[fiche] Erreur d'attribution des rôles à {member} ({member.id}) : {e}")
+        traceback.print_exc()
+        return heir_conflict
+
+    # 4) La place de clan devient réellement occupée ICI seulement si le rôle vient d'être attribué
+    # (pas le cas d'un Reroll Clan, où la place a déjà été comptée au moment du reroll).
+    if clan_role_id and newly_assigned_clan:
+        try:
+            update_clan_state_after_join(guild, clan_key)
+        except Exception as e:
+            print(f"[fiche] Erreur fermeture/redistribution du clan {clan_key} : {e}")
+
+    return heir_conflict
+
+
 async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
     parts = custom_id.split(":")
     target_uid = int(parts[1])
@@ -1472,7 +1679,17 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
         content=f"{original_content}\n✅ Validée par {interaction.user.mention}", view=None
     )
 
-    # 2) Insertion dans validated_characters.
+    # 2) Attribution réelle des rôles (camp/clan/grade/héritier/RCT) + comptage de clan.
+    # Fait AVANT l'insertion pour connaître un éventuel conflit d'héritier (grade réel = repli).
+    heir_conflict = await assign_validation_roles(guild, member, progress)
+
+    # Grade effectivement attribué (pour validated_characters + affichage).
+    if progress.get("sera_heritier"):
+        effective_grade = "Membres principaux" if heir_conflict else "Héritier"
+    else:
+        effective_grade = progress.get("grade_choisi")
+
+    # 3) Insertion dans validated_characters (avec le grade effectif : source de vérité des places).
     has_clan = has_clan_from_progress(progress)
     nom_final = progress.get("clan").capitalize() if has_clan else (progress.get("nom") or "")
     prenom = progress.get("prenom") or ""
@@ -1484,7 +1701,7 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
         camp=progress.get("camp"), clan=progress.get("clan"), sort=progress.get("sort"),
         eo_classe=progress.get("eo_classe"), eo_value=progress.get("eo_value"),
         nature=progress.get("nature"), hybride_type=_hybride_type_of(progress),
-        portrait_path=progress.get("portrait_path"),
+        grade=effective_grade, portrait_path=progress.get("portrait_path"),
         validated_at=datetime.utcnow().isoformat(),
     )
     update_progress(target_uid, fiche_status="validated")
@@ -1495,6 +1712,21 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
         progress, guild, member, target_uid,
         statut_display="✅ Validée", valide_par_display=interaction.user.mention,
     )
+    member_mention = member.mention if member else f"<@{target_uid}>"
+
+    # Conflit d'héritier : l'embed a affiché "Héritier" mais le joueur est en fait "Membre principal".
+    if heir_conflict:
+        embed.description = embed.description.replace("**Grade :** Héritier", "**Grade :** Membre principal")
+        staff_channel = interaction.client.get_channel(FICHE_STAFF_CHANNEL_ID)
+        if staff_channel:
+            clan_name = (progress.get("clan") or "").capitalize()
+            await staff_channel.send(
+                f"⚠️ Conflit détecté : {member_mention} avait obtenu le Sort héréditaire du clan "
+                f"{clan_name}, mais un héritier existe déjà pour ce clan. Il a été automatiquement "
+                "placé en Membre principal à la place. Une intervention manuelle du staff peut être "
+                "nécessaire si besoin."
+            )
+
     portrait_path = progress.get("portrait_path")
     filename = _fiche_portrait_filename(target_uid, slot)
     validated_channel = interaction.client.get_channel(FICHE_VALIDATED_CHANNEL_ID)
@@ -1506,7 +1738,6 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
 
     # 4) Notifie le joueur.
     origin = interaction.client.get_channel(progress.get("origin_channel_id"))
-    member_mention = member.mention if member else f"<@{target_uid}>"
     if origin:
         await origin.send(f"{member_mention} Ta fiche a été validée par le staff ! Bienvenue.")
 
@@ -1662,16 +1893,18 @@ async def apply_reward(interaction: discord.Interaction, reward: dict):
         await channel.send(embed=_reward_embed(f"{member.mention} a obtenu : **{reward['name']}** !"))
 
     # --- Enchaînement selon le chemin ---
-    # Fléaux / Livré à soi même : pas d'étape RCT, on va directement vers la fiche.
-    # Exorciste / Hybride-exorciste : étape RCT comme avant.
+    # Fléaux : pas de RCT (régénération par l'énergie), on va directement vers la fiche.
+    # Exorciste / Hybride-exorciste / Livré à soi même : étape RCT.
     path = get_progress(uid).get("path")
-    if path in ("hybride_fleaux", "hybride_seul"):
+    if path == "hybride_fleaux":
         await send_vers_la_fiche(channel, member)
     else:
         await send_rct_step(channel, member)
 
 
 async def reward_reroll_clan(interaction, progress):
+    """EXCEPTION au système différé : le Reroll Clan (récompense) attribue immédiatement le vrai
+    rôle du clan + le comptage/fermeture qui va avec (contrairement au tirage initial, différé)."""
     member = interaction.user
     guild = interaction.guild
     channel = interaction.channel
@@ -1682,12 +1915,13 @@ async def reward_reroll_clan(interaction, progress):
 
     state = load_clan_state()
 
+    # Retire le rôle de l'ancien clan (d'un reroll précédent) si le membre le porte encore.
     remove_roles = []
     if old_clan and old_clan != "sans_clan":
         old_info = state["clans"].get(old_clan)
         if old_info:
             r = guild.get_role(old_info["role_id"])
-            if r:
+            if r and r in member.roles:
                 remove_roles.append(r)
 
     # Nouveau tirage de clan, identique au parcours normal.
@@ -1697,27 +1931,42 @@ async def reward_reroll_clan(interaction, progress):
             pool[clan_key] = inf["current_pct"]
     new_clan = weighted_choice(pool)
 
+    auto_grade = None
     if new_clan == "sans_clan":
+        # Aucun rôle de clan : on retire aussi le marqueur "appartient à un clan" si présent.
         marker = guild.get_role(CLAN_MEMBER_ROLE_ID)
         if marker and marker in member.roles:
             remove_roles.append(marker)
-        if remove_roles:
-            try:
-                await member.remove_roles(*remove_roles)
-            except discord.Forbidden:
-                pass
+        try:
+            if remove_roles:
+                await member.remove_roles(*remove_roles, reason="Reroll Clan (récompense)")
+        except discord.Forbidden:
+            print(f"[reroll_clan] Permission manquante pour retirer les rôles à {member} ({uid}).")
     else:
-        if remove_roles:
-            try:
-                await member.remove_roles(*remove_roles)
-            except discord.Forbidden:
-                pass
         new_info = state["clans"][new_clan]
-        extra = [MEMBRES_PRINCIPAUX_ROLE_ID] if path == "hybride_exorciste" else None
-        await assign_clan_roles(interaction, new_info["role_id"], extra_role_ids=extra)
+        add_roles = [role for role in (guild.get_role(new_info["role_id"]),
+                                       guild.get_role(CLAN_MEMBER_ROLE_ID)) if role is not None]
+        # Hybride chez les exorcistes : grade auto (Membres principaux) recalculé pour le nouveau clan.
+        if path == "hybride_exorciste":
+            auto_grade = compute_auto_grade_hybride(new_clan, guild.id if guild else None)
+            grade_role = guild.get_role(GRADE_LABEL_TO_ROLE_ID.get(auto_grade))
+            if grade_role is not None:
+                add_roles.append(grade_role)
+        try:
+            if remove_roles:
+                await member.remove_roles(*remove_roles, reason="Reroll Clan (récompense)")
+            if add_roles:
+                await member.add_roles(*add_roles, reason="Reroll Clan (récompense)")
+        except discord.Forbidden:
+            print(f"[reroll_clan] Permission manquante pour modifier les rôles à {member} ({uid}).")
+        # La place est maintenant réellement occupée : fermeture / redistribution si cap atteint.
         update_clan_state_after_join(guild, new_clan)
 
-    update_progress(uid, clan=new_clan)
+    # Base : nouveau clan, plus héritier (un nouveau sort héréditaire devrait être re-accepté).
+    fields = {"clan": new_clan, "sera_heritier": 0}
+    if path == "hybride_exorciste":
+        fields["grade_choisi"] = auto_grade  # None si sans_clan
+    update_progress(uid, **fields)
     # TODO: cas limite si le nouveau clan ne permet pas le sort déjà obtenu (ex: sort héréditaire
     # partiel sur un clan qui ne le propose pas), à vérifier manuellement pour l'instant.
 
@@ -1759,15 +2008,15 @@ async def reward_reroll_sort(interaction, progress):
     final_table = redistribute_pct(base_table, "sort_heredit") if heredit_taken else dict(base_table)
     new_sort = weighted_choice(final_table)
 
-    # TODO: si new_sort == "sort_heredit", la validation accepter/refuser héritier n'est pas
-    # re-déclenchée ici ; le reroll attribue directement le sort héréditaire complet (rôle Héritier).
+    # Rôle Héritier différé à la validation : on ne fait que mémoriser l'état en base.
+    # TODO: la validation accepter/refuser héritier n'est pas re-déclenchée ici ; un reroll
+    # tombant sur le sort héréditaire désigne directement le joueur comme futur héritier.
     if new_sort == "sort_heredit":
-        await assign_clan_roles(interaction, info["role_id"], heir=True)
+        update_progress(uid, sort=new_sort, sera_heritier=1)
         label = "Sort héréditaire (complet)"
     else:
+        update_progress(uid, sort=new_sort, sera_heritier=0)
         label = SORT_LABELS[new_sort]
-
-    update_progress(uid, sort=new_sort)
 
     spell_data = build_spell_image_data(base_table, final_table, new_sort, label)
     await send_clan_sort_pillow(channel, state, clan_key, spell_data)
@@ -1861,7 +2110,9 @@ async def start_reward_choice(interaction: discord.Interaction, table):
     if not interaction.response.is_done():
         await interaction.response.defer()
     uid = interaction.user.id
-    option_a, option_b = pick_two_distinct_rewards(table)
+    # Héritier désigné : "Reroll Clan" retiré du pool (il perdrait son statut d'héritier).
+    exclude = {"reroll_clan"} if get_progress(uid).get("sera_heritier") else None
+    option_a, option_b = pick_two_distinct_rewards(table, exclude_keys=exclude)
     store_pending_rewards(uid, option_a, option_b)
 
     img = _tmp_image_path("recompense")
@@ -2009,12 +2260,8 @@ class HeirView(discord.ui.View):
 
         await interaction.response.edit_message(view=None)
 
-        info = self.state["clans"][self.clan_key]
-        if not await assign_clan_roles(interaction, info["role_id"], heir=True):
-            return
-
-        update_clan_state_after_join(interaction.guild, self.clan_key)
-        update_progress(interaction.user.id, camp="exorciste", path="exorciste", clan=self.clan_key, sort="sort_heredit")
+        # Rôles (clan + Héritier) différés à la validation : on mémorise seulement "sera héritier".
+        update_progress(interaction.user.id, camp="exorciste", path="exorciste", clan=self.clan_key, sort="sort_heredit", sera_heritier=1)
 
         await send_roll_result(
             interaction,
@@ -2037,15 +2284,8 @@ class HeirView(discord.ui.View):
         reduced_table = redistribute_pct(self.final_table, "sort_heredit")
         new_sort = weighted_choice(reduced_table)
 
-        info = self.state["clans"][self.clan_key]
-        # Pas de rôle Héritier ici : seulement le clan + le marqueur de clan.
-        if not await assign_clan_roles(interaction, info["role_id"], heir=False):
-            return
-
-        # TODO: attribution du grade (Membres principaux/secondaires) à définir plus tard avec l'utilisateur
-
-        update_clan_state_after_join(interaction.guild, self.clan_key)
-        update_progress(interaction.user.id, camp="exorciste", path="exorciste", clan=self.clan_key, sort=new_sort)
+        # Rôles différés à la validation ; grade choisi via le questionnaire de fiche.
+        update_progress(interaction.user.id, camp="exorciste", path="exorciste", clan=self.clan_key, sort=new_sort, sera_heritier=0)
 
         await send_roll_result(
             interaction,
@@ -2119,14 +2359,9 @@ class ClanRollView(discord.ui.View):
             )
             return
 
-        # Sort classique : attribution directe du clan + marqueur de clan.
-        if not await assign_clan_roles(interaction, info["role_id"], heir=False):
-            return
-
-        # TODO: attribution du grade (Membres principaux/secondaires) à définir plus tard avec l'utilisateur
-
-        update_clan_state_after_join(guild, result_key)
-        update_progress(interaction.user.id, camp="exorciste", path="exorciste", clan=result_key, sort=sort_key)
+        # Sort classique : rôles (clan + marqueur) différés à la validation. Grade choisi via la fiche.
+        # Le comptage/fermeture du clan se fait aussi à la validation (place réellement occupée à ce moment).
+        update_progress(interaction.user.id, camp="exorciste", path="exorciste", clan=result_key, sort=sort_key, sera_heritier=0)
 
         await send_roll_result(
             interaction, state, result_key, sort_key, SORT_LABELS[sort_key], base_table, final_table
@@ -2164,16 +2399,14 @@ class ClanRollHybrideView(discord.ui.View):
             )
             return
 
-        # c) Clan précis : clan + marqueur + Membres principaux (automatique, sans confirmation).
+        # c) Clan précis : rôles différés à la validation, comptage/fermeture à la validation.
+        # Le grade est déterminé AUTOMATIQUEMENT (aucune question de grade dans la fiche pour ce chemin).
         info = state["clans"][result_key]
-        if not await assign_clan_roles(
-            interaction, info["role_id"], extra_role_ids=[MEMBRES_PRINCIPAUX_ROLE_ID]
-        ):
-            return
-
-        # L'hybride occupe une vraie place du clan : mêmes règles de fermeture/réouverture.
-        update_clan_state_after_join(guild, result_key)
-        update_progress(interaction.user.id, camp="hybride", path="hybride_exorciste", hybride_type="exorciste", clan=result_key, sort="sort_inne")
+        auto_grade = compute_auto_grade_hybride(result_key, guild.id if guild else None)
+        update_progress(
+            interaction.user.id, camp="hybride", path="hybride_exorciste", hybride_type="exorciste",
+            clan=result_key, sort="sort_inne", sera_heritier=0, grade_choisi=auto_grade,
+        )
 
         # b/e) Sort toujours "Sort inné", table verrouillée pour l'affichage.
         spell_data = build_hybride_spell_data(info["partial_heredit"])
@@ -2446,9 +2679,7 @@ class CampView(discord.ui.View):
 
     @discord.ui.button(label="Exorciste", emoji="⚔️", style=discord.ButtonStyle.primary, custom_id="depart_camp_exorciste")
     async def exorciste(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await apply_camp_role(interaction, ROLE_EXORCISTE):
-            return
-
+        # Rôle de camp NON attribué ici : différé à la validation de la fiche.
         update_progress(interaction.user.id, camp="exorciste")
 
         # Dans TOUS les cas : le tableau des clans + bouton Roll part immédiatement dans le salon.
@@ -2481,8 +2712,7 @@ class CampView(discord.ui.View):
 
     @discord.ui.button(label="Hybride", emoji="🧬", style=discord.ButtonStyle.danger, custom_id="depart_camp_hybride")
     async def hybride(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await apply_camp_role(interaction, ROLE_HYBRIDE):
-            return
+        # Rôle de camp NON attribué ici : différé à la validation de la fiche.
         update_progress(interaction.user.id, camp="hybride")
         await interaction.response.send_message(
             embed=build_education_embed(), view=EducationView(), ephemeral=False
@@ -2636,6 +2866,8 @@ class Depart(commands.Cog):
             await handle_histoire(interaction, custom_id, "oui")
         elif custom_id.startswith("depart_histoire_non:"):
             await handle_histoire(interaction, custom_id, "non")
+        elif custom_id.startswith("depart_grade_select:"):
+            await handle_grade_select(interaction, custom_id)
         elif custom_id.startswith("depart_fiche_valide:"):
             await handle_fiche_valide(interaction, custom_id)
         elif custom_id.startswith("depart_fiche_refuse:"):
@@ -2766,12 +2998,8 @@ class Depart(commands.Cog):
 
     @app_commands.command(name="départ", description="Démarre la création de ton personnage")
     async def depart(self, interaction: discord.Interaction):
-        if not has_depart_role(interaction.user):
-            # TODO: comportement à définir plus tard (point A), pour l'instant message temporaire
-            await interaction.response.send_message(
-                "Tu n'as pas encore accès à cette commande.", ephemeral=False
-            )
-            return
+        # Aucune condition de rôle : la commande est ouverte à tous les membres du serveur.
+        # (Le rôle DEPART_ROLE_ID reste utilisé par cogs/ticket.py pour les permissions d'upload.)
 
         # Écran de sélection de personnage (3 slots).
         rows = db.get_validated_characters(interaction.user.id, interaction.guild.id)

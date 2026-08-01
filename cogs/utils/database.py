@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS validated_characters (
     eo_value INTEGER,
     nature TEXT,
     hybride_type TEXT,
+    grade TEXT,
     portrait_path TEXT,
     validated_at TEXT
 );
@@ -96,6 +97,8 @@ CREATE TABLE IF NOT EXISTS depart_character_progress (
     hybride_type TEXT,
     clan TEXT,
     sort TEXT,
+    sera_heritier INTEGER DEFAULT 0,
+    grade_choisi TEXT,
     eo_classe TEXT,
     eo_value INTEGER,
     nature TEXT,
@@ -174,6 +177,8 @@ def _copy_validated_characters_from_old(conn):
 _PROGRESS_EXTRA_COLUMNS = [
     ("slot_number", "INTEGER"),
     ("hybride_type", "TEXT"),
+    ("sera_heritier", "INTEGER DEFAULT 0"),
+    ("grade_choisi", "TEXT"),
     ("reroll_rct_charges", "INTEGER DEFAULT 0"),
     ("reroll_energie_charges", "INTEGER DEFAULT 0"),
     ("parchemins_territoire", "INTEGER DEFAULT 0"),
@@ -197,6 +202,7 @@ _PROGRESS_EXTRA_COLUMNS = [
 _VALIDATED_EXTRA_COLUMNS = [
     ("portrait_path", "TEXT"),
     ("hybride_type", "TEXT"),
+    ("grade", "TEXT"),
 ]
 
 
@@ -473,7 +479,8 @@ def delete_pending_choice(user_id: int):
 # DEPART CHARACTER PROGRESS
 # =====================================================================
 _PROGRESS_SCALAR_COLS = (
-    "guild_id", "slot_number", "camp", "path", "hybride_type", "clan", "sort", "eo_classe", "eo_value", "nature",
+    "guild_id", "slot_number", "camp", "path", "hybride_type", "clan", "sort",
+    "sera_heritier", "grade_choisi", "eo_classe", "eo_value", "nature",
     "reroll_rct_charges", "reroll_energie_charges",
     "parchemins_territoire", "parchemins_rct", "parchemins_nature", "rct",
     "recompense", "nom", "prenom", "age", "histoire", "portrait_path",
@@ -503,6 +510,8 @@ def get_character_progress(user_id: int) -> dict:
         "hybride_type": row["hybride_type"],
         "clan": row["clan"],
         "sort": row["sort"],
+        "sera_heritier": row["sera_heritier"] or 0,
+        "grade_choisi": row["grade_choisi"],
         "eo_classe": row["eo_classe"],
         "eo_value": row["eo_value"],
         "nature": row["nature"],
@@ -542,17 +551,27 @@ def get_expired_fiches(now_iso: str):
 
 def insert_validated_character(user_id, guild_id, slot_number, discord_username, character_name,
                                camp, clan, sort, eo_classe, eo_value, nature, hybride_type,
-                               portrait_path, validated_at):
+                               grade, portrait_path, validated_at):
     """Insère un personnage validé (un joueur peut en avoir plusieurs, un par slot)."""
     with get_connection() as conn:
         conn.execute(
             """INSERT INTO validated_characters
                (user_id, guild_id, slot_number, discord_username, character_name,
-                camp, clan, sort, eo_classe, eo_value, nature, hybride_type, portrait_path, validated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                camp, clan, sort, eo_classe, eo_value, nature, hybride_type, grade, portrait_path, validated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (user_id, guild_id, slot_number, discord_username, character_name,
-             camp, clan, sort, eo_classe, eo_value, nature, hybride_type, portrait_path, validated_at),
+             camp, clan, sort, eo_classe, eo_value, nature, hybride_type, grade, portrait_path, validated_at),
         )
+
+
+def count_validated_grade(guild_id: int, clan: str, grade: str) -> int:
+    """Nombre de personnages VALIDÉS occupant un grade précis dans un clan précis.
+    Source de vérité pour les places de grade (les rôles Discord ne sont posés qu'à la validation)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM validated_characters WHERE guild_id = ? AND clan = ? AND grade = ?",
+            (guild_id, clan, grade),
+        ).fetchone()["n"]
 
 
 def adjust_progress_counter(user_id: int, column: str, delta: int):
