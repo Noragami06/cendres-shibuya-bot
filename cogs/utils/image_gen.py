@@ -391,3 +391,150 @@ def generate_slots_image(username: str, slots: list, out_path: str):
 
     canvas.save(out_path)
     return out_path
+
+
+def generate_economie_image(prenom: str, nom_clan: str, solde: int, livret_a: int, transactions: list, out_path: str):
+    """
+    transactions: liste de tuples (label, date, montant_str, is_positif)
+    Exemple : [("Récompense de départ", "30/07/2026", "+34 000 ¥", True), ...]
+    Affiche au maximum les 4 dernières transactions.
+    """
+    W, H = 1200, 650
+    BG = (16, 15, 26, 255)
+    TEXT = (245, 245, 250, 255)
+    SUB = (170, 165, 190, 255)
+    POS = (140, 255, 190, 255)
+    NEG = (255, 140, 160, 255)
+    LABEL = (255, 255, 255, 255)
+    LINE = (50, 47, 65, 255)
+
+    img = Image.new("RGBA", (W, H), BG)
+    d = ImageDraw.Draw(img)
+
+    d.rectangle((0, 0, W, 74), fill=(22, 20, 34, 255))
+    d.text((40, 22), "Banque Phénix", font=font(18, True), fill=(255, 255, 255, 255))
+    identite = f"{prenom} — {nom_clan}" if nom_clan else prenom
+    name_w = text_w(d, identite, font(14, True))
+    d.text((W - 40 - name_w, 27), identite, font=font(14, True), fill=TEXT)
+
+    # carte SOLDE : degrade rose -> violet
+    card = Image.new("RGBA", (550, 170), (0, 0, 0, 255))
+    cd = ImageDraw.Draw(card)
+    for x in range(550):
+        t = x / 550
+        r = int(255 * (1 - t) + 130 * t)
+        g = int(90 * (1 - t) + 80 * t)
+        b = int(160 * (1 - t) + 255 * t)
+        cd.line([(x, 0), (x, 170)], fill=(r, g, b, 255))
+    mask = Image.new("L", (550, 170), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, 549, 169), radius=20, fill=255)
+    img.paste(card, (40, 110), mask)
+    d.text((64, 134), "SOLDE ACTUEL", font=font(15, True), fill=LABEL)
+    d.text((64, 168), f"{solde:,} ¥".replace(",", " "), font=font(38, True), fill=(255, 255, 255, 255))
+
+    # carte LIVRET A : degrade orange -> dore (theme phenix)
+    card2 = Image.new("RGBA", (550, 170), (0, 0, 0, 255))
+    cd2 = ImageDraw.Draw(card2)
+    for x in range(550):
+        t = x / 550
+        r = int(255 * (1 - t) + 230 * t)
+        g = int(110 * (1 - t) + 170 * t)
+        b = int(40 * (1 - t) + 50 * t)
+        cd2.line([(x, 0), (x, 170)], fill=(r, g, b, 255))
+    mask2 = Image.new("L", (550, 170), 0)
+    ImageDraw.Draw(mask2).rounded_rectangle((0, 0, 549, 169), radius=20, fill=255)
+    img.paste(card2, (610, 110), mask2)
+    d.text((634, 134), "LIVRET A", font=font(15, True), fill=LABEL)
+    d.text((634, 168), f"{livret_a:,} ¥".replace(",", " "), font=font(32, True), fill=(255, 255, 255, 255))
+
+    d.text((40, 316), "Transactions récentes", font=font(16, True), fill=TEXT)
+    rounded_panel(d, (40, 350, W - 40, 600), 20, fill=(28, 26, 40, 255), outline=None)
+    y = 372
+    display_transactions = transactions[:4]
+    for i, (label, date, amount, pos) in enumerate(display_transactions):
+        d.text((64, y), label, font=font(13, True), fill=TEXT)
+        d.text((64, y + 20), date, font=font(11), fill=SUB)
+        aw = text_w(d, amount, font(14, True))
+        d.text((W - 64 - aw, y + 8), amount, font=font(14, True), fill=POS if pos else NEG)
+        if i != len(display_transactions) - 1:
+            d.line((64, y + 50, W - 64, y + 50), fill=LINE, width=1)
+        y += 60
+
+    if not display_transactions:
+        d.text((64, 380), "Aucune transaction pour l'instant.", font=font(13), fill=SUB)
+
+    img.save(out_path)
+    return out_path
+
+
+def generate_pin_image(portrait_path: str, values: list, out_path: str):
+    """
+    portrait_path : chemin vers la vraie photo du personnage (déjà utilisée ailleurs dans ce fichier via ImageOps.fit)
+    values : liste de 4 éléments, chacun soit "*" (chiffre déjà saisi) soit "" (case vide)
+             exemple : ["*", "*", "", ""] pour un code à moitié saisi
+    """
+    W, H = 500, 620
+    BG = (16, 15, 26, 255)
+    TEXT = (245, 245, 250, 255)
+    GOLD1, GOLD2 = (255, 110, 40), (230, 170, 50)
+
+    def grad_h(size, c1, c2):
+        w, h = size
+        card = Image.new("RGBA", (w, h), (0, 0, 0, 255))
+        cd = ImageDraw.Draw(card)
+        for x in range(w):
+            t = x / w
+            r = int(c1[0] * (1 - t) + c2[0] * t)
+            g = int(c1[1] * (1 - t) + c2[1] * t)
+            b = int(c1[2] * (1 - t) + c2[2] * t)
+            cd.line([(x, 0), (x, h)], fill=(r, g, b, 255))
+        return card
+
+    def grad_ring_mask(size, thickness):
+        w, h = size
+        mask = Image.new("L", (w, h), 0)
+        md = ImageDraw.Draw(mask)
+        md.ellipse((0, 0, w - 1, h - 1), fill=255)
+        md.ellipse((thickness, thickness, w - 1 - thickness, h - 1 - thickness), fill=0)
+        return mask
+
+    img = Image.new("RGBA", (W, H), BG)
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, W, 64), fill=(22, 20, 34, 255))
+    d.text((24, 20), "Banque Phénix", font=font(15, True), fill=(255, 255, 255, 255))
+
+    size = 150
+    cx = W // 2
+    ring = grad_h((size, size), GOLD1, GOLD2)
+    mask = grad_ring_mask((size, size), 5)
+    img.paste(ring, (cx - size // 2, 130), mask)
+
+    inner = size - 16
+    photo_mask = Image.new("L", (inner, inner), 0)
+    ImageDraw.Draw(photo_mask).ellipse((0, 0, inner - 1, inner - 1), fill=255)
+
+    if portrait_path and os.path.exists(portrait_path):
+        photo = Image.open(portrait_path).convert("RGB")
+        photo = ImageOps.fit(photo, (inner, inner), method=Image.LANCZOS)
+    else:
+        photo = Image.new("RGB", (inner, inner), (40, 38, 55))
+
+    img.paste(photo, (cx - inner // 2, 130 + 8), photo_mask)
+
+    d.text((24, 310), "Entre ton code secret", font=font(15, True), fill=TEXT)
+
+    box = 70
+    gap = 18
+    total = box * 4 + gap * 3
+    x0 = (W - total) // 2
+    y0 = 350
+    for i in range(4):
+        v = values[i] if i < len(values) else ""
+        x = x0 + i * (box + gap)
+        d.rounded_rectangle((x, y0, x + box, y0 + box), radius=14, outline=GOLD2 if v else (60, 58, 78, 255), width=2, fill=(24, 22, 36, 255))
+        if v:
+            vw = text_w(d, v, font(28, True))
+            d.text((x + box / 2 - vw / 2, y0 + box / 2 - 18), v, font=font(28, True), fill=TEXT)
+
+    img.save(out_path)
+    return out_path

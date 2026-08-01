@@ -1847,7 +1847,10 @@ async def apply_reward(interaction: discord.Interaction, reward: dict):
 
     # --- Effet propre à chaque récompense (aucun return : l'enchaînement RCT est commun, plus bas) ---
     if key in ("argent", "xp"):
-        # TODO: intégrer réellement ce montant dans le futur système économique/XP une fois développé.
+        # L'argent est mémorisé pour être déposé sur le futur compte bancaire (cog banque).
+        if key == "argent":
+            update_progress(uid, argent_recompense=reward.get("amount") or 0)
+        # TODO: intégrer réellement l'XP dans le futur système une fois développé.
         await channel.send(embed=_reward_embed(f"{member.mention} a choisi **{reward['qty']}** !"))
 
     elif key == "reroll_clan":

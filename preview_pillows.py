@@ -27,3 +27,19 @@ energy_table = [("Normal", "55%", False), ("Brute", "25%", True), ("Raffinée", 
 generate_reserve_image("4", 812, 100, 1000, ranking, energy_table, "temp/preview_reserve.png")
 
 print("3 images générées dans temp/")
+
+from cogs.utils.image_gen import generate_economie_image
+
+transactions_exemple = [
+    ("Récompense de départ", "30/07/2026", "+34 000 ¥", True),
+    ("Achat — Boutique", "29/07/2026", "-8 500 ¥", False),
+    ("Virement reçu", "27/07/2026", "+12 000 ¥", True),
+    ("Frais d'ordre", "25/07/2026", "-2 300 ¥", False),
+]
+generate_economie_image("Han Gojo", "Gojo", 234567, 58200, transactions_exemple, "temp/preview_economie.png")
+print("5ème image (économie) générée dans temp/")
+
+from cogs.utils.image_gen import generate_pin_image
+
+generate_pin_image(None, ["*", "*", "", ""], "temp/preview_pin.png")
+print("6ème image (code PIN) générée dans temp/")

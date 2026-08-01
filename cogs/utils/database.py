@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS depart_character_progress (
     parchemins_nature INTEGER DEFAULT 0,
     rct INTEGER DEFAULT 0,
     recompense TEXT,
+    argent_recompense INTEGER DEFAULT 0,
     nom TEXT,
     prenom TEXT,
     age INTEGER,
@@ -133,6 +134,35 @@ CREATE TABLE IF NOT EXISTS depart_pending_rewards (
 CREATE TABLE IF NOT EXISTS depart_pending_reserve_choice (
     user_id INTEGER PRIMARY KEY,
     classe TEXT
+);
+
+CREATE TABLE IF NOT EXISTS bank_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id INTEGER UNIQUE,
+    user_id INTEGER,
+    guild_id INTEGER,
+    iban_courant TEXT UNIQUE,
+    iban_livret TEXT UNIQUE,
+    pin_code TEXT,
+    solde_courant INTEGER DEFAULT 0,
+    solde_livret INTEGER DEFAULT 0,
+    created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS bank_sessions (
+    user_id INTEGER,
+    character_id INTEGER,
+    verified_at TEXT,
+    PRIMARY KEY (user_id, character_id)
+);
+
+CREATE TABLE IF NOT EXISTS bank_transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id INTEGER,
+    label TEXT,
+    amount INTEGER,
+    date TEXT,
+    related_iban TEXT
 );
 """
 
@@ -186,6 +216,7 @@ _PROGRESS_EXTRA_COLUMNS = [
     ("parchemins_nature", "INTEGER DEFAULT 0"),
     ("rct", "INTEGER DEFAULT 0"),
     ("recompense", "TEXT"),
+    ("argent_recompense", "INTEGER DEFAULT 0"),
     ("nom", "TEXT"),
     ("prenom", "TEXT"),
     ("age", "INTEGER"),
@@ -483,7 +514,7 @@ _PROGRESS_SCALAR_COLS = (
     "sera_heritier", "grade_choisi", "eo_classe", "eo_value", "nature",
     "reroll_rct_charges", "reroll_energie_charges",
     "parchemins_territoire", "parchemins_rct", "parchemins_nature", "rct",
-    "recompense", "nom", "prenom", "age", "histoire", "portrait_path",
+    "recompense", "argent_recompense", "nom", "prenom", "age", "histoire", "portrait_path",
     "fiche_status", "fiche_stage", "fiche_deadline", "fiche_question_msg_id", "origin_channel_id",
 )
 
@@ -524,6 +555,7 @@ def get_character_progress(user_id: int) -> dict:
         "parchemins_nature": row["parchemins_nature"] or 0,
         "rct": row["rct"] or 0,
         "recompense": row["recompense"],
+        "argent_recompense": row["argent_recompense"] or 0,
         "nom": row["nom"],
         "prenom": row["prenom"],
         "age": row["age"],
