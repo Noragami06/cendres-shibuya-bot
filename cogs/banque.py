@@ -103,11 +103,25 @@ def get_account(character_id: int):
         ).fetchone()
 
 
-def get_account_by_iban_courant(iban: str):
+def find_account_by_any_iban(iban: str):
+    """Cherche un compte par IBAN courant OU livret. Retourne une ligne
+    (character_id, user_id, type_compte='courant'|'livret') ou None."""
     with db.get_connection() as conn:
         return conn.execute(
-            "SELECT * FROM bank_accounts WHERE iban_courant = ?", (iban,)
+            "SELECT character_id, user_id, 'courant' AS type_compte FROM bank_accounts WHERE iban_courant = ? "
+            "UNION "
+            "SELECT character_id, user_id, 'livret' AS type_compte FROM bank_accounts WHERE iban_livret = ?",
+            (iban, iban),
         ).fetchone()
+
+
+def credit_account(character_id: int, target: str, montant: int):
+    """Crédite un solde (courant ou livret) d'un personnage."""
+    col = "solde_courant" if target == "courant" else "solde_livret"
+    with db.get_connection() as conn:
+        conn.execute(
+            f"UPDATE bank_accounts SET {col} = {col} + ? WHERE character_id = ?", (montant, character_id)
+        )
 
 
 def get_session(user_id: int, character_id: int):
@@ -183,22 +197,6 @@ def create_account(character_id: int, user_id: int, guild_id: int, solde_courant
             (character_id, user_id, guild_id, iban_c, iban_l, pin, solde_courant, _now()),
         )
     return iban_c, iban_l, pin
-
-
-def apply_transfer(sender, recipient, amount: int):
-    with db.get_connection() as conn:
-        conn.execute(
-            "UPDATE bank_accounts SET solde_courant = solde_courant - ? WHERE id = ?",
-            (amount, sender["id"]),
-        )
-        conn.execute(
-            "UPDATE bank_accounts SET solde_courant = solde_courant + ? WHERE id = ?",
-            (amount, recipient["id"]),
-        )
-    add_transaction(sender["character_id"], f"Virement envoyé à {recipient['iban_courant']}",
-                    -amount, recipient["iban_courant"])
-    add_transaction(recipient["character_id"], f"Virement reçu de {sender['iban_courant']}",
-                    amount, sender["iban_courant"])
 
 
 def apply_balance_change(character_id: int, target: str, delta: int):
@@ -352,11 +350,28 @@ class AdminTargetView(discord.ui.View):
         if interaction.user.id != self.staff_id:
             await interaction.response.send_message("Ce n'est pas ton opération.", ephemeral=True)
             return
-        apply_balance_change(self.character_id, target, self.delta)
-        account = get_account(self.character_id)
-        bal = account["solde_courant"] if target == "courant" else account["solde_livret"]
+
         verbe = "Ajout" if self.delta >= 0 else "Retrait"
         libelle = "compte courant" if target == "courant" else "Livret A"
+
+        # Retrait sur le compte courant : passe par le débit qui peut clôturer le compte (<= -100 ¥).
+        if self.delta < 0 and target == "courant":
+            add_transaction(self.character_id, "Retrait manuel par le staff", self.delta)
+            deleted = await self.cog.apply_debit_and_check_deletion(
+                self.character_id, abs(self.delta), interaction.guild
+            )
+            if deleted:
+                await interaction.response.edit_message(
+                    content=f"✅ Retrait de {abs(self.delta):,} ¥ effectué. ⚠️ Le solde est passé sous "
+                            "-100 ¥ : le compte a été clôturé automatiquement.",
+                    view=None,
+                )
+                return
+        else:
+            apply_balance_change(self.character_id, target, self.delta)
+
+        account = get_account(self.character_id)
+        bal = account["solde_courant"] if target == "courant" else account["solde_livret"]
         msg = f"✅ {verbe} de {abs(self.delta):,} ¥ sur le {libelle}. Nouveau solde : {bal:,} ¥."
         if bal < 0:
             msg += "\n⚠️ Attention : le solde est désormais négatif."
@@ -377,7 +392,7 @@ class AdminTargetView(discord.ui.View):
 class Banque(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        # Saisie du code en cours par utilisateur : {user_id: "chiffres tapés"}.
+        # Saisie du code en cours : clé composite (user_id, character_id) -> "chiffres tapés".
         self.pin_buffers = {}
 
     async def cog_load(self):
@@ -385,6 +400,44 @@ class Banque(commands.Cog):
         # à l'avance), donc bot.add_view() ne peut pas les enregistrer génériquement. La persistance
         # réelle est assurée par le listener on_interaction ci-dessous (comme tous les boutons banque).
         pass
+
+    # ---------- débit + suppression automatique du compte si solde <= -100 ----------
+    async def apply_debit_and_check_deletion(self, character_id, montant, guild) -> bool:
+        """Retire 'montant' du solde_courant du personnage. Si le résultat est <= -100 ¥,
+        supprime le compte (et ses transactions/sessions) et prévient le titulaire par DM.
+        Retourne True si le compte a été supprimé, False sinon."""
+        with db.get_connection() as conn:
+            conn.execute(
+                "UPDATE bank_accounts SET solde_courant = solde_courant - ? WHERE character_id = ?",
+                (montant, character_id),
+            )
+            row = conn.execute(
+                "SELECT solde_courant, user_id FROM bank_accounts WHERE character_id = ?", (character_id,)
+            ).fetchone()
+        if row is None:
+            return False
+        solde, owner_id = row["solde_courant"], row["user_id"]
+        if solde <= -100:
+            with db.get_connection() as conn:
+                conn.execute("DELETE FROM bank_accounts WHERE character_id = ?", (character_id,))
+                conn.execute("DELETE FROM bank_transactions WHERE character_id = ?", (character_id,))
+                conn.execute("DELETE FROM bank_sessions WHERE character_id = ?", (character_id,))
+            member = guild.get_member(owner_id) if guild is not None else None
+            if member is None:
+                try:
+                    member = await self.bot.fetch_user(owner_id)
+                except discord.HTTPException:
+                    member = None
+            if member is not None:
+                try:
+                    await member.send(
+                        "🏦 Ton compte Banque Phénix a été supprimé automatiquement : le solde est "
+                        f"descendu à {solde} ¥, en dessous du seuil autorisé de -100 ¥."
+                    )
+                except discord.Forbidden:
+                    pass
+            return True
+        return False
 
     # ---------- attente d'une réponse texte dans le salon ----------
     async def wait_message(self, channel, author, timeout: int = WAIT_TIMEOUT):
@@ -692,7 +745,7 @@ class Banque(commands.Cog):
             await interaction.response.send_message("Ce compte n'est pas le tien.", ephemeral=True)
             return
         # Ouvre le clavier : buffer vide + image PIN vierge, sur le message existant.
-        self.pin_buffers[user_id] = ""
+        self.pin_buffers[(user_id, character_id)] = ""
         path = self._render_pin(character_id, "")
         await interaction.response.edit_message(
             content="🔒 Entre ton code secret à l'aide du clavier ci dessous.",
@@ -706,7 +759,7 @@ class Banque(commands.Cog):
 
     async def _refresh_keypad(self, interaction, character_id, user_id):
         """Régénère l'image du clavier avec le buffer courant et édite le message."""
-        buf = self.pin_buffers.get(user_id, "")
+        buf = self.pin_buffers.get((user_id, character_id), "")
         path = self._render_pin(character_id, buf)
         await interaction.response.edit_message(
             attachments=[discord.File(path, filename="pin.png")],
@@ -723,11 +776,11 @@ class Banque(commands.Cog):
         if interaction.user.id != user_id:
             await interaction.response.send_message("Ce clavier ne t'appartient pas.", ephemeral=True)
             return
-        buf = self.pin_buffers.get(user_id, "")
+        buf = self.pin_buffers.get((user_id, character_id), "")
         if len(buf) >= 4:
             await interaction.response.defer()  # buffer plein : on ignore le clic
             return
-        self.pin_buffers[user_id] = buf + digit
+        self.pin_buffers[(user_id, character_id)] = buf + digit
         await self._refresh_keypad(interaction, character_id, user_id)
 
     async def handle_pin_clear(self, interaction, cid):
@@ -736,8 +789,8 @@ class Banque(commands.Cog):
         if interaction.user.id != user_id:
             await interaction.response.send_message("Ce clavier ne t'appartient pas.", ephemeral=True)
             return
-        buf = self.pin_buffers.get(user_id, "")
-        self.pin_buffers[user_id] = buf[:-1] if buf else ""
+        buf = self.pin_buffers.get((user_id, character_id), "")
+        self.pin_buffers[(user_id, character_id)] = buf[:-1] if buf else ""
         await self._refresh_keypad(interaction, character_id, user_id)
 
     async def handle_pin_confirm(self, interaction, cid):
@@ -746,14 +799,14 @@ class Banque(commands.Cog):
         if interaction.user.id != user_id:
             await interaction.response.send_message("Ce clavier ne t'appartient pas.", ephemeral=True)
             return
-        buf = self.pin_buffers.get(user_id, "")
+        buf = self.pin_buffers.get((user_id, character_id), "")
         if len(buf) != 4:
             await interaction.response.send_message("Entre les 4 chiffres avant de valider.", ephemeral=True)
             return
 
         account = get_account(character_id)
         if account and buf == account["pin_code"]:
-            self.pin_buffers[user_id] = ""
+            self.pin_buffers[(user_id, character_id)] = ""
             set_session(user_id, character_id)
             # Passe directement à l'écran de compte, sur le même message.
             path, view = self._build_account_image(character_id)
@@ -766,7 +819,7 @@ class Banque(commands.Cog):
             except OSError:
                 pass
         else:
-            self.pin_buffers[user_id] = ""
+            self.pin_buffers[(user_id, character_id)] = ""
             embed = discord.Embed(description="❌ Code incorrect.", color=discord.Color.red())
             await interaction.response.edit_message(
                 content=None, embed=embed, attachments=[], view=PinErrorView(character_id, user_id)
@@ -779,7 +832,7 @@ class Banque(commands.Cog):
             await interaction.response.send_message("Ce clavier ne t'appartient pas.", ephemeral=True)
             return
         # Relance un buffer vide et réaffiche le clavier avec le pillow remis à zéro.
-        self.pin_buffers[user_id] = ""
+        self.pin_buffers[(user_id, character_id)] = ""
         path = self._render_pin(character_id, "")
         await interaction.response.edit_message(
             content="🔒 Entre ton code secret à l'aide du clavier ci dessous.",
@@ -841,24 +894,29 @@ class Banque(commands.Cog):
         await interaction.response.send_message("💸 Virement — suis les instructions ci-dessous.", ephemeral=True)
         channel = interaction.channel
 
-        # 1) IBAN destinataire
-        recipient = None
-        while recipient is None:
+        # 1) IBAN destinataire (courant OU livret). On accepte son PROPRE Livret A.
+        dest = None
+        dest_iban = None
+        while dest is None:
             await channel.send("Entre l'IBAN du destinataire (format JA suivi de 13 chiffres).")
             m = await self.wait_message(channel, interaction.user)
             if m is None:
                 await channel.send("⏳ Virement annulé (délai dépassé).")
                 return
             iban = m.content.strip().upper().replace(" ", "")
-            found = get_account_by_iban_courant(iban)
+            found = find_account_by_any_iban(iban)
             if found is None:
                 await channel.send("❌ Aucun compte trouvé avec cet IBAN. Réessaie.")
-            elif found["id"] == account["id"]:
-                await channel.send("❌ Tu ne peux pas te virer de l'argent à toi même. Réessaie.")
+            elif found["character_id"] == character_id and found["type_compte"] == "courant":
+                await channel.send(
+                    "❌ Tu ne peux pas te virer de l'argent sur ton propre compte courant "
+                    "(utilise ton IBAN Livret A pour épargner). Réessaie."
+                )
             else:
-                recipient = found
+                dest = found
+                dest_iban = iban
 
-        # 2) Montant
+        # 2) Montant : entier STRICTEMENT positif et <= solde_courant de l'expéditeur.
         amount = None
         while amount is None:
             await channel.send("Quel montant veux tu envoyer ?")
@@ -868,7 +926,7 @@ class Banque(commands.Cog):
                 return
             content = m.content.strip().replace(" ", "")
             if not content.isdigit() or int(content) <= 0:
-                await channel.send("❌ Montant invalide. Entre un nombre entier positif.")
+                await channel.send("Le montant doit être un nombre positif.")
                 continue
             val = int(content)
             account = get_account(character_id)  # solde à jour
@@ -879,11 +937,27 @@ class Banque(commands.Cog):
                 continue
             amount = val
 
-        recipient = get_account_by_iban_courant(recipient["iban_courant"])  # rafraîchit le destinataire
-        apply_transfer(account, recipient, amount)
-        await channel.send(
-            f"✅ Virement de {amount:,} ¥ envoyé à **{recipient['iban_courant']}** avec succès !"
-        )
+        # 3) Application : crédite le destinataire sur le bon solde (courant OU livret),
+        # débite toujours le compte courant de l'expéditeur.
+        sender_iban = account["iban_courant"]
+        dest_target = dest["type_compte"]  # "courant" | "livret"
+        credit_account(dest["character_id"], dest_target, amount)
+        if dest_target == "livret":
+            add_transaction(dest["character_id"], f"Virement reçu sur Livret A de {sender_iban}",
+                            amount, sender_iban)
+        else:
+            add_transaction(dest["character_id"], f"Virement reçu de {sender_iban}", amount, sender_iban)
+        add_transaction(character_id, f"Virement envoyé à {dest_iban}", -amount, dest_iban)
+
+        deleted = await self.apply_debit_and_check_deletion(character_id, amount, interaction.guild)
+
+        await channel.send(f"✅ Virement de {amount:,} ¥ envoyé à **{dest_iban}** avec succès !")
+        if deleted:
+            await channel.send(
+                "🏦 Suite à ce virement, ton solde est passé sous -100 ¥ : ton compte a été "
+                "clôturé automatiquement."
+            )
+            return
         await self.show_account_screen(channel, character_id)
 
     async def handle_info(self, interaction, cid):

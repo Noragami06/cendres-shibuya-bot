@@ -2767,6 +2767,16 @@ class SelectionView(discord.ui.View):
             ))
 
 
+# IMPORTANT : toute nouvelle table qui référence character_id à l'avenir doit être ajoutée ici
+# pour garder la suppression de personnage complète.
+def delete_character_cascade(character_id):
+    """Nettoyage en cascade des données liées à un personnage (compte bancaire, etc.)."""
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM bank_accounts WHERE character_id = ?", (character_id,))
+        conn.execute("DELETE FROM bank_transactions WHERE character_id = ?", (character_id,))
+        conn.execute("DELETE FROM bank_sessions WHERE character_id = ?", (character_id,))
+
+
 class DeleteConfirmView(discord.ui.View):
     """Confirmation ✅/❌ avant la suppression définitive d'un personnage.
     custom_id dynamique par joueur -> géré par le listener on_interaction (persistant)."""
@@ -2963,7 +2973,18 @@ class Depart(commands.Cog):
         if interaction.user.id != target_uid:
             await interaction.response.send_message("Ce bouton ne t'est pas destiné.", ephemeral=True)
             return
+        # Récupère l'id du personnage AVANT suppression, pour le nettoyage en cascade.
+        with db.get_connection() as conn:
+            row = conn.execute(
+                "SELECT id FROM validated_characters WHERE user_id = ? AND guild_id = ? AND slot_number = ?",
+                (target_uid, interaction.guild.id, slot),
+            ).fetchone()
+        character_id = row["id"] if row else None
+
         db.delete_validated_character(target_uid, interaction.guild.id, slot)
+        if character_id is not None:
+            delete_character_cascade(character_id)
+
         await interaction.response.edit_message(
             content=f"Le personnage du slot {slot} a été supprimé définitivement.",
             embed=None, view=None,
