@@ -3,11 +3,11 @@ import os
 import random
 import string
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from cogs.utils import database as db
 from cogs.utils.image_gen import generate_economie_image, generate_pin_image
@@ -18,6 +18,9 @@ from cogs.informations import paginate_content, PaginationView
 FICHE_STAFF_ROLE_ID = 1521229332075512039   # rôle staff, déjà utilisé ailleurs dans le bot
 OWNER_ID = 396615332346855428               # reçoit une copie de chaque création de compte
 PHOENIX_COLOR = discord.Color.from_rgb(255, 140, 40)
+
+GRACE_PERIOD_DAYS = 21          # délai avant suppression d'un compte resté sous le seuil critique
+FLOOR_BALANCE = -100000         # plancher absolu du solde courant
 
 BANK_IMG_DIR = os.path.join(os.path.dirname(__file__), "..", "temp", "bank_images")
 WAIT_TIMEOUT = 300  # secondes d'attente d'une réponse texte (virement / admin)
@@ -354,19 +357,10 @@ class AdminTargetView(discord.ui.View):
         verbe = "Ajout" if self.delta >= 0 else "Retrait"
         libelle = "compte courant" if target == "courant" else "Livret A"
 
-        # Retrait sur le compte courant : passe par le débit qui peut clôturer le compte (<= -100 ¥).
-        if self.delta < 0 and target == "courant":
+        # Retrait (courant OU livret) : passe par apply_debit (protection découvert + compte à rebours).
+        if self.delta < 0:
             add_transaction(self.character_id, "Retrait manuel par le staff", self.delta)
-            deleted = await self.cog.apply_debit_and_check_deletion(
-                self.character_id, abs(self.delta), interaction.guild
-            )
-            if deleted:
-                await interaction.response.edit_message(
-                    content=f"✅ Retrait de {abs(self.delta):,} ¥ effectué. ⚠️ Le solde est passé sous "
-                            "-100 ¥ : le compte a été clôturé automatiquement.",
-                    view=None,
-                )
-                return
+            await self.cog.apply_debit(self.character_id, abs(self.delta), interaction.guild, compte=target)
         else:
             apply_balance_change(self.character_id, target, self.delta)
 
@@ -375,6 +369,9 @@ class AdminTargetView(discord.ui.View):
         msg = f"✅ {verbe} de {abs(self.delta):,} ¥ sur le {libelle}. Nouveau solde : {bal:,} ¥."
         if bal < 0:
             msg += "\n⚠️ Attention : le solde est désormais négatif."
+        if account["is_at_risk"] and account["deletion_deadline"]:
+            msg += (f"\n⏳ Compte sous surveillance : suppression prévue le "
+                    f"{_fmt_date(account['deletion_deadline'])} sans redressement.")
         await interaction.response.edit_message(content=msg, view=None)
 
     @discord.ui.button(label="Compte courant", style=discord.ButtonStyle.primary, custom_id="banque_admin_target_courant")
@@ -399,45 +396,161 @@ class Banque(commands.Cog):
         # NOTE : les boutons du clavier ont un custom_id contenant character_id/user_id (inconnus
         # à l'avance), donc bot.add_view() ne peut pas les enregistrer génériquement. La persistance
         # réelle est assurée par le listener on_interaction ci-dessous (comme tous les boutons banque).
-        pass
+        if not self.deletion_loop.is_running():
+            self.deletion_loop.start()
 
-    # ---------- débit + suppression automatique du compte si solde <= -100 ----------
-    async def apply_debit_and_check_deletion(self, character_id, montant, guild) -> bool:
-        """Retire 'montant' du solde_courant du personnage. Si le résultat est <= -100 ¥,
-        supprime le compte (et ses transactions/sessions) et prévient le titulaire par DM.
-        Retourne True si le compte a été supprimé, False sinon."""
+    async def cog_unload(self):
+        self.deletion_loop.cancel()
+
+    async def _resolve_member(self, guild, user_id):
+        """Membre du serveur si en cache, sinon utilisateur récupéré via l'API (ou None)."""
+        member = guild.get_member(user_id) if guild is not None else None
+        if member is None:
+            try:
+                member = await self.bot.fetch_user(user_id)
+            except discord.HTTPException:
+                member = None
+        return member
+
+    # ---------- débit + gestion du compte à rebours de suppression ----------
+    async def apply_debit(self, character_id, montant, guild, compte: str = "courant") -> int:
+        """Retire 'montant' du solde indiqué (courant ou livret). Si compte='courant' et que le
+        résultat est négatif, pioche dans le Livret A pour combler jusqu'à 0 (jamais plus). Plafonne
+        le solde courant à FLOOR_BALANCE minimum. Lance ou annule le compte à rebours de suppression
+        selon le nouveau solde. Retourne le solde_courant final."""
+        colonne = "solde_courant" if compte == "courant" else "solde_livret"
         with db.get_connection() as conn:
             conn.execute(
-                "UPDATE bank_accounts SET solde_courant = solde_courant - ? WHERE character_id = ?",
+                f"UPDATE bank_accounts SET {colonne} = {colonne} - ? WHERE character_id = ?",
                 (montant, character_id),
             )
             row = conn.execute(
-                "SELECT solde_courant, user_id FROM bank_accounts WHERE character_id = ?", (character_id,)
+                "SELECT solde_courant, solde_livret, user_id, is_at_risk, deletion_deadline "
+                "FROM bank_accounts WHERE character_id = ?",
+                (character_id,),
             ).fetchone()
         if row is None:
-            return False
-        solde, owner_id = row["solde_courant"], row["user_id"]
-        if solde <= -100:
+            return 0
+        solde_courant = row["solde_courant"]
+        solde_livret = row["solde_livret"]
+        owner_id = row["user_id"]
+        is_at_risk = row["is_at_risk"]
+
+        # Protection découvert : pioche dans le Livret A pour combler le courant jusqu'à 0 (pas plus).
+        if compte == "courant" and solde_courant < 0:
+            deficit = abs(solde_courant)
+            secours = min(deficit, solde_livret)
+            if secours > 0:
+                with db.get_connection() as conn:
+                    conn.execute(
+                        "UPDATE bank_accounts SET solde_courant = solde_courant + ?, "
+                        "solde_livret = solde_livret - ? WHERE character_id = ?",
+                        (secours, secours, character_id),
+                    )
+                add_transaction(
+                    character_id, "Transfert automatique du Livret A (protection découvert)", secours
+                )
+                solde_courant += secours
+                solde_livret -= secours
+
+        # Plancher absolu du solde courant.
+        if solde_courant < FLOOR_BALANCE:
+            with db.get_connection() as conn:
+                conn.execute(
+                    "UPDATE bank_accounts SET solde_courant = ? WHERE character_id = ?",
+                    (FLOOR_BALANCE, character_id),
+                )
+            solde_courant = FLOOR_BALANCE
+
+        # Compte à rebours de suppression.
+        if solde_courant <= -100:
+            if not is_at_risk:
+                deadline = (datetime.utcnow() + timedelta(days=GRACE_PERIOD_DAYS)).isoformat()
+                with db.get_connection() as conn:
+                    conn.execute(
+                        "UPDATE bank_accounts SET is_at_risk = 1, deletion_deadline = ? WHERE character_id = ?",
+                        (deadline, character_id),
+                    )
+                member = await self._resolve_member(guild, owner_id)
+                if member is not None:
+                    try:
+                        await member.send(
+                            f"⚠️ Ton compte Banque Phénix est passé sous -100 ¥ (solde actuel : "
+                            f"{solde_courant} ¥). Tu as jusqu'au {_fmt_date(deadline)} pour redresser "
+                            "la situation, sans quoi ton compte sera supprimé définitivement."
+                        )
+                    except discord.Forbidden:
+                        pass
+            # Déjà à risque : on ne touche pas à deletion_deadline, le compte à rebours continue.
+        else:
+            if is_at_risk:
+                with db.get_connection() as conn:
+                    conn.execute(
+                        "UPDATE bank_accounts SET is_at_risk = 0, deletion_deadline = NULL "
+                        "WHERE character_id = ?",
+                        (character_id,),
+                    )
+                member = await self._resolve_member(guild, owner_id)
+                if member is not None:
+                    try:
+                        await member.send(
+                            "✅ Ton compte Banque Phénix est repassé au dessus du seuil critique, "
+                            "la suppression programmée est annulée."
+                        )
+                    except discord.Forbidden:
+                        pass
+
+        return solde_courant
+
+    # ---------- tâche périodique : suppression des comptes en fin de délai ----------
+    @tasks.loop(hours=1)
+    async def deletion_loop(self):
+        now = _now()
+        with db.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT character_id, user_id, guild_id, solde_courant FROM bank_accounts "
+                "WHERE is_at_risk = 1 AND deletion_deadline IS NOT NULL AND deletion_deadline < ?",
+                (now,),
+            ).fetchall()
+
+        for r in rows:
+            character_id = r["character_id"]
+            owner_id = r["user_id"]
+            guild_id = r["guild_id"]
+            solde = r["solde_courant"]
+
+            char = get_character(character_id)
+            char_name = char["character_name"] if char else "ce personnage"
+
             with db.get_connection() as conn:
                 conn.execute("DELETE FROM bank_accounts WHERE character_id = ?", (character_id,))
                 conn.execute("DELETE FROM bank_transactions WHERE character_id = ?", (character_id,))
                 conn.execute("DELETE FROM bank_sessions WHERE character_id = ?", (character_id,))
-            member = guild.get_member(owner_id) if guild is not None else None
-            if member is None:
-                try:
-                    member = await self.bot.fetch_user(owner_id)
-                except discord.HTTPException:
-                    member = None
+
+            guild = self.bot.get_guild(guild_id) if guild_id else None
+            member = await self._resolve_member(guild, owner_id)
             if member is not None:
                 try:
                     await member.send(
-                        "🏦 Ton compte Banque Phénix a été supprimé automatiquement : le solde est "
-                        f"descendu à {solde} ¥, en dessous du seuil autorisé de -100 ¥."
+                        f"🏦 Ton compte Banque Phénix pour {char_name} a été supprimé définitivement, "
+                        "le solde étant resté négatif au delà du délai de 3 semaines."
                     )
                 except discord.Forbidden:
                     pass
-            return True
-        return False
+
+            owner_mention = getattr(member, "mention", f"<@{owner_id}>")
+            try:
+                owner_user = await self.bot.fetch_user(OWNER_ID)
+                await owner_user.send(
+                    f"⚠️ Le compte bancaire de {char_name} (appartenant à {owner_mention}) a été "
+                    f"supprimé automatiquement pour insuffisance de solde prolongée (solde final : {solde} ¥)."
+                )
+            except discord.HTTPException:
+                pass
+
+    @deletion_loop.before_loop
+    async def _before_deletion_loop(self):
+        await self.bot.wait_until_ready()
 
     # ---------- attente d'une réponse texte dans le salon ----------
     async def wait_message(self, channel, author, timeout: int = WAIT_TIMEOUT):
@@ -949,15 +1062,10 @@ class Banque(commands.Cog):
             add_transaction(dest["character_id"], f"Virement reçu de {sender_iban}", amount, sender_iban)
         add_transaction(character_id, f"Virement envoyé à {dest_iban}", -amount, dest_iban)
 
-        deleted = await self.apply_debit_and_check_deletion(character_id, amount, interaction.guild)
+        # Débit du compte courant de l'expéditeur (avec protection découvert + compte à rebours).
+        await self.apply_debit(character_id, amount, interaction.guild, compte="courant")
 
         await channel.send(f"✅ Virement de {amount:,} ¥ envoyé à **{dest_iban}** avec succès !")
-        if deleted:
-            await channel.send(
-                "🏦 Suite à ce virement, ton solde est passé sous -100 ¥ : ton compte a été "
-                "clôturé automatiquement."
-            )
-            return
         await self.show_account_screen(channel, character_id)
 
     async def handle_info(self, interaction, cid):

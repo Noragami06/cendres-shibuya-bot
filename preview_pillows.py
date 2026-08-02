@@ -43,3 +43,14 @@ from cogs.utils.image_gen import generate_pin_image
 
 generate_pin_image(None, ["*", "*", "", ""], "temp/preview_pin.png")
 print("6ème image (code PIN) générée dans temp/")
+
+from cogs.utils.image_gen import generate_inventaire_image
+
+items_exemple = [
+    ("Katana Maudit", "Arme maudite redoutable", "2", 1, "12 000 ¥"),
+    ("Parchemin RCT", "Technique de récupération", "4", 3, "2 500 ¥"),
+    ("Relique Zenin", "Artefact du clan Zenin", "S", 1, "85 000 ¥"),
+    ("Talisman d'Acier", "Boost défensif temporaire", "4", 2, "1 800 ¥"),
+]
+generate_inventaire_image("Daisuke Gojo", items_exemple, "137 700 ¥", "temp/preview_inventaire.png")
+print("7ème image (inventaire) générée dans temp/")

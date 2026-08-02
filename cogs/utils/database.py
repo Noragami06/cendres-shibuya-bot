@@ -146,7 +146,9 @@ CREATE TABLE IF NOT EXISTS bank_accounts (
     pin_code TEXT,
     solde_courant INTEGER DEFAULT 0,
     solde_livret INTEGER DEFAULT 0,
-    created_at TEXT
+    created_at TEXT,
+    is_at_risk INTEGER DEFAULT 0,
+    deletion_deadline TEXT
 );
 
 CREATE TABLE IF NOT EXISTS bank_sessions (
@@ -163,6 +165,39 @@ CREATE TABLE IF NOT EXISTS bank_transactions (
     amount INTEGER,
     date TEXT,
     related_iban TEXT
+);
+
+CREATE TABLE IF NOT EXISTS item_definitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE,
+    description TEXT,
+    classe TEXT,
+    valeur_base INTEGER,
+    categorie TEXT
+);
+
+CREATE TABLE IF NOT EXISTS character_inventory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id INTEGER,
+    item_id INTEGER,
+    quantity INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS pending_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposer_user_id INTEGER,
+    proposer_character_id INTEGER,
+    target_user_id INTEGER,
+    target_character_id INTEGER,
+    status TEXT DEFAULT 'awaiting_response',
+    offered_item_id INTEGER,
+    offered_quantity INTEGER,
+    request_type TEXT,
+    request_amount INTEGER,
+    request_item_id INTEGER,
+    request_item_quantity INTEGER,
+    channel_id INTEGER,
+    created_at TEXT
 );
 """
 
@@ -236,6 +271,12 @@ _VALIDATED_EXTRA_COLUMNS = [
     ("grade", "TEXT"),
 ]
 
+# Colonnes de bank_accounts ajoutées après coup.
+_BANK_EXTRA_COLUMNS = [
+    ("is_at_risk", "INTEGER DEFAULT 0"),
+    ("deletion_deadline", "TEXT"),
+]
+
 
 def _ensure_progress_columns(conn):
     """Ajoute à depart_character_progress les colonnes manquantes (DB existante)."""
@@ -257,6 +298,16 @@ def _ensure_validated_columns(conn):
             conn.execute(f"ALTER TABLE validated_characters ADD COLUMN {name} {decl}")
 
 
+def _ensure_bank_columns(conn):
+    """Ajoute à bank_accounts les colonnes manquantes (DB existante)."""
+    cols = _column_names(conn, "bank_accounts")
+    if not cols:
+        return
+    for name, decl in _BANK_EXTRA_COLUMNS:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE bank_accounts ADD COLUMN {name} {decl}")
+
+
 def init_db():
     """Crée les tables manquantes et applique les migrations légères. N'efface jamais de données."""
     with get_connection() as conn:
@@ -266,6 +317,7 @@ def init_db():
             _copy_validated_characters_from_old(conn)
         _ensure_progress_columns(conn)
         _ensure_validated_columns(conn)
+        _ensure_bank_columns(conn)
 
 
 # =====================================================================

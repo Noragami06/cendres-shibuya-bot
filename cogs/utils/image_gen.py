@@ -538,3 +538,70 @@ def generate_pin_image(portrait_path: str, values: list, out_path: str):
 
     img.save(out_path)
     return out_path
+
+
+CLASS_COLORS_INV = {
+    "S": (255, 165, 0),
+    "1": (235, 60, 100),
+    "2": (170, 80, 240),
+    "3": (60, 130, 240),
+    "4": (40, 200, 150),
+    "sans": (130, 130, 140),
+}
+
+
+def generate_inventaire_image(character_name: str, items: list, total_value: str, out_path: str):
+    """
+    items : liste de tuples (name, description, classe, quantite, valeur_str)
+            classe est une chaîne parmi "S", "1", "2", "3", "4", "sans"
+            valeur_str est déjà formatée, ex: "12 000 ¥"
+    Affiche jusqu'à 8 objets (4 lignes de 2 colonnes). Si plus de 8 objets sont fournis,
+    n'affiche que les 8 premiers pour l'instant (pagination à prévoir plus tard).
+    """
+    display_items = items[:8]
+    rows = (len(display_items) + 1) // 2
+    W = 1400
+    H = 120 + rows * 144 + 100
+
+    BG = (13, 13, 18, 255)
+    CARD = (24, 24, 30, 255)
+    TEXT = (235, 235, 240, 255)
+    SUB = (140, 140, 150, 255)
+
+    img = Image.new("RGBA", (W, H), BG)
+    d = ImageDraw.Draw(img)
+    d.text((40, 30), f"Inventaire de {character_name}", font=font(30, True), fill=TEXT)
+    d.text((40, 74), f"{len(items)} objets  ·  Valeur totale : {total_value}", font=font(14), fill=SUB)
+
+    col_w = (W - 40 * 3) // 2
+    x_positions = [40, 40 + col_w + 40]
+    y = 120
+    row_h = 128
+    for i, (name, desc, cls, qty, val) in enumerate(display_items):
+        col = i % 2
+        row = i // 2
+        x = x_positions[col]
+        yy = y + row * (row_h + 16)
+        color = CLASS_COLORS_INV.get(cls, CLASS_COLORS_INV["sans"])
+        d.rounded_rectangle((x, yy, x + col_w, yy + row_h), radius=10, fill=CARD)
+        d.rounded_rectangle((x, yy, x + col_w, yy + 8), radius=4, fill=color)
+        d.text((x + 24, yy + 22), name, font=font(15, True), fill=TEXT)
+        d.text((x + 24, yy + 46), desc, font=font(11), fill=SUB)
+        classe_label = f"Classe {cls}" if cls != "sans" else "Sans classe"
+        d.text((x + 24, yy + 70), classe_label, font=font(11, True), fill=color)
+        d.text((x + col_w - 140, yy + 22), f"x{qty}", font=font(13, True), fill=TEXT)
+        vw = text_w(d, val, font(13, True))
+        d.text((x + col_w - 24 - vw, yy + 22), val, font=font(13, True), fill=(120, 220, 160, 255))
+
+    # legende
+    ly = H - 60
+    d.text((40, ly), "Légende :", font=font(12, True), fill=TEXT)
+    lx = 40 + 90
+    for key, label in [("S", "Classe S"), ("1", "Classe 1"), ("2", "Classe 2"), ("3", "Classe 3"), ("4", "Classe 4"), ("sans", "Sans classe")]:
+        c = CLASS_COLORS_INV[key]
+        d.ellipse((lx, ly + 2, lx + 12, ly + 14), fill=c)
+        d.text((lx + 18, ly), label, font=font(11), fill=TEXT)
+        lx += 100
+
+    img.save(out_path)
+    return out_path

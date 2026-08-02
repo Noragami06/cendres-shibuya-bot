@@ -2767,14 +2767,25 @@ class SelectionView(discord.ui.View):
             ))
 
 
-# IMPORTANT : toute nouvelle table qui référence character_id à l'avenir doit être ajoutée ici
-# pour garder la suppression de personnage complète.
+# RÈGLE PERMANENTE DU PROJET : delete_character_cascade() doit TOUJOURS être mise à jour
+# dès qu'une nouvelle table référence character_id (ex: un futur système de profil, de
+# quêtes, de compétences, etc.). Avant de considérer un nouveau système "terminé",
+# vérifie systématiquement s'il doit être ajouté ici pour éviter les données orphelines
+# quand un personnage est supprimé.
 def delete_character_cascade(character_id):
-    """Nettoyage en cascade des données liées à un personnage (compte bancaire, etc.)."""
+    """Nettoyage en cascade des données liées à un personnage (banque, inventaire, échanges...)."""
     with db.get_connection() as conn:
+        # Banque
         conn.execute("DELETE FROM bank_accounts WHERE character_id = ?", (character_id,))
         conn.execute("DELETE FROM bank_transactions WHERE character_id = ?", (character_id,))
         conn.execute("DELETE FROM bank_sessions WHERE character_id = ?", (character_id,))
+        # Inventaire
+        conn.execute("DELETE FROM character_inventory WHERE character_id = ?", (character_id,))
+        # Échanges (le personnage peut être proposeur OU cible)
+        conn.execute(
+            "DELETE FROM pending_trades WHERE proposer_character_id = ? OR target_character_id = ?",
+            (character_id, character_id),
+        )
 
 
 class DeleteConfirmView(discord.ui.View):
