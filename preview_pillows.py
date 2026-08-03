@@ -54,3 +54,18 @@ items_exemple = [
 ]
 generate_inventaire_image("Daisuke Gojo", items_exemple, "137 700 ¥", "temp/preview_inventaire.png")
 print("7ème image (inventaire) générée dans temp/")
+
+from cogs.utils.image_gen import generate_shop_image
+
+items_shop_exemple = [
+    ("Katana Maudit", "Arme maudite redoutable", "2", "12 000 ¥"),
+    ("Parchemin RCT", "Technique de récupération", "4", "2 500 ¥"),
+    ("Relique Zenin", "Artefact du clan Zenin", "S", "85 000 ¥"),
+    ("Talisman d'Acier", "Boost défensif temporaire", "4", "1 800 ¥"),
+    ("Lance Spirite", "Arme à distance maudite", "3", "6 400 ¥"),
+    ("Grimoire Kamo", "Techniques du clan Kamo", "3", "7 100 ¥"),
+    ("Essence Maudite", "Ressource de craft", "4", "900 ¥"),
+    ("Anneau du Sceau", "Relique de puissance", "1", "22 000 ¥"),
+]
+generate_shop_image(items_shop_exemple, 1, 3, "temp/preview_shop.png")
+print("8ème image (shop) générée dans temp/")

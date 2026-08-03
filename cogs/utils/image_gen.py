@@ -605,3 +605,70 @@ def generate_inventaire_image(character_name: str, items: list, total_value: str
 
     img.save(out_path)
     return out_path
+
+
+SHOP_CLASS_COLORS = {
+    "S": (255, 165, 0),
+    "1": (235, 60, 100),
+    "2": (170, 80, 240),
+    "3": (60, 130, 240),
+    "4": (40, 200, 150),
+    "sans": (130, 130, 140),
+}
+
+
+def generate_shop_image(items: list, page: int, total_pages: int, out_path: str):
+    """
+    items : liste de tuples (name, description, classe, price_str) pour CETTE page uniquement (8 max)
+            classe est une chaîne parmi "S", "1", "2", "3", "4", "sans"
+            price_str est déjà formaté, ex: "12 000 ¥"
+    page, total_pages : pour l'indicateur "Page X / Y" en haut à droite
+    """
+    W, H = 1300, 950
+    BG, CARD, TEXT, SUB, ACCENT = (16, 16, 20, 255), (23, 23, 28, 255), (235, 235, 240, 255), (145, 145, 158, 255), (255, 210, 100, 255)
+    img = Image.new("RGBA", (W, H), BG)
+    d = ImageDraw.Draw(img)
+
+    d.rectangle((0, 0, W, 84), fill=(20, 20, 25, 255))
+    d.text((40, 26), "Boutique — Banque Phénix", font=font(22, True), fill=(255, 255, 255, 255))
+    d.text((W - 260, 32), f"Page {page} / {total_pages}", font=font(13), fill=SUB)
+
+    cols, gap = 2, 22
+    card_w = (W - 40 * 2 - gap) // cols
+    card_h = 170
+
+    display_items = items[:8]
+    for i, (name, desc, cls, price) in enumerate(display_items):
+        col, row = i % cols, i // cols
+        x, y = 40 + col * (card_w + gap), 108 + row * (card_h + gap)
+        color = SHOP_CLASS_COLORS.get(cls, SHOP_CLASS_COLORS["sans"])
+
+        d.rounded_rectangle((x, y, x + card_w, y + card_h), radius=10, fill=CARD)
+
+        num = str(i + 1 + (page - 1) * 8)
+        d.text((x + 20, y + card_h / 2 - 30), num, font=font(46, True), fill=(45, 45, 55, 255))
+
+        d.text((x + 100, y + 18), name, font=font(18, True), fill=TEXT)
+        d.text((x + 100, y + 50), desc, font=font(11), fill=SUB)
+        d.text((x + 100, y + card_h - 34), price, font=font(16, True), fill=ACCENT)
+
+        r = 34
+        cx, cy = x + card_w - 46, y + card_h - 42
+        d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=color)
+        label = cls if cls != "sans" else "—"
+        f_label = font(26, True)
+        lw = text_w(d, label, f_label)
+        d.text((cx - lw / 2, cy - 17), label, font=f_label, fill=(15, 15, 18, 255))
+
+    # legende
+    ly = H - 60
+    d.text((40, ly), "Légende :", font=font(12, True), fill=TEXT)
+    lx = 40 + 90
+    for key, lbl in [("S", "Classe S"), ("1", "Classe 1"), ("2", "Classe 2"), ("3", "Classe 3"), ("4", "Classe 4"), ("sans", "Sans classe")]:
+        c = SHOP_CLASS_COLORS[key]
+        d.ellipse((lx, ly + 2, lx + 12, ly + 14), fill=c)
+        d.text((lx + 18, ly), lbl, font=font(11), fill=TEXT)
+        lx += 100
+
+    img.save(out_path)
+    return out_path

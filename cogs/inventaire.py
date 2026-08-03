@@ -17,7 +17,7 @@ from cogs.banque import (
 # ---------- Constantes ----------
 FICHE_STAFF_ROLE_ID = 1521229332075512039
 WAIT_TIMEOUT = 300  # secondes d'attente d'une réponse texte
-CLASSE_VALUES = ["S", "1", "2", "3", "4", "sans"]
+ITEMS_PER_PAGE = 8  # objets affichés par page d'inventaire (2 colonnes x 4 lignes)
 
 INV_IMG_DIR = os.path.join(os.path.dirname(__file__), "..", "temp", "inv_images")
 
@@ -61,16 +61,6 @@ def search_owned_items(character_id: int, query: str):
 def get_item(item_id: int):
     with db.get_connection() as conn:
         return conn.execute("SELECT * FROM item_definitions WHERE id = ?", (item_id,)).fetchone()
-
-
-def create_item_definition(name, description, classe, valeur_base, categorie) -> int:
-    with db.get_connection() as conn:
-        cur = conn.execute(
-            "INSERT INTO item_definitions (name, description, classe, valeur_base, categorie) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (name, description, classe, valeur_base, categorie),
-        )
-        return cur.lastrowid
 
 
 def get_inventory_categories(character_id: int):
@@ -182,22 +172,6 @@ def try_transition(trade_id: int, from_status: str, to_status: str) -> bool:
         return cur.rowcount > 0
 
 
-def get_item_by_name_ci(name: str):
-    """item_definitions dont le nom est EXACTEMENT égal (insensible à la casse)."""
-    with db.get_connection() as conn:
-        return conn.execute(
-            "SELECT * FROM item_definitions WHERE LOWER(name) = LOWER(?)", (name,)
-        ).fetchone()
-
-
-def next_available_item_name(base: str) -> str:
-    """Renvoie 'base (2)', ou '(3)', '(4)'... si les précédents existent déjà (insensible à la casse)."""
-    n = 2
-    while get_item_by_name_ci(f"{base} ({n})") is not None:
-        n += 1
-    return f"{base} ({n})"
-
-
 # =====================================================================
 # VUES EN SESSION (callbacks internes)
 # =====================================================================
@@ -225,32 +199,6 @@ class InvCharacterSelectView(discord.ui.View):
         super().__init__(timeout=WAIT_TIMEOUT)
         self.result = None
         self.add_item(InvCharacterSelect(chars, invoker_id))
-
-
-class ClasseSelect(discord.ui.Select):
-    def __init__(self, invoker_id):
-        self.invoker_id = invoker_id
-        options = [
-            discord.SelectOption(label=("Sans classe" if c == "sans" else f"Classe {c}"), value=c)
-            for c in CLASSE_VALUES
-        ]
-        super().__init__(placeholder="Choisis la classe...", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        view = self.view
-        if interaction.user.id != self.invoker_id:
-            await interaction.response.send_message("Ce menu ne t'appartient pas.", ephemeral=True)
-            return
-        view.result = self.values[0]
-        await interaction.response.edit_message(view=None)
-        view.stop()
-
-
-class ClasseSelectView(discord.ui.View):
-    def __init__(self, invoker_id):
-        super().__init__(timeout=WAIT_TIMEOUT)
-        self.result = None
-        self.add_item(ClasseSelect(invoker_id))
 
 
 class TradeAcceptView(discord.ui.View):
@@ -357,12 +305,26 @@ class MainInventoryView(discord.ui.View):
             label="Vendre", emoji="💰", style=discord.ButtonStyle.success,
             custom_id=f"inv_sell:{character_id}:{user_id}", row=1))
         if is_staff:
-            self.add_item(discord.ui.Button(
-                label="Ajouter un item", emoji="➕", style=discord.ButtonStyle.success,
-                custom_id=f"inv_add:{user_id}", row=2))
+            # La création/ajout d'objets se fait maintenant exclusivement via la commande /shop (à venir).
             self.add_item(discord.ui.Button(
                 label="Retirer un item", emoji="➖", style=discord.ButtonStyle.danger,
                 custom_id=f"inv_remove:{user_id}", row=2))
+
+
+class InventoryPageView(discord.ui.View):
+    """Boutons de pagination sous l'image d'inventaire (persistants). Les états activé/désactivé
+    dépendent de la page courante et du nombre total de pages."""
+
+    def __init__(self, character_id, user_id, page, total_pages):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Page précédente", emoji="◀️", style=discord.ButtonStyle.secondary,
+            custom_id=f"inv_page_prev:{character_id}:{user_id}", disabled=(page <= 0),
+        ))
+        self.add_item(discord.ui.Button(
+            label="Page suivante", emoji="▶️", style=discord.ButtonStyle.secondary,
+            custom_id=f"inv_page_next:{character_id}:{user_id}", disabled=(page >= total_pages - 1),
+        ))
 
 
 # =====================================================================
@@ -377,6 +339,10 @@ class Inventaire(commands.Cog):
         # pour le libérer). L'ensemble est vidé au redémarrage, ce qui est exactement le comportement
         # voulu, et chaque flux libère sa place via un bloc finally.
         self._active_users = set()
+        # État de pagination d'inventaire par joueur : {(user_id, character_id): {"categorie", "page"}}.
+        # Même logique mémoire que l'isolation : l'état est reconstruit en ré-ouvrant l'inventaire
+        # après un redémarrage (les boutons persistent, mais l'état volatil non).
+        self._page_state = {}
 
     async def cog_load(self):
         # Les boutons de l'inventaire ont un custom_id contenant character_id/user_id (inconnus à
@@ -434,24 +400,6 @@ class Inventaire(commands.Cog):
                 await channel.send(f"Quantité trop élevée (maximum {maximum}). Réessaie.")
                 continue
             return val
-
-    async def ask_int(self, channel, user, prompt, minimum=0):
-        while True:
-            await channel.send(prompt)
-            m = await self.wait_message(channel, user)
-            if m is None:
-                return None
-            c = m.content.strip().replace(" ", "")
-            if not c.isdigit() or int(c) < minimum:
-                await channel.send(f"Entre un nombre entier ≥ {minimum}.")
-                continue
-            return int(c)
-
-    async def ask_classe(self, channel, user):
-        view = ClasseSelectView(user.id)
-        await channel.send("Classe de l'objet :", view=view)
-        await view.wait()
-        return view.result
 
     async def select_character_await(self, channel, target_user, invoker_id, none_msg):
         chars = get_characters(target_user.id, channel.guild.id)
@@ -534,16 +482,38 @@ class Inventaire(commands.Cog):
         cid = interaction.data.get("custom_id", "")
         if cid.startswith("inv_cat:"):
             await self.handle_category(interaction, cid)
+        elif cid.startswith("inv_page_prev:"):
+            await self.handle_page(interaction, cid, "prev")
+        elif cid.startswith("inv_page_next:"):
+            await self.handle_page(interaction, cid, "next")
         elif cid.startswith("inv_info:"):
             await self.handle_info(interaction, cid)
         elif cid.startswith("inv_trade:"):
             await self.handle_trade(interaction, cid)
         elif cid.startswith("inv_sell:"):
             await self.handle_sell(interaction, cid)
-        elif cid.startswith("inv_add:"):
-            await self.handle_add(interaction, cid)
         elif cid.startswith("inv_remove:"):
             await self.handle_remove(interaction, cid)
+
+    def _render_category_page(self, character_id, categorie, page):
+        """Génère l'image de la page demandée d'une catégorie. Retourne (chemin, total_pages, page_clampée).
+        La valeur totale affichée est celle de TOUTE la catégorie (pas seulement de la page)."""
+        rows = get_inventory_items(character_id, categorie)  # tous les objets, sans limite
+        pages = [rows[i:i + ITEMS_PER_PAGE] for i in range(0, len(rows), ITEMS_PER_PAGE)] or [[]]
+        total_pages = len(pages)
+        page = max(0, min(page, total_pages - 1))
+        page_rows = pages[page]
+        items = [
+            (r["name"], r["description"] or "", r["classe"] or "sans", r["quantity"],
+             f"{(r['valeur_base'] or 0) * r['quantity']:,} ¥")
+            for r in page_rows
+        ]
+        total_value = sum((r["valeur_base"] or 0) * r["quantity"] for r in rows)
+        char = get_character(character_id)
+        name = char["character_name"] if char else "?"
+        path = _tmp_inv("inv")
+        generate_inventaire_image(name, items, f"{total_value:,} ¥", path)
+        return path, total_pages, page
 
     async def handle_category(self, interaction, cid):
         character_id = int(cid.split(":")[1])
@@ -551,18 +521,36 @@ class Inventaire(commands.Cog):
         await interaction.response.defer()
         if not categorie:
             return
-        rows = get_inventory_items(character_id, categorie)
-        items = [
-            (r["name"], r["description"] or "", r["classe"] or "sans", r["quantity"],
-             f"{(r['valeur_base'] or 0) * r['quantity']:,} ¥")
-            for r in rows
-        ]
-        total = sum((r["valeur_base"] or 0) * r["quantity"] for r in rows)
-        char = get_character(character_id)
-        name = char["character_name"] if char else "?"
-        path = _tmp_inv("inv")
-        generate_inventaire_image(name, items, f"{total:,} ¥", path)
-        await interaction.channel.send(file=discord.File(path, filename="inventaire.png"))
+        # Mémorise l'état de pagination pour ce joueur/personnage (page 0).
+        self._page_state[(interaction.user.id, character_id)] = {"categorie": categorie, "page": 0}
+        path, total_pages, page = self._render_category_page(character_id, categorie, 0)
+        view = InventoryPageView(character_id, interaction.user.id, page, total_pages) if total_pages > 1 else None
+        await interaction.channel.send(file=discord.File(path, filename="inventaire.png"), view=view)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    async def handle_page(self, interaction, cid, direction):
+        _, character_id, user_id = cid.split(":")
+        character_id, user_id = int(character_id), int(user_id)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Cette pagination n'est pas la tienne.", ephemeral=True)
+            return
+        state = self._page_state.get((user_id, character_id))
+        if state is None:
+            await interaction.response.send_message(
+                "Cette pagination a expiré, ré-ouvre ton inventaire via le menu des catégories.",
+                ephemeral=True,
+            )
+            return
+        new_page = state["page"] + (1 if direction == "next" else -1)
+        path, total_pages, page = self._render_category_page(character_id, state["categorie"], new_page)
+        state["page"] = page
+        view = InventoryPageView(character_id, user_id, page, total_pages) if total_pages > 1 else None
+        await interaction.response.edit_message(
+            attachments=[discord.File(path, filename="inventaire.png")], view=view
+        )
         try:
             os.remove(path)
         except OSError:
@@ -886,121 +874,8 @@ class Inventaire(commands.Cog):
             await channel.send(embed=embed)
         return True
 
-    # ---------- STAFF : ajout / retrait ----------
-    async def handle_add(self, interaction, cid):
-        user_id = int(cid.split(":")[1])
-        if interaction.user.id != user_id or not _is_staff(interaction.user):
-            await interaction.response.send_message("Action réservée au staff propriétaire du panneau.", ephemeral=True)
-            return
-        if not self._acquire(user_id):
-            await interaction.response.send_message(
-                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True
-            )
-            return
-        try:
-            await interaction.response.send_message("➕ Ajout d'un item…", ephemeral=True)
-            channel = interaction.channel
-
-            await channel.send("Mentionne le joueur concerné.")
-            target = await self.wait_mention(channel, interaction.user)
-            if target is None:
-                await channel.send("⏳ Annulé.")
-                return
-            character_id = await self.select_character_await(
-                channel, target, interaction.user.id, "Ce joueur n'a aucun personnage validé."
-            )
-            if character_id is None:
-                return
-
-            item = await self._resolve_or_create_item(channel, interaction.user)
-            if item is None:
-                await channel.send("⏳ Annulé.")
-                return
-            qty = await self.ask_quantity(channel, interaction.user, f"Quelle quantité de **{item['name']}** ajouter ?")
-            if qty is None:
-                return
-            inv_add(character_id, item["id"], qty)
-            char = get_character(character_id)
-            await channel.send(f"✅ {qty} × **{item['name']}** ajouté(s) à l'inventaire de **{char['character_name']}**.")
-        finally:
-            self._release(user_id)
-
-    async def _resolve_or_create_item(self, channel, staff_user):
-        """Cherche un item par nom ; s'il n'existe pas, propose de le créer (description, classe, valeur, catégorie)."""
-        await channel.send("Nom de l'objet à ajouter (ou début du nom s'il existe déjà) :")
-        m = await self.wait_message(channel, staff_user)
-        if m is None:
-            return None
-        query = m.content.strip()
-        results = search_item_definitions(query)
-        if len(results) == 1:
-            return results[0]
-        if len(results) >= 2:
-            return await self._pick_numbered(channel, staff_user, results)
-
-        # 0 résultat -> création. On résout d'abord un nom définitif (gestion des doublons insensibles
-        # à la casse), puis on demande les détails.
-        final_name = await self._resolve_new_item_name(channel, staff_user, query)
-        if final_name is None:
-            return None
-
-        await channel.send(f"Création de « {final_name} ».\nDonne sa **description** :")
-        m_desc = await self.wait_message(channel, staff_user)
-        if m_desc is None:
-            return None
-        description = m_desc.content.strip()
-        classe = await self.ask_classe(channel, staff_user)
-        if classe is None:
-            return None
-        valeur = await self.ask_int(channel, staff_user, "Valeur de base (en ¥) :", minimum=0)
-        if valeur is None:
-            return None
-        await channel.send("Catégorie de l'objet :")
-        m_cat = await self.wait_message(channel, staff_user)
-        if m_cat is None:
-            return None
-        categorie = m_cat.content.strip()
-        try:
-            new_id = create_item_definition(final_name, description, classe, valeur, categorie)
-        except Exception:
-            # Nom déjà pris entre-temps (contrainte UNIQUE) : on récupère l'existant.
-            existing = get_item_by_name_ci(final_name)
-            return existing
-        await channel.send(f"🆕 Objet **{final_name}** créé (classe {classe}, {valeur:,} ¥, catégorie « {categorie} »).")
-        return get_item(new_id)
-
-    async def _resolve_new_item_name(self, channel, staff_user, name):
-        """Renvoie un nom d'objet à créer sans doublon (insensible à la casse), ou None si abandon.
-        Si un doublon exact existe : propose « continuer » (suffixe (2), (3)...) ou « réécrire »."""
-        while True:
-            dup = get_item_by_name_ci(name)
-            if dup is None:
-                return name
-            embed = discord.Embed(
-                description=(
-                    f"⚠️ Un objet nommé \"{dup['name']}\" existe déjà dans le catalogue. Que veux tu faire ?\n\n"
-                    f"• Écris \"continuer\" pour créer quand même ce nouvel objet (il sera renommé \"{name} (2)\")\n"
-                    f"• Écris \"réécrire\" pour choisir un nom différent"
-                ),
-                color=PHOENIX_COLOR,
-            )
-            await channel.send(embed=embed)
-            while True:
-                m = await self.wait_message(channel, staff_user)
-                if m is None:
-                    return None
-                choice = m.content.strip().lower()
-                if choice == "continuer":
-                    return next_available_item_name(name)
-                if choice in ("réécrire", "reecrire", "réecrire", "reécrire"):
-                    await channel.send("Écris le nouveau nom de l'objet.")
-                    m2 = await self.wait_message(channel, staff_user)
-                    if m2 is None:
-                        return None
-                    name = m2.content.strip()
-                    break  # relance la vérification de doublon sur le nouveau nom
-                await channel.send("Réponds par « continuer » ou « réécrire ».")
-
+    # ---------- STAFF : retrait ----------
+    # La création/ajout d'objets se fait maintenant exclusivement via la commande /shop (à venir).
     async def handle_remove(self, interaction, cid):
         user_id = int(cid.split(":")[1])
         if interaction.user.id != user_id or not _is_staff(interaction.user):
