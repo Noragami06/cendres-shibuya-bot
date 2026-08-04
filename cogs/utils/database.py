@@ -167,13 +167,18 @@ CREATE TABLE IF NOT EXISTS bank_transactions (
     related_iban TEXT
 );
 
+CREATE TABLE IF NOT EXISTS shop_categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE
+);
+
 CREATE TABLE IF NOT EXISTS item_definitions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT UNIQUE,
     description TEXT,
     classe TEXT,
     valeur_base INTEGER,
-    categorie TEXT
+    categorie_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS character_inventory (
@@ -308,6 +313,37 @@ def _ensure_bank_columns(conn):
             conn.execute(f"ALTER TABLE bank_accounts ADD COLUMN {name} {decl}")
 
 
+def _migrate_item_categorie_id(conn):
+    """Migre item_definitions de l'ancienne colonne texte `categorie` vers `categorie_id`
+    (référence shop_categories.id). Pour chaque valeur texte distincte, crée la catégorie
+    correspondante si besoin puis remplit categorie_id. L'ancienne colonne `categorie` est
+    conservée (SQLite ne supprime pas facilement une colonne) mais n'est plus lue nulle part :
+    tout le code référence désormais categorie_id."""
+    cols = _column_names(conn, "item_definitions")
+    if not cols:
+        return
+    if "categorie_id" not in cols:
+        conn.execute("ALTER TABLE item_definitions ADD COLUMN categorie_id INTEGER")
+        cols.append("categorie_id")
+    # Migration des anciennes catégories texte, uniquement si l'ancienne colonne existe encore.
+    if "categorie" in cols:
+        rows = conn.execute(
+            "SELECT DISTINCT categorie FROM item_definitions "
+            "WHERE categorie IS NOT NULL AND TRIM(categorie) <> '' AND categorie_id IS NULL"
+        ).fetchall()
+        for r in rows:
+            cat_name = r["categorie"]
+            conn.execute("INSERT OR IGNORE INTO shop_categories (name) VALUES (?)", (cat_name,))
+            cat = conn.execute(
+                "SELECT id FROM shop_categories WHERE name = ?", (cat_name,)
+            ).fetchone()
+            conn.execute(
+                "UPDATE item_definitions SET categorie_id = ? "
+                "WHERE categorie = ? AND categorie_id IS NULL",
+                (cat["id"], cat_name),
+            )
+
+
 def init_db():
     """Crée les tables manquantes et applique les migrations légères. N'efface jamais de données."""
     with get_connection() as conn:
@@ -318,6 +354,7 @@ def init_db():
         _ensure_progress_columns(conn)
         _ensure_validated_columns(conn)
         _ensure_bank_columns(conn)
+        _migrate_item_categorie_id(conn)
 
 
 # =====================================================================

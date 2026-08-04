@@ -64,24 +64,27 @@ def get_item(item_id: int):
 
 
 def get_inventory_categories(character_id: int):
+    """Catégories (id + nom) présentes dans l'inventaire du personnage. Le nom provient de
+    shop_categories (référencé par item_definitions.categorie_id) : un renommage côté /shop se
+    répercute donc automatiquement ici, puisque tout référence categorie_id et non un texte dupliqué."""
     with db.get_connection() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT d.categorie FROM item_definitions d "
+        return conn.execute(
+            "SELECT DISTINCT s.id, s.name FROM item_definitions d "
             "JOIN character_inventory c ON d.id = c.item_id "
-            "WHERE c.character_id = ? AND c.quantity > 0 AND d.categorie IS NOT NULL "
-            "ORDER BY d.categorie",
+            "JOIN shop_categories s ON d.categorie_id = s.id "
+            "WHERE c.character_id = ? AND c.quantity > 0 "
+            "ORDER BY s.name",
             (character_id,),
         ).fetchall()
-    return [r["categorie"] for r in rows]
 
 
-def get_inventory_items(character_id: int, categorie: str):
+def get_inventory_items(character_id: int, categorie_id: int):
     with db.get_connection() as conn:
         return conn.execute(
             "SELECT d.name, d.description, d.classe, d.valeur_base, c.quantity "
             "FROM item_definitions d JOIN character_inventory c ON d.id = c.item_id "
-            "WHERE c.character_id = ? AND d.categorie = ? AND c.quantity > 0 ORDER BY d.name",
-            (character_id, categorie),
+            "WHERE c.character_id = ? AND d.categorie_id = ? AND c.quantity > 0 ORDER BY d.name",
+            (character_id, categorie_id),
         ).fetchall()
 
 
@@ -292,7 +295,7 @@ class MainInventoryView(discord.ui.View):
         if categories:
             self.add_item(discord.ui.Select(
                 placeholder="Choisis une catégorie...", min_values=1, max_values=1,
-                options=[discord.SelectOption(label=c, value=c) for c in categories[:25]],
+                options=[discord.SelectOption(label=c["name"], value=str(c["id"])) for c in categories[:25]],
                 custom_id=f"inv_cat:{character_id}", row=0,
             ))
         self.add_item(discord.ui.Button(
@@ -521,9 +524,11 @@ class Inventaire(commands.Cog):
         await interaction.response.defer()
         if not categorie:
             return
-        # Mémorise l'état de pagination pour ce joueur/personnage (page 0).
-        self._page_state[(interaction.user.id, character_id)] = {"categorie": categorie, "page": 0}
-        path, total_pages, page = self._render_category_page(character_id, categorie, 0)
+        cat_id = int(categorie)
+        # Mémorise l'état de pagination pour ce joueur/personnage (page 0). La catégorie est
+        # désormais identifiée par son id (categorie_id), pas par un texte.
+        self._page_state[(interaction.user.id, character_id)] = {"categorie": cat_id, "page": 0}
+        path, total_pages, page = self._render_category_page(character_id, cat_id, 0)
         view = InventoryPageView(character_id, interaction.user.id, page, total_pages) if total_pages > 1 else None
         await interaction.channel.send(file=discord.File(path, filename="inventaire.png"), view=view)
         try:
