@@ -1731,10 +1731,15 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
     filename = _fiche_portrait_filename(target_uid, slot)
     validated_channel = interaction.client.get_channel(FICHE_VALIDATED_CHANNEL_ID)
     if validated_channel:
+        # Le "Voici la fiche de @user" est dans le MÊME message que l'embed (paramètre content),
+        # comme pour le salon staff, afin d'identifier immédiatement le propriétaire de la fiche.
+        content = f"Voici la fiche de {member_mention}"
         if portrait_path and os.path.exists(portrait_path):
-            await validated_channel.send(embed=embed, file=discord.File(portrait_path, filename=filename))
+            await validated_channel.send(
+                content=content, embed=embed, file=discord.File(portrait_path, filename=filename)
+            )
         else:
-            await validated_channel.send(embed=embed)
+            await validated_channel.send(content=content, embed=embed)
 
     # 4) Notifie le joueur.
     origin = interaction.client.get_channel(progress.get("origin_channel_id"))
