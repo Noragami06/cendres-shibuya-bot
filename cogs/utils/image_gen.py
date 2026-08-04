@@ -672,3 +672,154 @@ def generate_shop_image(items: list, page: int, total_pages: int, out_path: str)
 
     img.save(out_path)
     return out_path
+
+
+# math est déjà importé en haut du fichier.
+def _profil_ring_gauge(d, cx, cy, r, pct, color, bg, width=8):
+    d.ellipse((cx - r, cy - r, cx + r, cy + r), outline=bg, width=width)
+    end = -90 + 360 * (pct / 100)
+    d.arc((cx - r, cy - r, cx + r, cy + r), start=-90, end=end, fill=color, width=width)
+
+
+def _profil_bar_gauge(d, x0, y0, x1, y1, pct, color, bg):
+    d.rounded_rectangle((x0, y0, x1, y1), radius=(y1 - y0) // 2, fill=bg)
+    w = (x1 - x0) * (pct / 100)
+    if w > 4:
+        d.rounded_rectangle((x0, y0, x0 + w, y1), radius=(y1 - y0) // 2, fill=color)
+
+
+def _profil_frame(d, xy, gold):
+    d.rounded_rectangle(xy, radius=14, outline=gold, width=3)
+
+
+def generate_profil_image(name, pv, eo, level, xp, stats, maitrises, clan, rang, victoires, defaites, nuls, out_path):
+    """
+    pv, eo, xp : tuples (valeur_actuelle, valeur_max)
+    stats : liste de 3 tuples (nom, niveau, pourcentage, (xp_actuel, xp_max)) → Force, Vitesse, Défense dans cet ordre
+    maitrises : liste de 4 tuples (nom, niveau, pourcentage) → Maîtrise EO, Maîtrise Sort, Maîtrise Territoire, RCT dans cet ordre
+    clan, rang : chaînes
+    victoires, defaites, nuls : entiers
+    """
+    W, H = 1100, 900
+    BG = (10, 9, 15, 255)
+    TEXT = (235, 235, 240, 255)
+    SUB = (150, 148, 160, 255)
+    GOLD = (232, 197, 121, 255)
+    XP_COLOR = (190, 100, 255, 255)
+    HEADER_COLOR = (255, 200, 60, 255)
+    CELL_BG = (22, 20, 28, 255)
+
+    img = Image.new("RGBA", (W, H), BG)
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, W, H), outline=GOLD, width=2)
+
+    cx, cy, r = W - 110, 100, 70
+    pts = [(cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a))) for a in range(-90, 271, 60)]
+    d.polygon(pts, outline=GOLD, width=3, fill=(20, 20, 28, 255))
+
+    title = f"Profil de {name}"
+    tw = text_w(d, title, font(30, True))
+    d.text((W / 2 - tw / 2, 40), title, font=font(30, True), fill=GOLD)
+
+    top_y = 200
+    gap = 26
+    half_w = (W - 40 * 2 - gap) // 2
+
+    f1 = (40, top_y, 40 + half_w, top_y + 250)
+    _profil_frame(d, f1, GOLD)
+    x, y = f1[0] + 24, f1[1] + 22
+    d.text((x, y), "PV", font=font(13, True), fill=(230, 70, 70, 255))
+    pv_pct = pv[0] / pv[1] * 100
+    _profil_bar_gauge(d, x, y + 22, f1[2] - 24, y + 34, pv_pct, (230, 70, 70, 255), (35, 33, 42, 255))
+    d.text((x, y + 40), f"{pv[0]:,} / {pv[1]:,}".replace(",", " "), font=font(11), fill=SUB)
+
+    y += 74
+    d.text((x, y), "ÉNERGIE OCCULTE", font=font(13, True), fill=(90, 160, 240, 255))
+    eo_pct = eo[0] / eo[1] * 100
+    _profil_bar_gauge(d, x, y + 22, f1[2] - 24, y + 34, eo_pct, (90, 160, 240, 255), (35, 33, 42, 255))
+    d.text((x, y + 40), f"{eo[0]:,} / {eo[1]:,}".replace(",", " "), font=font(11), fill=SUB)
+
+    y += 74
+    ring_r = 30
+    d.ellipse((x - ring_r + 30, y - ring_r + 30, x + ring_r + 30, y + ring_r + 30), outline=XP_COLOR, width=6)
+    d.text((x + 30 - 10, y + 18), str(level), font=font(18, True), fill=TEXT)
+    d.text((x + 74, y + 8), "LEVEL & XP", font=font(13, True), fill=HEADER_COLOR)
+    d.text((x + 74, y + 26), f"{xp[0]:,} / {xp[1]:,} XP".replace(",", " "), font=font(11), fill=TEXT)
+    xpbw = f1[2] - 24 - (x + 74)
+    _profil_bar_gauge(d, x + 74, y + 46, x + 74 + xpbw, y + 54, xp[0] / xp[1] * 100, XP_COLOR, (35, 33, 42, 255))
+
+    f2 = (40 + half_w + gap, top_y, W - 40, top_y + 250)
+    _profil_frame(d, f2, GOLD)
+    x, y = f2[0] + 24, f2[1] + 22
+    d.text((x, y), "CLAN", font=font(12, True), fill=HEADER_COLOR)
+    d.text((x, y + 18), clan, font=font(18, True), fill=TEXT)
+    d.text((x + half_w / 2, y), "RANG", font=font(12, True), fill=HEADER_COLOR)
+    d.text((x + half_w / 2, y + 18), rang, font=font(18, True), fill=GOLD)
+
+    y += 66
+    d.line((x, y, f2[2] - 24, y), fill=(55, 52, 65, 255), width=1)
+    y += 20
+    d.text((x, y), "COMBATS", font=font(12, True), fill=HEADER_COLOR)
+    y += 26
+
+    combat_data = [("VICTOIRES", victoires, (110, 220, 150, 255)), ("DÉFAITES", defaites, (230, 90, 90, 255)),
+                   ("NULS", nuls, (190, 190, 198, 255)), ("TOTAL", victoires + defaites + nuls, GOLD)]
+    cell_gap = 12
+    cell_w = (f2[2] - 24 - x - cell_gap * 3) // 4
+    for i, (label, val, col) in enumerate(combat_data):
+        cxp = x + i * (cell_w + cell_gap)
+        d.rounded_rectangle((cxp, y, cxp + cell_w, y + 76), radius=10, fill=CELL_BG, outline=col, width=1)
+        lw = text_w(d, label, font(9, True))
+        d.text((cxp + cell_w / 2 - lw / 2, y + 10), label, font=font(9, True), fill=SUB)
+        vw = text_w(d, str(val), font(20, True))
+        d.text((cxp + cell_w / 2 - vw / 2, y + 32), str(val), font=font(20, True), fill=col)
+
+    bottom_y = top_y + 250 + gap
+    frame_h = 340
+    f3 = (40, bottom_y, 40 + half_w, bottom_y + frame_h)
+    _profil_frame(d, f3, GOLD)
+    x, y = f3[0] + 24, f3[1] + 22
+    d.text((x, y), "STATISTIQUES DE COMBAT", font=font(13, True), fill=HEADER_COLOR)
+    y += 50
+
+    stat_colors = [(170, 100, 240, 255), (90, 200, 220, 255), (240, 150, 80, 255)]
+    ring_r_stat = 38
+    inner_w = (f3[2] - 24) - x
+    seg_w = inner_w / 3
+    row_y = y + ring_r_stat + 10
+    for i, ((sname, slvl, spct, sxp), col) in enumerate(zip(stats, stat_colors)):
+        px = x + seg_w * i + seg_w / 2
+        _profil_ring_gauge(d, px, row_y, ring_r_stat, spct, col, (35, 33, 42, 255), width=7)
+        pw = text_w(d, f"{spct}%", font(14, True))
+        d.text((px - pw / 2, row_y - 9), f"{spct}%", font=font(14, True), fill=TEXT)
+        nw = text_w(d, sname, font(12, True))
+        d.text((px - nw / 2, row_y + ring_r_stat + 12), sname, font=font(12, True), fill=col)
+        lvl_txt = f"Lvl {slvl}"
+        xp_txt = f"{sxp[0]}/{sxp[1]} XP"
+        lw = text_w(d, lvl_txt, font(11, True))
+        xw = text_w(d, xp_txt, font(11))
+        d.text((px - lw / 2, row_y + ring_r_stat + 32), lvl_txt, font=font(11, True), fill=TEXT)
+        d.text((px - xw / 2, row_y + ring_r_stat + 50), xp_txt, font=font(11), fill=SUB)
+
+    f4 = (40 + half_w + gap, bottom_y, W - 40, bottom_y + frame_h)
+    _profil_frame(d, f4, GOLD)
+    x, y = f4[0] + 24, f4[1] + 22
+    d.text((x, y), "MAÎTRISES", font=font(13, True), fill=HEADER_COLOR)
+
+    maitrise_colors = [(90, 160, 240, 255), (170, 100, 240, 255), (100, 220, 150, 255), (240, 110, 130, 255)]
+    ring_r_m = 46
+    positions = [(f4[0] + half_w * 0.28, y + 74), (f4[0] + half_w * 0.72, y + 74),
+                 (f4[0] + half_w * 0.28, y + 208), (f4[0] + half_w * 0.72, y + 208)]
+    for (mname, mlvl, mpct), (px, py), col in zip(maitrises, positions, maitrise_colors):
+        _profil_ring_gauge(d, px, py, ring_r_m, mpct, col, (35, 33, 42, 255), width=8)
+        lvl_txt = f"Lv{mlvl}"
+        pct_txt = f"{mpct}%"
+        lw = text_w(d, lvl_txt, font(15, True))
+        d.text((px - lw / 2, py - 20), lvl_txt, font=font(15, True), fill=TEXT)
+        pw = text_w(d, pct_txt, font(11))
+        d.text((px - pw / 2, py + 4), pct_txt, font=font(11), fill=col)
+        nw = text_w(d, mname, font(12, True))
+        d.text((px - nw / 2, py + ring_r_m + 12), mname, font=font(12, True), fill=SUB)
+
+    img.save(out_path)
+    return out_path
