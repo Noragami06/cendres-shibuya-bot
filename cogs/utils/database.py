@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS validated_characters (
     nature TEXT,
     hybride_type TEXT,
     grade TEXT,
+    rct INTEGER DEFAULT 0,
     portrait_path TEXT,
     validated_at TEXT
 );
@@ -204,6 +205,43 @@ CREATE TABLE IF NOT EXISTS pending_trades (
     channel_id INTEGER,
     created_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS character_virtual_roles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id INTEGER,
+    role_id INTEGER,
+    UNIQUE(character_id, role_id)
+);
+
+CREATE TABLE IF NOT EXISTS character_profiles (
+    character_id INTEGER PRIMARY KEY,
+    pv_actuel INTEGER DEFAULT 100,
+    pv_max INTEGER DEFAULT 100,
+    eo_actuel INTEGER DEFAULT 100,
+    eo_max INTEGER DEFAULT 100,
+    level INTEGER DEFAULT 1,
+    xp_actuel INTEGER DEFAULT 0,
+    xp_max INTEGER DEFAULT 1000,
+    force_level INTEGER DEFAULT 1,
+    force_xp_actuel INTEGER DEFAULT 0,
+    force_xp_max INTEGER DEFAULT 1000,
+    vitesse_level INTEGER DEFAULT 1,
+    vitesse_xp_actuel INTEGER DEFAULT 0,
+    vitesse_xp_max INTEGER DEFAULT 1000,
+    defense_level INTEGER DEFAULT 1,
+    defense_xp_actuel INTEGER DEFAULT 0,
+    defense_xp_max INTEGER DEFAULT 1000,
+    maitrise_eo_level INTEGER DEFAULT 1,
+    victoires INTEGER DEFAULT 0,
+    defaites INTEGER DEFAULT 0,
+    nuls INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS character_backgrounds (
+    character_id INTEGER PRIMARY KEY,
+    image_path TEXT,
+    uploaded_at TEXT
+);
 """
 
 
@@ -274,6 +312,7 @@ _VALIDATED_EXTRA_COLUMNS = [
     ("portrait_path", "TEXT"),
     ("hybride_type", "TEXT"),
     ("grade", "TEXT"),
+    ("rct", "INTEGER DEFAULT 0"),
 ]
 
 # Colonnes de bank_accounts ajoutées après coup.
@@ -672,17 +711,148 @@ def get_expired_fiches(now_iso: str):
 
 def insert_validated_character(user_id, guild_id, slot_number, discord_username, character_name,
                                camp, clan, sort, eo_classe, eo_value, nature, hybride_type,
-                               grade, portrait_path, validated_at):
+                               grade, portrait_path, validated_at, rct=0):
     """Insère un personnage validé (un joueur peut en avoir plusieurs, un par slot)."""
     with get_connection() as conn:
         conn.execute(
             """INSERT INTO validated_characters
                (user_id, guild_id, slot_number, discord_username, character_name,
-                camp, clan, sort, eo_classe, eo_value, nature, hybride_type, grade, portrait_path, validated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                camp, clan, sort, eo_classe, eo_value, nature, hybride_type, grade, rct,
+                portrait_path, validated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (user_id, guild_id, slot_number, discord_username, character_name,
-             camp, clan, sort, eo_classe, eo_value, nature, hybride_type, grade, portrait_path, validated_at),
+             camp, clan, sort, eo_classe, eo_value, nature, hybride_type, grade, rct,
+             portrait_path, validated_at),
         )
+
+
+def count_clan_members(guild_id: int, clan: str) -> int:
+    """Nombre de personnages VALIDÉS d'un clan (réels ET virtuels, TOUS slots confondus).
+    Source de vérité des places de clan : validated_characters, jamais les rôles Discord (les slots
+    2/3 n'ont que des rôles virtuels enregistrés en base)."""
+    if not clan:
+        return 0
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM validated_characters WHERE clan = ? AND guild_id = ?",
+            (clan, guild_id),
+        ).fetchone()["n"]
+
+
+def heir_exists(guild_id: int, clan: str) -> bool:
+    """True si un personnage validé de ce clan porte déjà le grade 'Héritier' (réel OU virtuel).
+    Source de vérité : la base, pas les rôles Discord (un héritier de slot 2/3 n'a pas de rôle)."""
+    if not clan:
+        return False
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM validated_characters WHERE clan = ? AND grade = 'Héritier' AND guild_id = ? LIMIT 1",
+            (clan, guild_id),
+        ).fetchone()
+    return row is not None
+
+
+def add_virtual_role(character_id: int, role_id: int) -> bool:
+    """Associe (virtuellement) un rôle Discord à un personnage, en base uniquement (aucun rôle réel
+    n'est posé). La contrainte UNIQUE(character_id, role_id) empêche les doublons. Retourne True si
+    la ligne a été réellement insérée (False si le couple existait déjà). Aucune limite au nombre de
+    rôles par personnage."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO character_virtual_roles (character_id, role_id) VALUES (?, ?)",
+            (character_id, role_id),
+        )
+        return cur.rowcount > 0
+
+
+def get_virtual_roles(character_id: int):
+    """Rôles virtuels enregistrés pour un personnage (liste de role_id)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT role_id FROM character_virtual_roles WHERE character_id = ?", (character_id,)
+        ).fetchall()
+    return [r["role_id"] for r in rows]
+
+
+# ---------- Profils de personnage (/profil) ----------
+# Colonnes modifiables de character_profiles (character_id exclu : c'est la clé).
+_PROFILE_COLUMNS = frozenset({
+    "pv_actuel", "pv_max", "eo_actuel", "eo_max", "level", "xp_actuel", "xp_max",
+    "force_level", "force_xp_actuel", "force_xp_max",
+    "vitesse_level", "vitesse_xp_actuel", "vitesse_xp_max",
+    "defense_level", "defense_xp_actuel", "defense_xp_max",
+    "maitrise_eo_level", "victoires", "defaites", "nuls",
+})
+
+
+def get_or_create_profile(character_id: int):
+    """Retourne la ligne character_profiles du personnage, en la créant avec les valeurs par défaut
+    de la table si elle n'existe pas encore (premier affichage du profil)."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO character_profiles (character_id) VALUES (?)", (character_id,)
+        )
+        return conn.execute(
+            "SELECT * FROM character_profiles WHERE character_id = ?", (character_id,)
+        ).fetchone()
+
+
+def update_profile(character_id: int, **fields):
+    """Met à jour des colonnes de character_profiles (crée la ligne au besoin). Seules les colonnes
+    connues sont acceptées."""
+    fields = {k: v for k, v in fields.items() if k in _PROFILE_COLUMNS}
+    if not fields:
+        return
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO character_profiles (character_id) VALUES (?)", (character_id,)
+        )
+        assignments = ", ".join(f"{k} = ?" for k in fields)
+        conn.execute(
+            f"UPDATE character_profiles SET {assignments} WHERE character_id = ?",
+            (*fields.values(), character_id),
+        )
+
+
+def get_background(character_id: int):
+    """Fond d'écran propre à CE personnage (jamais partagé entre personnages), ou None."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT image_path, uploaded_at FROM character_backgrounds WHERE character_id = ?",
+            (character_id,),
+        ).fetchone()
+
+
+def set_background(character_id: int, image_path: str, uploaded_at: str):
+    """Enregistre/actualise le fond d'un personnage (INSERT OR REPLACE : un seul fond par personnage)."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO character_backgrounds (character_id, image_path, uploaded_at) "
+            "VALUES (?, ?, ?)",
+            (character_id, image_path, uploaded_at),
+        )
+
+
+def renumber_character_slots(user_id: int, guild_id: int):
+    """Renumérote les slots restants d'un joueur pour qu'ils soient consécutifs à partir de 1, dans
+    l'ordre croissant des slot_number actuels. Ne touche QUE la colonne slot_number (aucun rôle
+    Discord). Retourne la liste des changements [(character_id, ancien_slot, nouveau_slot), ...] pour
+    les personnages dont le numéro a réellement changé (permet de notifier le joueur)."""
+    changes = []
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, slot_number FROM validated_characters "
+            "WHERE user_id = ? AND guild_id = ? ORDER BY slot_number ASC",
+            (user_id, guild_id),
+        ).fetchall()
+        for new_slot, row in enumerate(rows, start=1):
+            if row["slot_number"] != new_slot:
+                conn.execute(
+                    "UPDATE validated_characters SET slot_number = ? WHERE id = ?",
+                    (new_slot, row["id"]),
+                )
+                changes.append((row["id"], row["slot_number"], new_slot))
+    return changes
 
 
 def count_validated_grade(guild_id: int, clan: str, grade: str) -> int:

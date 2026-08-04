@@ -424,16 +424,12 @@ def redistribute_pct(table: dict, removed_key: str) -> dict:
 
 
 # ---------- Comptage en direct ----------
-def get_clan_member_count(guild: discord.Guild, clan_role_id: int) -> int:
-    """Compte les membres possédant à la fois le rôle marqueur de clan et le rôle du clan visé."""
-    if guild is None:
-        return 0
-    count = 0
-    for member in guild.members:
-        role_ids = {role.id for role in member.roles}
-        if CLAN_MEMBER_ROLE_ID in role_ids and clan_role_id in role_ids:
-            count += 1
-    return count
+def get_clan_member_count(guild: discord.Guild, clan_key: str) -> int:
+    """Compte les personnages VALIDÉS d'un clan (réels ET virtuels, TOUS slots confondus) depuis la
+    base — plus depuis les rôles Discord, car les slots 2/3 n'ont que des rôles virtuels enregistrés.
+    Reçoit désormais la CLÉ du clan (telle que stockée dans validated_characters.clan), pas un role_id."""
+    guild_id = guild.id if guild else None
+    return db.count_clan_members(guild_id, clan_key)
 
 
 def is_heredit_taken(guild: discord.Guild, clan_role_id: int) -> bool:
@@ -481,7 +477,7 @@ def update_clan_state_after_join(guild: discord.Guild, clan_key: str):
     data = load_clan_state()
     info = data["clans"][clan_key]
 
-    count = get_clan_member_count(guild, info["role_id"])
+    count = get_clan_member_count(guild, clan_key)
     if not info["closed"] and count >= info["cap"]:
         close_clan_and_redistribute(data, clan_key)
 
@@ -595,7 +591,7 @@ def build_clan_table_embed(guild: discord.Guild) -> discord.Embed:
     )
 
     for clan_key, info in clans.items():
-        count = get_clan_member_count(guild, info["role_id"])
+        count = get_clan_member_count(guild, clan_key)
         partiel = "Oui" if info["partial_heredit"] else "Non"
         name = clan_key.capitalize()
 
@@ -1236,11 +1232,15 @@ async def handle_histoire(interaction: discord.Interaction, custom_id: str, choi
     await interaction.response.defer()
     await _delete_fiche_question(interaction.client, progress)  # retire l'embed Oui/Non
 
+    # L'histoire n'est plus capturée pendant le questionnaire : que le joueur clique Oui ou Non, on
+    # enregistre histoire = NULL et on passe DIRECTEMENT à l'étape suivante (grade ou portrait), sans
+    # jamais passer par le stage "histoire_text". Sur "Oui", on lui rappelle simplement de la poster
+    # dans ce salon une fois sa fiche validée.
+    nxt = next_fiche_stage("histoire_ask", progress)  # -> grade ou portrait
+    update_progress(interaction.user.id, histoire=None, fiche_stage=nxt, fiche_deadline=_fiche_deadline_iso())
     if choice == "oui":
-        update_progress(interaction.user.id, fiche_stage="histoire_text", fiche_deadline=_fiche_deadline_iso())
+        await interaction.followup.send("Une fois ta fiche validée, poste ton histoire dans ce salon.")
     else:
-        nxt = next_fiche_stage("histoire_ask", progress)  # -> grade ou portrait
-        update_progress(interaction.user.id, histoire=None, fiche_stage=nxt, fiche_deadline=_fiche_deadline_iso())
         await interaction.followup.send("Très bien.", ephemeral=True)
 
     await send_fiche_question(interaction.client, interaction.user.id)
@@ -1569,18 +1569,24 @@ async def finalize_fiche(client, uid: int):
         await origin.send(f"{member_mention} Ta fiche a été envoyée au staff pour validation.")
 
 
-async def assign_validation_roles(guild: discord.Guild, member: discord.Member, progress: dict) -> bool:
-    """Attribue TOUS les rôles Discord au moment de la validation (camp, clan, grade/héritier, RCT).
-    Ne lève jamais : en cas d'erreur, logue dans le terminal et continue (l'insertion en base ne
-    doit pas être bloquée). C'est aussi ici que la place de clan devient réellement occupée
-    (comptage / fermeture / redistribution).
+async def assign_validation_roles(guild: discord.Guild, member: discord.Member, progress: dict,
+                                  slot_number: int, heir_conflict: bool) -> None:
+    """Attribue les VRAIS rôles Discord au moment de la validation (camp, clan, grade/héritier, RCT)
+    — UNIQUEMENT pour le SLOT 1. Ne lève jamais : en cas d'erreur, logue et continue (l'insertion en
+    base ne doit pas être bloquée).
 
-    Retourne True si un CONFLIT D'HÉRITIER a été détecté (le clan a déjà un héritier validé) :
-    dans ce cas le joueur reçoit "Membres principaux" au lieu du rôle Héritier."""
-    heir_conflict = False
+    heir_conflict est déterminé EN AMONT depuis la base (cf. handle_fiche_valide) : s'il vaut True et
+    que le personnage devait être héritier, on pose 'Membres principaux' au lieu du rôle Héritier.
+
+    Le comptage / la fermeture de clan ne sont plus faits ici : ils le sont APRÈS l'insertion en base
+    dans handle_fiche_valide (comptage basé sur validated_characters, tous slots confondus)."""
+    if slot_number != 1:
+        # Ce personnage (slot 2/3) a des rôles uniquement enregistrés en base, jamais attribués sur
+        # Discord, pour éviter les rôles contradictoires avec le slot 1 du même joueur.
+        return
     if guild is None or member is None:
         print(f"[fiche] Rôles non attribués : guild/member introuvable (uid={member.id if member else '?'}).")
-        return heir_conflict
+        return
 
     camp = (progress.get("camp") or "").lower()
     path = progress.get("path")
@@ -1601,31 +1607,20 @@ async def assign_validation_roles(guild: discord.Guild, member: discord.Member, 
         collect(camp_role_id)
 
     # 2) Rôle de clan (exorciste classique ou hybride chez les exorcistes, avec un clan précis)
-    clan_role_id = None
-    newly_assigned_clan = False
     if path in ("exorciste", "hybride_exorciste") and clan_key and clan_key != "sans_clan":
         info = load_clan_state()["clans"].get(clan_key)
         clan_role_id = info["role_id"] if info else None
         if clan_role_id:
             # Exception "Reroll Clan" : si le membre porte DÉJÀ le rôle du clan (attribué au moment
-            # du reroll), on ne le réattribue pas et on ne recompte pas la place (déjà occupée).
+            # du reroll), on ne le réattribue pas.
             already_has_clan = any(r.id == clan_role_id for r in member.roles)
             if not already_has_clan:
                 collect(clan_role_id)
                 collect(CLAN_MEMBER_ROLE_ID)
-                newly_assigned_clan = True
-            # Grade / héritier : attribués dans tous les cas (idempotent si déjà présent).
+            # Grade / héritier : attribués dans tous les cas (idempotent si déjà présent). Le conflit
+            # d'héritier a déjà été tranché en base (heir_conflict) : repli sur Membres principaux.
             if progress.get("sera_heritier"):
-                # Anti double-héritier : un membre valide porte-t-il déjà clan + Héritier ?
-                existing_heir = any(
-                    {clan_role_id, HERITIER_ROLE_ID} <= {r.id for r in m.roles}
-                    for m in guild.members
-                )
-                if existing_heir:
-                    heir_conflict = True
-                    collect(MEMBRES_PRINCIPAUX_ROLE_ID)  # grade de repli
-                else:
-                    collect(HERITIER_ROLE_ID)
+                collect(MEMBRES_PRINCIPAUX_ROLE_ID if heir_conflict else HERITIER_ROLE_ID)
             elif progress.get("grade_choisi"):
                 grade_rid = GRADE_LABEL_TO_ROLE_ID.get(progress.get("grade_choisi"))
                 if grade_rid:
@@ -1642,22 +1637,10 @@ async def assign_validation_roles(guild: discord.Guild, member: discord.Member, 
     except discord.Forbidden:
         print(f"[fiche] Permission manquante pour attribuer les rôles à {member} ({member.id}). "
               "Rôles à corriger manuellement.")
-        return heir_conflict
     except Exception as e:
         import traceback
         print(f"[fiche] Erreur d'attribution des rôles à {member} ({member.id}) : {e}")
         traceback.print_exc()
-        return heir_conflict
-
-    # 4) La place de clan devient réellement occupée ICI seulement si le rôle vient d'être attribué
-    # (pas le cas d'un Reroll Clan, où la place a déjà été comptée au moment du reroll).
-    if clan_role_id and newly_assigned_clan:
-        try:
-            update_clan_state_after_join(guild, clan_key)
-        except Exception as e:
-            print(f"[fiche] Erreur fermeture/redistribution du clan {clan_key} : {e}")
-
-    return heir_conflict
 
 
 async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
@@ -1679,9 +1662,11 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
         content=f"{original_content}\n✅ Validée par {interaction.user.mention}", view=None
     )
 
-    # 2) Attribution réelle des rôles (camp/clan/grade/héritier/RCT) + comptage de clan.
-    # Fait AVANT l'insertion pour connaître un éventuel conflit d'héritier (grade réel = repli).
-    heir_conflict = await assign_validation_roles(guild, member, progress)
+    # 2) Conflit d'héritier basé sur la BASE (slots réels ET virtuels) : un personnage validé de ce
+    # clan porte-t-il déjà le grade 'Héritier' ? Calculé AVANT l'insertion pour figer le grade réel.
+    heir_conflict = bool(progress.get("sera_heritier")) and db.heir_exists(
+        progress.get("guild_id"), progress.get("clan")
+    )
 
     # Grade effectivement attribué (pour validated_characters + affichage).
     if progress.get("sera_heritier"):
@@ -1689,7 +1674,13 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
     else:
         effective_grade = progress.get("grade_choisi")
 
+    # Attribution réelle des rôles Discord : UNIQUEMENT pour le slot 1 (les slots 2/3 n'ont que des
+    # rôles virtuels enregistrés en base). Le comptage de clan est fait après l'insertion ci-dessous.
+    await assign_validation_roles(guild, member, progress, slot, heir_conflict)
+
     # 3) Insertion dans validated_characters (avec le grade effectif : source de vérité des places).
+    # On enregistre TOUTES les infos, y compris pour les slots 2/3 : camp, clan, sort, eo, nature,
+    # grade (Héritier / Membres principaux / grade choisi / None selon les cas), rct, hybride_type.
     has_clan = has_clan_from_progress(progress)
     nom_final = progress.get("clan").capitalize() if has_clan else (progress.get("nom") or "")
     prenom = progress.get("prenom") or ""
@@ -1701,10 +1692,21 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
         camp=progress.get("camp"), clan=progress.get("clan"), sort=progress.get("sort"),
         eo_classe=progress.get("eo_classe"), eo_value=progress.get("eo_value"),
         nature=progress.get("nature"), hybride_type=_hybride_type_of(progress),
-        grade=effective_grade, portrait_path=progress.get("portrait_path"),
+        grade=effective_grade, rct=1 if progress.get("rct") else 0,
+        portrait_path=progress.get("portrait_path"),
         validated_at=datetime.utcnow().isoformat(),
     )
     update_progress(target_uid, fiche_status="validated")
+
+    # 3 bis) Place de clan : comptage basé sur la base (TOUS les personnages du clan, slots réels ET
+    # virtuels), APRÈS l'insertion pour inclure ce nouveau personnage. Ferme / redistribue si le cap
+    # est atteint. S'applique quel que soit le slot (un slot 2/3 occupe aussi une place de clan).
+    clan_key = progress.get("clan")
+    if clan_key and clan_key != "sans_clan":
+        try:
+            update_clan_state_after_join(guild, clan_key)
+        except Exception as e:
+            print(f"[fiche] Erreur fermeture/redistribution du clan {clan_key} : {e}")
 
     # 3) Renvoie le même embed (même image) dans le salon des fiches validées, sans boutons.
     #    Sur cette copie uniquement : statut « ✅ Validée » et mention du valideur.
@@ -1745,6 +1747,63 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
     origin = interaction.client.get_channel(progress.get("origin_channel_id"))
     if origin:
         await origin.send(f"{member_mention} Ta fiche a été validée par le staff ! Bienvenue.")
+
+    # 5) Slots 2/3 : aucun rôle réel n'a été posé (cf. assign_validation_roles). Le staff enregistre
+    # en masse, via mentions de rôles, les rôles à associer VIRTUELLEMENT à ce personnage.
+    if slot in (2, 3):
+        await _collect_virtual_roles_for_slot(interaction, target_uid, slot)
+
+
+async def _collect_virtual_roles_for_slot(interaction: discord.Interaction, target_uid: int, slot: int):
+    """Slot 2/3 : demande au staff qui vient de valider de mentionner tous les rôles à associer
+    virtuellement au personnage, puis les enregistre en base (character_virtual_roles) — aucun rôle
+    réel n'est posé sur Discord. Isolation STRICTE (même staff + même salon), sans limite de temps ni
+    de nombre de rôles ; redemande tant qu'aucune mention de rôle valide n'est fournie."""
+    staff_channel = interaction.client.get_channel(FICHE_STAFF_CHANNEL_ID)
+    if staff_channel is None:
+        return
+    guild_id = interaction.guild.id if interaction.guild else None
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT id FROM validated_characters WHERE user_id = ? AND guild_id = ? AND slot_number = ?",
+            (target_uid, guild_id, slot),
+        ).fetchone()
+    if row is None:
+        return
+    character_id = row["id"]
+
+    await staff_channel.send(
+        f"{interaction.user.mention}, ce personnage est en slot {slot}, ses rôles ne sont donc pas "
+        "attribués sur Discord. Mentionne tous les rôles à associer virtuellement à ce personnage "
+        "(autant que tu veux, en un seul message)."
+    )
+
+    # Isolation : uniquement le staff qui vient de valider, dans CE salon.
+    def check(m):
+        return (m.channel.id == staff_channel.id and m.author.id == interaction.user.id
+                and not m.author.bot)
+
+    while True:
+        message = await interaction.client.wait_for("message", check=check)  # aucune limite de temps
+        roles = message.role_mentions
+        if not roles:
+            await staff_channel.send(
+                "Aucune mention de rôle détectée. Mentionne au moins un rôle (ex : @Rôle) à associer "
+                "à ce personnage."
+            )
+            continue
+        # Dédoublonnage si le même rôle est mentionné plusieurs fois ; INSERT OR IGNORE en base aussi.
+        seen = set()
+        for role in roles:
+            if role.id in seen:
+                continue
+            seen.add(role.id)
+            db.add_virtual_role(character_id, role.id)
+        await staff_channel.send(
+            f"{len(seen)} rôles enregistrés pour ce personnage. Le staff pourra en ajouter d'autres "
+            "plus tard si besoin via la commande /profil."
+        )
+        return
 
 
 async def handle_fiche_refuse(interaction: discord.Interaction, custom_id: str):
@@ -2791,6 +2850,11 @@ def delete_character_cascade(character_id):
             "DELETE FROM pending_trades WHERE proposer_character_id = ? OR target_character_id = ?",
             (character_id, character_id),
         )
+        # Rôles virtuels enregistrés pour les personnages de slot 2/3
+        conn.execute("DELETE FROM character_virtual_roles WHERE character_id = ?", (character_id,))
+        # Profil (/profil) et fond d'écran propres au personnage
+        conn.execute("DELETE FROM character_profiles WHERE character_id = ?", (character_id,))
+        conn.execute("DELETE FROM character_backgrounds WHERE character_id = ?", (character_id,))
 
 
 class DeleteConfirmView(discord.ui.View):
@@ -3001,10 +3065,25 @@ class Depart(commands.Cog):
         if character_id is not None:
             delete_character_cascade(character_id)
 
+        # Renumérotation automatique des slots restants pour qu'ils soient consécutifs à partir de 1.
+        # La renumérotation des slots est automatique, mais la réattribution des VRAIS rôles Discord
+        # reste manuelle, gérée par le staff via un futur outil de la commande /profil.
+        slot_changes = db.renumber_character_slots(target_uid, interaction.guild.id)
+
         await interaction.response.edit_message(
             content=f"Le personnage du slot {slot} a été supprimé définitivement.",
             embed=None, view=None,
         )
+
+        # Informe le joueur des slots qui ont été renumérotés (aucun rôle Discord n'est touché).
+        for _cid, old_slot, new_slot in slot_changes:
+            try:
+                await interaction.channel.send(
+                    f"<@{target_uid}> Ton personnage du slot {old_slot} devient maintenant le slot "
+                    f"{new_slot}. Contacte le staff si tu veux qu'il récupère les rôles Discord réels."
+                )
+            except discord.HTTPException:
+                pass
 
     async def handle_delete_cancel(self, interaction: discord.Interaction, custom_id: str):
         target_uid = int(custom_id.split(":")[1])

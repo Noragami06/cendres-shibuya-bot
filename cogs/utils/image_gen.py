@@ -1,4 +1,4 @@
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
 import math
 import os
 
@@ -692,13 +692,18 @@ def _profil_frame(d, xy, gold):
     d.rounded_rectangle(xy, radius=14, outline=gold, width=3)
 
 
-def generate_profil_image(name, pv, eo, level, xp, stats, maitrises, clan, rang, victoires, defaites, nuls, out_path):
+def generate_profil_image(name, pv, eo, level, xp, stats, maitrises, clan, rang, victoires, defaites, nuls,
+                          out_path, portrait_path=None, background_path=None):
     """
     pv, eo, xp : tuples (valeur_actuelle, valeur_max)
     stats : liste de 3 tuples (nom, niveau, pourcentage, (xp_actuel, xp_max)) → Force, Vitesse, Défense dans cet ordre
     maitrises : liste de 4 tuples (nom, niveau, pourcentage) → Maîtrise EO, Maîtrise Sort, Maîtrise Territoire, RCT dans cet ordre
     clan, rang : chaînes
     victoires, defaites, nuls : entiers
+    portrait_path : photo du personnage, découpée à la forme de l'hexagone (cadre en haut à droite).
+                    Si None/absent : remplissage uni de l'hexagone (comportement d'origine).
+    background_path : image de fond couvrant tout le canvas, floutée + assombrie pour la lisibilité.
+                    Si None/absent : fond de couleur unie BG (comportement d'origine).
     """
     W, H = 1100, 900
     BG = (10, 9, 15, 255)
@@ -709,13 +714,41 @@ def generate_profil_image(name, pv, eo, level, xp, stats, maitrises, clan, rang,
     HEADER_COLOR = (255, 200, 60, 255)
     CELL_BG = (22, 20, 28, 255)
 
-    img = Image.new("RGBA", (W, H), BG)
+    # Fond : image floutée + assombrie si fournie, sinon couleur unie (comme avant).
+    if background_path and os.path.exists(background_path):
+        try:
+            bg = ImageOps.fit(Image.open(background_path).convert("RGB"), (W, H), method=Image.LANCZOS)
+            bg = bg.filter(ImageFilter.GaussianBlur(radius=8)).convert("RGBA")
+            # Calque noir semi transparent pour garder le texte lisible.
+            img = Image.alpha_composite(bg, Image.new("RGBA", (W, H), (0, 0, 0, 140)))
+        except Exception:
+            img = Image.new("RGBA", (W, H), BG)
+    else:
+        img = Image.new("RGBA", (W, H), BG)
     d = ImageDraw.Draw(img)
     d.rectangle((0, 0, W, H), outline=GOLD, width=2)
 
     cx, cy, r = W - 110, 100, 70
     pts = [(cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a))) for a in range(-90, 271, 60)]
-    d.polygon(pts, outline=GOLD, width=3, fill=(20, 20, 28, 255))
+    # Photo du personnage découpée à la forme de l'hexagone (masque), sinon remplissage uni.
+    portrait_filled = False
+    if portrait_path and os.path.exists(portrait_path):
+        try:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            x0, y0, x1, y1 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+            bw, bh = x1 - x0, y1 - y0
+            photo = ImageOps.fit(Image.open(portrait_path).convert("RGBA"), (bw, bh), method=Image.LANCZOS)
+            hex_mask = Image.new("L", (bw, bh), 0)
+            ImageDraw.Draw(hex_mask).polygon([(px - x0, py - y0) for px, py in pts], fill=255)
+            img.paste(photo, (x0, y0), hex_mask)
+            portrait_filled = True
+        except Exception:
+            portrait_filled = False
+    if portrait_filled:
+        d.polygon(pts, outline=GOLD, width=3)
+    else:
+        d.polygon(pts, outline=GOLD, width=3, fill=(20, 20, 28, 255))
 
     title = f"Profil de {name}"
     tw = text_w(d, title, font(30, True))

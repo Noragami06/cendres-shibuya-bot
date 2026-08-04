@@ -28,6 +28,7 @@ async def setup_hook():
     await bot.load_extension("cogs.banque")
     await bot.load_extension("cogs.inventaire")
     await bot.load_extension("cogs.shop")
+    await bot.load_extension("cogs.profil")
 
 
 @bot.event
