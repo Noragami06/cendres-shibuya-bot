@@ -8,7 +8,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from cogs.utils import database as db
-from cogs.utils.image_gen import generate_profil_image
+from cogs.utils.image_gen import generate_profil_image, generate_stats_image
 # Réutilise les helpers déjà en place (personnages / comptes / couleur).
 from cogs.banque import get_characters, get_character, PHOENIX_COLOR
 # Réutilise la validation + téléchargement + compression d'image du parcours /depart, et le rôle staff.
@@ -21,7 +21,7 @@ WAIT_TIMEOUT = 300  # secondes d'attente d'une réponse texte
 BACKGROUND_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "backgrounds")
 PROFILE_IMG_DIR = os.path.join(os.path.dirname(__file__), "..", "temp", "profil_images")
 
-# Les 6 sections encore non développées (boutons "à venir" sous le profil).
+# Les 6 sections encore non développées (boutons sous le profil). "stats" a désormais un vrai écran.
 TODO_SECTIONS = [
     ("stats", "📊 Stats"),
     ("relation", "🤝 Relation"),
@@ -46,22 +46,17 @@ def _now() -> str:
 
 
 # =====================================================================
-# RÈGLES TEMPORAIRES DE NIVEAU / XP
+# RÈGLES TEMPORAIRES DE NIVEAU / XP (niveau GÉNÉRAL du profil, inchangé)
 # =====================================================================
 # TODO TEMPORAIRE : cette formule sera remplacée par le vrai système de niveaux plus tard.
-# Règle actuelle : XP nécessaire pour atteindre le niveau N = N * 1000.
 def compute_xp_max_for_level(level: int) -> int:
     return level * 1000
 
 
 def sync_level_and_xp(level=None, xp_actuel=None, xp_max=None,
                       cur_level=1, cur_xp_actuel=0, cur_xp_max=1000):
-    """Recalcule (level, xp_actuel, xp_max) de façon cohérente selon ce qui a été fourni. Les cur_*
-    portent les valeurs actuelles pour les cas partiels.
-    - level fourni  : xp_max = compute_xp_max_for_level(level), xp_actuel clampé entre 0 et xp_max.
-    - xp_max fourni (sans level) : level = round(xp_max / 1000), au minimum 1 ; xp_actuel reclampé.
-    - seulement xp_actuel : garde level/xp_max existants, clamp xp_actuel entre 0 et xp_max existant.
-    Utilisable tel quel pour le groupe global ET pour Force/Vitesse/Défense (colonnes *_level/*_xp_*)."""
+    """Recalcule (level, xp_actuel, xp_max) du NIVEAU GÉNÉRAL du profil de façon cohérente. Utilisé
+    uniquement pour les colonnes character_profiles.level/xp_actuel/xp_max (indépendant des stats)."""
     if level is not None:
         level = max(1, int(level))
         new_max = compute_xp_max_for_level(level)
@@ -78,15 +73,61 @@ def sync_level_and_xp(level=None, xp_actuel=None, xp_max=None,
 
 
 # =====================================================================
+# STATISTIQUES : clés, noms, conversions points <-> niveau/XP (utilitaire partagé)
+# =====================================================================
+STAT_KEYS = ["force", "rct", "vitesse", "territoire", "endurance", "sorts", "armes_maudites", "energie_occulte"]
+STAT_DISPLAY_NAMES = {
+    "force": "Force", "rct": "RCT", "vitesse": "Vitesse", "territoire": "Territoire",
+    "endurance": "Endurance", "sorts": "Sorts", "armes_maudites": "Armes maudites",
+    "energie_occulte": "Énergie occulte",
+}
+# sorts et energie_occulte exclus pour la répartition JOUEUR (le staff peut tout viser via les buffs).
+PLAYER_DISTRIBUABLE_STATS = ["force", "rct", "vitesse", "territoire", "endurance", "armes_maudites"]
+
+# Couleurs des 8 stats pour generate_stats_image.
+STAT_COLORS = {
+    "force": (215, 80, 80), "rct": (100, 220, 150), "vitesse": (90, 150, 240),
+    "territoire": (190, 100, 240), "endurance": (230, 170, 60), "sorts": (230, 220, 70),
+    "armes_maudites": (230, 140, 60), "energie_occulte": (100, 160, 230),
+}
+
+
+def points_to_level_xp(total_points: int):
+    level = total_points // 1000 + 1
+    xp_actuel = total_points % 1000
+    return level, xp_actuel, 1000
+
+
+def level_xp_to_points(level: int, xp_actuel: int) -> int:
+    return (level - 1) * 1000 + xp_actuel
+
+
+def compute_tranche(base_pts: int):
+    """(numero_tranche, pct_dans_la_tranche, texte) selon le PALIER de base_pts (hors buffs)."""
+    brackets = [(1, 0, 10), (2, 10, 100), (3, 100, 1000), (4, 1000, 10000), (5, 10000, 100000)]
+    for num, lo, hi in brackets:
+        if base_pts < hi or num == brackets[-1][0]:
+            pct = round((base_pts - lo) / (hi - lo) * 100) if hi > lo else 0
+            pct = max(0, min(100, pct))
+            return num, pct, f"Tranche {num} : {lo}-{hi}"
+
+
+async def get_stat_base(character_id, stat_key) -> int:
+    return db.get_stat_base_pts(character_id, stat_key)
+
+
+async def get_stat_total(character_id, stat_key) -> int:
+    """base_pts + somme des buffs actifs pour cette stat précise."""
+    return db.get_stat_base_pts(character_id, stat_key) + db.sum_buff_points(character_id, stat_key)
+
+
+# =====================================================================
 # MÉTHODE STANDARD DU PROJET : rôle appliqué à un PERSONNAGE précis
 # =====================================================================
 async def character_has_role(guild, member, character_id, role_id) -> bool:
-    """MÉTHODE STANDARD du projet pour vérifier si un rôle (camp / clan / grade / RCT / ...) s'applique
-    à un PERSONNAGE précis :
-      - slot_number == 1 : le personnage porte les VRAIS rôles Discord -> on inspecte member.roles ;
-      - slot_number 2/3  : rôles seulement virtuels -> on lit character_virtual_roles pour ce personnage.
-    Tout futur système du bot (combat, etc.) DOIT passer par cette fonction plutôt que d'inspecter
-    member.roles directement, sinon les personnages de slot 2/3 seraient traités comme sans rôle."""
+    """MÉTHODE STANDARD pour vérifier si un rôle (camp / clan / grade / RCT / ...) s'applique à un
+    PERSONNAGE précis : slot 1 -> vrais rôles Discord (member.roles) ; slots 2/3 -> rôles virtuels
+    (character_virtual_roles). Tout futur système DOIT passer par ici plutôt que member.roles."""
     with db.get_connection() as conn:
         row = conn.execute(
             "SELECT slot_number FROM validated_characters WHERE id = ?", (character_id,)
@@ -134,14 +175,35 @@ PARAM_ALIASES = {
     "maitrise_eo_level": ["level maitrise eo", "niveau maitrise eo"],
     "image": ["image", "portrait"],
     "fond": ["fond", "arriere plan", "background"],
+    # --- Stats (points) ---
+    "stats_force": ["stats force"],
+    "stats_vitesse": ["stats vitesse"],
+    "stats_endurance": ["stats endurance"],
+    "stats_armes_maudites": ["stats armes maudites"],
+    "stats_rct": ["stats rct"],
+    "stats_territoire": ["stats territoire"],
+    "stats_sorts": ["stats sorts"],
+    "stats_energie_occulte": ["stats energie occulte"],
+    "buff": ["buff"],
+    "points_stats": ["points de stats", "points restants"],
 }
 
-STAT_BASES = ("force", "vitesse", "defense")
+# "stats_X" -> clé de stat (écriture ABSOLUE dans character_stats).
+STATS_PARAM_MAP = {
+    "stats_force": "force", "stats_vitesse": "vitesse", "stats_endurance": "endurance",
+    "stats_armes_maudites": "armes_maudites", "stats_rct": "rct", "stats_territoire": "territoire",
+    "stats_sorts": "sorts", "stats_energie_occulte": "energie_occulte",
+}
+# Anciens paramètres level/xp/% -> clé de stat (Défense = Endurance). Convertis en points.
+LEGACY_STAT_MAP = {"force": "force", "vitesse": "vitesse", "defense": "endurance"}
+# Paramètres dont la modification impacte l'écran Stats (pour régénérer aussi le pillow Stats).
+_STATS_AFFECTING = set(STATS_PARAM_MAP) | {"points_stats"} | {
+    f"{lg}_{sfx}" for lg in LEGACY_STAT_MAP for sfx in ("pct", "level", "xp_max", "xp_actuel")
+}
 
 
 def match_params(text: str):
-    """Résolution d'un nom de paramètre : match exact d'un alias, sinon match par préfixe. Retourne
-    la liste des clés candidates (0 = inconnu, 1 = direct, 2+ = ambigu à départager)."""
+    """Résolution d'un nom de paramètre : match exact d'un alias, sinon match par préfixe."""
     t = text.strip().lower()
     exact = [k for k, aliases in PARAM_ALIASES.items() if any(a == t for a in aliases)]
     if exact:
@@ -149,9 +211,26 @@ def match_params(text: str):
     return [k for k, aliases in PARAM_ALIASES.items() if any(a.startswith(t) for a in aliases)]
 
 
+def match_stat(text: str, allowed_keys):
+    """Résolution d'une stat par nom d'affichage ou clé (exact puis préfixe), parmi allowed_keys."""
+    t = text.strip().lower()
+    exact = [k for k in allowed_keys if STAT_DISPLAY_NAMES[k].lower() == t or k == t]
+    if exact:
+        return exact
+    return [k for k in allowed_keys if STAT_DISPLAY_NAMES[k].lower().startswith(t) or k.startswith(t)]
+
+
 def _parse_int(raw: str, minimum=0):
     c = raw.strip().replace(" ", "").replace(",", "")
     if c.lstrip("-").isdigit() and int(c) >= minimum:
+        return int(c)
+    return None
+
+
+def _parse_any_int(raw: str):
+    """Entier signé (autorise les valeurs négatives, ex: malus de buff)."""
+    c = raw.strip().replace(" ", "").replace(",", "")
+    if c not in ("", "-") and c.lstrip("-").isdigit():
         return int(c)
     return None
 
@@ -182,6 +261,41 @@ class ProfilCharacterSelectView(discord.ui.View):
         super().__init__(timeout=WAIT_TIMEOUT)
         self.result = None
         self.add_item(ProfilCharacterSelect(chars, invoker_id))
+
+
+class BuffChoiceView(discord.ui.View):
+    """Ajouter / Retirer un buff — vue en session (le staff est déjà dans son flux d'édition verrouillé)."""
+
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=WAIT_TIMEOUT)
+        self.owner_id = owner_id
+        self.result = None
+        add = discord.ui.Button(label="Ajouter", emoji="➕", style=discord.ButtonStyle.success)
+        rem = discord.ui.Button(label="Retirer", emoji="➖", style=discord.ButtonStyle.danger)
+        add.callback = self._add
+        rem.callback = self._rem
+        self.add_item(add)
+        self.add_item(rem)
+
+    async def _guard(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Ce choix ne t'appartient pas.", ephemeral=True)
+            return False
+        return True
+
+    async def _add(self, interaction):
+        if not await self._guard(interaction):
+            return
+        self.result = "add"
+        await interaction.response.edit_message(view=None)
+        self.stop()
+
+    async def _rem(self, interaction):
+        if not await self._guard(interaction):
+            return
+        self.result = "remove"
+        await interaction.response.edit_message(view=None)
+        self.stop()
 
 
 # =====================================================================
@@ -216,9 +330,17 @@ class ProfileView(discord.ui.View):
                 custom_id=f"profil_todo_{key}:{character_id}:{user_id}", row=1 + i // 3))
 
 
-class StaffActionView(discord.ui.View):
-    """Menu d'action staff après sélection d'un personnage à gérer."""
+class StatsPageView(discord.ui.View):
+    """Bouton de répartition sous l'image Stats (présent seulement s'il reste des points)."""
 
+    def __init__(self, character_id: int, user_id: int):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Répartir les points", emoji="🎯", style=discord.ButtonStyle.success,
+            custom_id=f"stats_repartir:{character_id}:{user_id}"))
+
+
+class StaffActionView(discord.ui.View):
     def __init__(self, character_id: int, user_id: int):
         super().__init__(timeout=None)
         self.add_item(discord.ui.Button(
@@ -232,8 +354,7 @@ class StaffActionView(discord.ui.View):
 class Profil(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        # Isolation des flux textuels par joueur (mémoire : les flux wait_for ne survivent pas au reboot).
-        self._active_users = set()
+        self._active_users = set()  # isolation des flux textuels par joueur (mémoire)
 
     # ---------- verrou de flux ----------
     def _acquire(self, *user_ids) -> bool:
@@ -248,7 +369,6 @@ class Profil(commands.Cog):
             if u is not None:
                 self._active_users.discard(u)
 
-    # ---------- attente de saisie (isolation stricte auteur + salon) ----------
     async def wait_message(self, channel, author, timeout: int = WAIT_TIMEOUT):
         def check(m):
             return m.channel.id == channel.id and m.author.id == author.id and not m.author.bot
@@ -270,38 +390,29 @@ class Profil(commands.Cog):
         return view.result
 
     # ---------- rendu de l'image de profil ----------
-    def _render_profile(self, character_id) -> str:
+    async def _render_profile(self, character_id) -> str:
         p = db.get_or_create_profile(character_id)
         char = get_character(character_id)
         name = char["character_name"] if char else "?"
         clan_key = char["clan"] if char else None
-        if clan_key and clan_key != "sans_clan":
-            clan = clan_key.capitalize()
-        else:
-            clan = "Sans clan"
+        clan = clan_key.capitalize() if clan_key and clan_key != "sans_clan" else "Sans clan"
         rang = (char["grade"] if char and char["grade"] else None) or "///"
         portrait_path = char["portrait_path"] if char else None
         bg = db.get_background(character_id)
         background_path = bg["image_path"] if bg else None
 
-        def pct(a, b):
-            return round(a / b * 100) if b else 0
+        # Force / Vitesse / Défense sont DÉRIVÉES de character_stats (Défense = Endurance).
+        stats = []
+        for stat_key, display_name in [("force", "Force"), ("vitesse", "Vitesse"), ("endurance", "Défense")]:
+            total = await get_stat_total(character_id, stat_key)
+            level, xp_actuel, xp_max = points_to_level_xp(total)
+            pct = round(xp_actuel / xp_max * 100)
+            stats.append((display_name, level, pct, (xp_actuel, xp_max)))
 
-        stats = [
-            ("Force", p["force_level"], pct(p["force_xp_actuel"], p["force_xp_max"]),
-             (p["force_xp_actuel"], p["force_xp_max"])),
-            ("Vitesse", p["vitesse_level"], pct(p["vitesse_xp_actuel"], p["vitesse_xp_max"]),
-             (p["vitesse_xp_actuel"], p["vitesse_xp_max"])),
-            ("Défense", p["defense_level"], pct(p["defense_xp_actuel"], p["defense_xp_max"]),
-             (p["defense_xp_actuel"], p["defense_xp_max"])),
-        ]
-        # Les 4 maîtrises restent à niveau 1 / 0 % pour tout le monde, sans exception, tant que le
-        # futur système de maîtrises liées aux stats n'est pas développé (cf. TODO.md).
+        # Les 4 maîtrises restent à niveau 1 / 0 % pour tout le monde tant que leur système n'existe pas.
         maitrises = [
-            ("Maîtrise EO", 1, 0),
-            ("Maîtrise Sort", 1, 0),
-            ("Maîtrise Territoire", 1, 0),
-            ("RCT", 1, 0),
+            ("Maîtrise EO", 1, 0), ("Maîtrise Sort", 1, 0),
+            ("Maîtrise Territoire", 1, 0), ("RCT", 1, 0),
         ]
         path = _tmp_profile("profil")
         generate_profil_image(
@@ -313,14 +424,45 @@ class Profil(commands.Cog):
         return path
 
     async def send_profile(self, channel, character_id, user_id):
-        """Envoie l'image de profil + les boutons persistants (mode consultation joueur)."""
         char = get_character(character_id)
         slot = char["slot_number"] if char else 1
-        path = self._render_profile(character_id)
+        path = await self._render_profile(character_id)
         await channel.send(
             file=discord.File(path, filename="profil.png"),
             view=ProfileView(character_id, user_id, slot),
         )
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    # ---------- rendu de l'image Stats ----------
+    async def _render_stats(self, character_id):
+        """Retourne (chemin_image, points_restants)."""
+        s = db.get_or_create_stats(character_id)
+        char = get_character(character_id)
+        name = char["character_name"] if char else "?"
+        portrait_path = char["portrait_path"] if char else None
+        stats = []
+        for key in STAT_KEYS:
+            base = s[f"{key}_pts"]
+            total = await get_stat_total(character_id, key)
+            _num, pct, tranche = compute_tranche(base)
+            stats.append((STAT_DISPLAY_NAMES[key], STAT_COLORS[key], base, total, pct, tranche))
+        buffs = []
+        for bname, effects in db.get_buffs_with_effects(character_id):
+            parts = " · ".join(
+                f"{STAT_DISPLAY_NAMES.get(k, k)} {'+' if pts >= 0 else ''}{pts}" for k, pts in effects
+            )
+            buffs.append(f"{bname}  →  {parts}" if parts else bname)
+        path = _tmp_profile("stats")
+        generate_stats_image(name, stats, buffs, s["points_restants"], path, portrait_path=portrait_path)
+        return path, s["points_restants"]
+
+    async def send_stats(self, channel, character_id, user_id):
+        path, points_restants = await self._render_stats(character_id)
+        view = StatsPageView(character_id, user_id) if points_restants > 0 else None
+        await channel.send(file=discord.File(path, filename="stats.png"), view=view)
         try:
             os.remove(path)
         except OSError:
@@ -358,6 +500,10 @@ class Profil(commands.Cog):
             await self.handle_fond(interaction, cid)
         elif cid.startswith("profil_edit:"):
             await self.handle_edit(interaction, cid)
+        elif cid.startswith("profil_todo_stats:"):
+            await self.handle_stats(interaction, cid)
+        elif cid.startswith("stats_repartir:"):
+            await self.handle_repartir(interaction, cid)
         elif cid.startswith("profil_todo_"):
             await interaction.response.send_message(
                 "🔧 Cette section n'est pas encore développée.", ephemeral=True
@@ -385,6 +531,7 @@ class Profil(commands.Cog):
                 "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True
             )
             return
+        character_id = None
         try:
             await interaction.response.send_message("🔧 Gestion d'un profil…", ephemeral=True)
             channel = interaction.channel
@@ -402,17 +549,15 @@ class Profil(commands.Cog):
             character_id = await self.select_character_await(
                 channel, target, interaction.user.id, "Ce joueur n'a aucun personnage validé."
             )
-            if character_id is None:
-                return
         finally:
             self._release(user_id)
 
-        # Menu d'action staff (hors verrou : plus aucune saisie texte n'est en attente ici).
-        embed = discord.Embed(
-            title="🔧 Gestion du profil", description="Que veux tu faire pour ce profil ?",
-            color=PHOENIX_COLOR,
-        )
-        await interaction.channel.send(embed=embed, view=StaffActionView(character_id, interaction.user.id))
+        if character_id is not None:
+            embed = discord.Embed(
+                title="🔧 Gestion du profil", description="Que veux tu faire pour ce profil ?",
+                color=PHOENIX_COLOR,
+            )
+            await interaction.channel.send(embed=embed, view=StaffActionView(character_id, interaction.user.id))
 
     async def handle_roles(self, interaction, cid):
         _, character_id, user_id = cid.split(":")
@@ -430,10 +575,102 @@ class Profil(commands.Cog):
             names.append(role.mention if role else f"`{rid}` (rôle supprimé)")
         embed = discord.Embed(
             title="🎭 Rôles virtuels du personnage",
-            description="\n".join(f"• {n}" for n in names),
-            color=PHOENIX_COLOR,
+            description="\n".join(f"• {n}" for n in names), color=PHOENIX_COLOR,
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # =================================================================
+    # PAGE STATS + RÉPARTITION (joueur)
+    # =================================================================
+    async def handle_stats(self, interaction, cid):
+        _, character_id, user_id = cid.split(":")  # profil_todo_stats:{cid}:{uid}
+        character_id, user_id = int(character_id), int(user_id)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self.send_stats(interaction.channel, character_id, user_id)
+
+    async def handle_repartir(self, interaction, cid):
+        _, character_id, user_id = cid.split(":")
+        character_id, user_id = int(character_id), int(user_id)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
+            return
+        if not self._acquire(user_id):
+            await interaction.response.send_message(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True
+            )
+            return
+        try:
+            await interaction.response.send_message("🎯 Répartition des points…", ephemeral=True)
+            channel = interaction.channel
+            s = db.get_or_create_stats(character_id)
+            if s["points_restants"] <= 0:
+                await channel.send("Tu n'as aucun point à répartir.")
+                return
+            stat = await self._pick_stat(channel, interaction.user, PLAYER_DISTRIBUABLE_STATS)
+            if stat is None:
+                await channel.send("⏳ Répartition annulée.")
+                return
+            new_rest = None
+            while new_rest is None:
+                await channel.send("Combien de points veux tu y mettre ?")
+                m = await self.wait_message(channel, interaction.user)
+                if m is None:
+                    await channel.send("⏳ Répartition annulée.")
+                    return
+                n = _parse_int(m.content, minimum=1)
+                if n is None:
+                    await channel.send("Entre un nombre entier positif.")
+                    continue
+                remaining = db.get_or_create_stats(character_id)["points_restants"]
+                if n > remaining:
+                    await channel.send(f"Tu n'as que {remaining} points restants.")
+                    continue
+                new_rest = db.add_stat_points_from_pool(character_id, stat, n)
+                if new_rest is None:  # course : le solde a bougé entre temps
+                    await channel.send(
+                        f"Tu n'as que {db.get_or_create_stats(character_id)['points_restants']} points restants."
+                    )
+            await channel.send(embed=discord.Embed(
+                description=f"{n} points répartis dans {STAT_DISPLAY_NAMES[stat]}. Points restants : {new_rest}.",
+                color=PHOENIX_COLOR,
+            ))
+            await self.send_stats(channel, character_id, user_id)
+        finally:
+            self._release(user_id)
+
+    async def _pick_stat(self, channel, user, allowed_keys):
+        await channel.send(embed=discord.Embed(
+            title="Choisis une statistique",
+            description="\n".join(f"• {STAT_DISPLAY_NAMES[k]}" for k in allowed_keys)
+                        + "\n\nÉcris le nom (ou le début) de la stat.",
+            color=PHOENIX_COLOR,
+        ))
+        while True:
+            m = await self.wait_message(channel, user)
+            if m is None:
+                return None
+            cands = match_stat(m.content, allowed_keys)
+            if not cands:
+                await channel.send("Statistique inconnue, réessaie.")
+                continue
+            if len(cands) == 1:
+                return cands[0]
+            lines = [f"**{i + 1}.** {STAT_DISPLAY_NAMES[k]}" for i, k in enumerate(cands)]
+            await channel.send(embed=discord.Embed(
+                title="Plusieurs stats correspondent",
+                description="\n".join(lines) + "\n\nRéponds avec le numéro.", color=PHOENIX_COLOR,
+            ))
+            while True:
+                mm = await self.wait_message(channel, user)
+                if mm is None:
+                    return None
+                c = mm.content.strip()
+                if c.isdigit() and 1 <= int(c) <= len(cands):
+                    return cands[int(c) - 1]
+                await channel.send(f"Réponds avec un numéro entre 1 et {len(cands)}.")
 
     # =================================================================
     # AJOUT / REMPLACEMENT DU FOND (joueur propriétaire OU staff via /profil)
@@ -467,9 +704,8 @@ class Profil(commands.Cog):
         await self.send_profile(channel, character_id, user.id)
 
     async def _await_and_save_image(self, channel, user, dest_dir, filename):
-        """Attend une image (pièce jointe/lien, JPG/PNG, pas de GIF), la télécharge, la compresse en
-        JPEG (même logique que l'upload de portrait de /depart) et l'écrit dans dest_dir/filename.
-        Redemande tant que l'image n'est pas valide. Retourne le chemin sauvegardé, ou None (timeout)."""
+        """Attend une image (JPG/PNG, pas de GIF), la télécharge, la compresse en JPEG (même logique
+        que /depart) et l'écrit dans dest_dir/filename. Redemande si invalide. None si timeout."""
         while True:
             m = await self.wait_message(channel, user)
             if m is None:
@@ -512,7 +748,6 @@ class Profil(commands.Cog):
         try:
             await interaction.response.send_message("✏️ Modification du profil…", ephemeral=True)
             channel = interaction.channel
-
             n = None
             while n is None:
                 await channel.send("Combien de modifications veux tu faire ?")
@@ -523,11 +758,10 @@ class Profil(commands.Cog):
                 n = _parse_int(m.content, minimum=1)
                 if n is None:
                     await channel.send("Entre un nombre entier positif.")
-
             for i in range(n):
                 await channel.send(f"**Modification {i + 1}/{n}**")
                 ok = await self._one_edit(channel, interaction.user, character_id)
-                if ok is None:  # timeout
+                if ok is None:
                     await channel.send("⏳ Session expirée, modifications interrompues.")
                     return
             await channel.send("Toutes les modifications ont été appliquées.")
@@ -535,17 +769,18 @@ class Profil(commands.Cog):
             self._release(user_id)
 
     def _params_embed(self) -> discord.Embed:
-        lines = []
-        for key, aliases in PARAM_ALIASES.items():
-            lines.append(f"**{key}** — {aliases[0]}")
-        return discord.Embed(
-            title="Paramètres modifiables",
-            description="\n".join(lines) + "\n\nÉcris le nom du paramètre à modifier.",
-            color=PHOENIX_COLOR,
+        desc = (
+            "**PROFIL :**\n"
+            "PV maximum, PV minimum, EO maximum, EO minimum, Level, XP maximum, XP minimum, "
+            "Clan, Rang, Victoires, Défaites, Nuls, Level maîtrise EO, Image, Fond\n\n"
+            "**STATS :**\n"
+            "Stats Force, Stats Vitesse, Stats Endurance, Stats Armes maudites, Stats RCT, "
+            "Stats Territoire, Stats Sorts, Stats Énergie occulte, Buff, Points de stats\n\n"
+            "Écris le nom du paramètre à modifier."
         )
+        return discord.Embed(title="Paramètres modifiables", description=desc, color=PHOENIX_COLOR)
 
     async def _pick_param(self, channel, user):
-        """Fait choisir un paramètre par nom (préfixe, numéroté si ambigu). None si timeout."""
         while True:
             m = await self.wait_message(channel, user)
             if m is None:
@@ -572,8 +807,7 @@ class Profil(commands.Cog):
                 await channel.send(f"Réponds avec un numéro entre 1 et {len(candidates)}.")
 
     async def _one_edit(self, channel, staff, character_id):
-        """Une modification complète. Retourne True si traitée (même invalide→réessai résolu), None si
-        timeout dur (pour interrompre proprement)."""
+        """Une modification. Retourne True si traitée, None si timeout dur (interruption propre)."""
         await channel.send(embed=self._params_embed())
         param = await self._pick_param(channel, staff)
         if param is None:
@@ -587,8 +821,6 @@ class Profil(commands.Cog):
             saved = await self._await_and_save_image(channel, staff, PORTRAIT_DIR, f"{owner_uid}_{slot}.jpg")
             if saved is None:
                 return None
-            # portrait_path lu à chaque appel par generate_slots_image ET par le profil -> l'UPDATE
-            # se répercute partout automatiquement, aucune autre action nécessaire.
             with db.get_connection() as conn:
                 conn.execute("UPDATE validated_characters SET portrait_path = ? WHERE id = ?", (saved, character_id))
             await channel.send("✅ Portrait mis à jour (visible partout : sélection de personnage et profil).")
@@ -605,6 +837,9 @@ class Profil(commands.Cog):
             await self.send_profile(channel, character_id, staff.id)
             return True
 
+        if param == "buff":
+            return await self._edit_buff(channel, staff, character_id)
+
         # Paramètres à valeur textuelle / numérique.
         await channel.send(f"Nouvelle valeur pour **{param}** ({PARAM_ALIASES[param][0]}) ?")
         while True:
@@ -615,19 +850,117 @@ class Profil(commands.Cog):
             await channel.send(msg)
             if ok:
                 await self.send_profile(channel, character_id, staff.id)
+                if param in _STATS_AFFECTING:
+                    await self.send_stats(channel, character_id, staff.id)
                 return True
-            # invalide : on redemande la valeur (le paramètre reste choisi)
+            # invalide : on redemande la valeur
 
+    # ---------- gestion des buffs (staff) ----------
+    async def _edit_buff(self, channel, staff, character_id):
+        view = BuffChoiceView(staff.id)
+        await channel.send(
+            embed=discord.Embed(description="Gestion des buffs : ajouter ou retirer ?", color=PHOENIX_COLOR),
+            view=view,
+        )
+        await view.wait()
+        if view.result == "remove":
+            return await self._buff_remove(channel, staff, character_id)
+        if view.result == "add":
+            return await self._buff_add(channel, staff, character_id)
+        await channel.send("Aucun choix, modification ignorée.")
+        return True
+
+    async def _buff_remove(self, channel, staff, character_id):
+        names = db.get_buff_names(character_id)
+        if not names:
+            await channel.send("Ce personnage n'a aucun buff actif, rien à retirer.")
+            return True
+        lines = [f"**{i + 1}.** {nm}" for i, nm in enumerate(names)]
+        await channel.send(embed=discord.Embed(
+            title="Buffs actifs", description="\n".join(lines) + "\n\nÉcris le nom ou le numéro du buff à retirer.",
+            color=PHOENIX_COLOR,
+        ))
+        chosen = None
+        while chosen is None:
+            m = await self.wait_message(channel, staff)
+            if m is None:
+                return None
+            c = m.content.strip()
+            if c.isdigit() and 1 <= int(c) <= len(names):
+                chosen = names[int(c) - 1]
+                break
+            low = c.lower()
+            exact = [nm for nm in names if nm.lower() == low]
+            pref = [nm for nm in names if nm.lower().startswith(low)]
+            if exact:
+                chosen = exact[0]
+            elif len(pref) == 1:
+                chosen = pref[0]
+            else:
+                await channel.send("Buff introuvable, réponds par le nom exact ou le numéro.")
+        db.remove_buff(character_id, chosen)
+        await channel.send(f"✅ Buff « {chosen} » retiré.")
+        await self.send_stats(channel, character_id, staff.id)
+        await self.send_profile(channel, character_id, staff.id)
+        return True
+
+    async def _buff_add(self, channel, staff, character_id):
+        await channel.send("Quel est le nom de ce buff ?")
+        m = await self.wait_message(channel, staff)
+        if m is None:
+            return None
+        buff_name = m.content.strip()
+        if not buff_name:
+            await channel.send("Nom vide, buff annulé.")
+            return True
+        buff_id = db.add_buff(character_id, buff_name)
+
+        n = None
+        while n is None:
+            await channel.send("Combien de stats ce buff concerne t il ?")
+            m = await self.wait_message(channel, staff)
+            if m is None:
+                return None
+            n = _parse_int(m.content, minimum=1)
+            if n is None:
+                await channel.send("Entre un nombre entier positif.")
+
+        recap = []
+        for i in range(n):
+            await channel.send(f"**Stat {i + 1}/{n}** — laquelle ? (parmi les 8, aucune restriction)")
+            stat = await self._pick_stat(channel, staff, list(STAT_KEYS))
+            if stat is None:
+                return None
+            pts = None
+            while pts is None:
+                await channel.send(
+                    f"Combien de points **{STAT_DISPLAY_NAMES[stat]}** donne ce buff ? (entier, négatif possible)"
+                )
+                mm = await self.wait_message(channel, staff)
+                if mm is None:
+                    return None
+                pts = _parse_any_int(mm.content)
+                if pts is None:
+                    await channel.send("Entre un entier (ex : 200 ou -50).")
+            db.add_buff_effect(buff_id, stat, pts)
+            recap.append(f"{STAT_DISPLAY_NAMES[stat]} {'+' if pts >= 0 else ''}{pts}")
+
+        await channel.send(f"✅ Buff « {buff_name} » créé : " + " · ".join(recap))
+        await self.send_stats(channel, character_id, staff.id)
+        await self.send_profile(channel, character_id, staff.id)
+        return True
+
+    # ---------- application d'un paramètre scalaire ----------
     def _apply_scalar(self, character_id, param, raw):
-        """Valide + applique un paramètre non-image. Retourne (ok: bool, message)."""
+        """Valide + applique un paramètre non-image/non-buff. Retourne (ok: bool, message)."""
         p = db.get_or_create_profile(character_id)
 
-        # --- PV / EO (avec clamp de l'actuel sous son max) ---
+        # --- PV / EO (clamp de l'actuel sous son max) ---
         if param in ("pv_max", "eo_max"):
             v = _parse_int(raw, minimum=1)
             if v is None:
                 return False, "❌ Valeur invalide (entier positif attendu)."
-            base = param.split("_")[0]  # "pv" / "eo"
+            base = param.split("_")[0]
             actuel_col = f"{base}_actuel"
             new_actuel = min(p[actuel_col], v)
             db.update_profile(character_id, **{param: v, actuel_col: new_actuel})
@@ -641,41 +974,57 @@ class Profil(commands.Cog):
             db.update_profile(character_id, **{param: v})
             return True, f"✅ {param} = {v}."
 
-        # --- XP global (level / xp_max / xp_actuel cohérents) ---
+        # --- Niveau GÉNÉRAL du profil (character_profiles) ---
         if param in ("level", "xp_max", "xp_actuel"):
             v = _parse_int(raw, minimum=(1 if param == "level" else 0))
             if v is None:
                 return False, "❌ Valeur invalide (entier positif attendu)."
             lvl, xa, xm = sync_level_and_xp(
-                cur_level=p["level"], cur_xp_actuel=p["xp_actuel"], cur_xp_max=p["xp_max"],
-                **{param: v},
+                cur_level=p["level"], cur_xp_actuel=p["xp_actuel"], cur_xp_max=p["xp_max"], **{param: v},
             )
             db.update_profile(character_id, level=lvl, xp_actuel=xa, xp_max=xm)
             return True, f"✅ Niveau {lvl} — {xa}/{xm} XP."
 
-        # --- Force / Vitesse / Défense ---
-        for base in STAT_BASES:
-            if param == f"{base}_pct":
+        # --- Stats (points) : écriture ABSOLUE dans character_stats ---
+        if param in STATS_PARAM_MAP:
+            v = _parse_int(raw, minimum=0)
+            if v is None:
+                return False, "❌ Valeur invalide (entier positif ou nul attendu)."
+            key = STATS_PARAM_MAP[param]
+            db.set_stat_base_pts(character_id, key, v)
+            return True, f"✅ {STAT_DISPLAY_NAMES[key]} (base) = {v} pts."
+        if param == "points_stats":
+            v = _parse_int(raw, minimum=0)
+            if v is None:
+                return False, "❌ Valeur invalide (entier positif ou nul attendu)."
+            db.set_points_restants(character_id, v)
+            return True, f"✅ Points de stats restants = {v}."
+
+        # --- Anciens paramètres Force/Vitesse/Défense : convertis en points de character_stats ---
+        # (Défense = Endurance). base = total_voulu(level/xp) - buffs actuels, clampé à 0.
+        for legacy, stat_key in LEGACY_STAT_MAP.items():
+            if param == f"{legacy}_pct" or param in (f"{legacy}_level", f"{legacy}_xp_max", f"{legacy}_xp_actuel"):
                 v = _parse_int(raw, minimum=0)
-                if v is None or v > 100:
-                    return False, "❌ Pourcentage invalide (0 à 100)."
-                xm = p[f"{base}_xp_max"]
-                xa = max(0, min(round(v / 100 * xm), xm))
-                db.update_profile(character_id, **{f"{base}_xp_actuel": xa})
-                return True, f"✅ {base.capitalize()} : {v}% ({xa}/{xm} XP)."
-            if param in (f"{base}_level", f"{base}_xp_max", f"{base}_xp_actuel"):
-                field = param[len(base) + 1:]  # level / xp_max / xp_actuel
-                v = _parse_int(raw, minimum=(1 if field == "level" else 0))
                 if v is None:
                     return False, "❌ Valeur invalide (entier positif attendu)."
-                lvl, xa, xm = sync_level_and_xp(
-                    cur_level=p[f"{base}_level"], cur_xp_actuel=p[f"{base}_xp_actuel"],
-                    cur_xp_max=p[f"{base}_xp_max"], **{field: v},
-                )
-                db.update_profile(character_id, **{
-                    f"{base}_level": lvl, f"{base}_xp_actuel": xa, f"{base}_xp_max": xm,
-                })
-                return True, f"✅ {base.capitalize()} : niveau {lvl} — {xa}/{xm} XP."
+                field = "pct" if param.endswith("_pct") else param[len(legacy) + 1:]
+                buffs = db.sum_buff_points(character_id, stat_key)
+                total_now = db.get_stat_base_pts(character_id, stat_key) + buffs
+                level, xp, _ = points_to_level_xp(total_now)
+                if field == "level":
+                    level = max(1, v)
+                elif field == "xp_actuel":
+                    xp = max(0, min(v, 1000))
+                elif field == "pct":
+                    xp = max(0, min(round(v / 100 * 1000), 1000))
+                elif field == "xp_max":  # legacy : borne l'XP courant (xp_max vaut 1000 dans ce modèle)
+                    xp = max(0, min(xp, v))
+                target_total = level_xp_to_points(level, xp)
+                new_base = max(0, target_total - buffs)
+                db.set_stat_base_pts(character_id, stat_key, new_base)
+                lvl_disp = points_to_level_xp(new_base + buffs)[0]
+                return True, (f"✅ {STAT_DISPLAY_NAMES[stat_key]} : base {new_base} pts "
+                              f"(buffs {'+' if buffs >= 0 else ''}{buffs}, niveau total {lvl_disp}).")
 
         # --- Compteurs de combat ---
         if param in ("victoires", "defaites", "nuls"):
@@ -685,7 +1034,7 @@ class Profil(commands.Cog):
             db.update_profile(character_id, **{param: v})
             return True, f"✅ {param} = {v}."
 
-        # --- Maîtrise EO ---
+        # --- Maîtrise EO (stockée, mais l'affichage reste 0 % tant que le système n'existe pas) ---
         if param == "maitrise_eo_level":
             v = _parse_int(raw, minimum=1)
             if v is None:
@@ -693,13 +1042,12 @@ class Profil(commands.Cog):
             db.update_profile(character_id, maitrise_eo_level=v)
             return True, f"✅ Niveau de Maîtrise EO = {v}."
 
-        # --- Clan (validation contre les clans existants + sans_clan) ---
+        # --- Clan ---
         if param == "clan":
             key = raw.strip().lower()
             valid = set(db.load_clan_state()["clans"].keys()) | {"sans_clan"}
             if key not in valid:
-                dispo = ", ".join(sorted(valid))
-                return False, f"❌ Clan inconnu. Clans valides : {dispo}."
+                return False, f"❌ Clan inconnu. Clans valides : {', '.join(sorted(valid))}."
             with db.get_connection() as conn:
                 conn.execute("UPDATE validated_characters SET clan = ? WHERE id = ?", (key, character_id))
             return True, f"✅ Clan = {key.capitalize() if key != 'sans_clan' else 'Sans clan'}."

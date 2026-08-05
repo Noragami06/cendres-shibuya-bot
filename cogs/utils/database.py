@@ -213,6 +213,9 @@ CREATE TABLE IF NOT EXISTS character_virtual_roles (
     UNIQUE(character_id, role_id)
 );
 
+-- force_level/vitesse_level/defense_level et leurs xp_actuel/xp_max ne sont plus utilisés :
+-- Force/Vitesse/Défense sont maintenant entièrement dérivées de character_stats
+-- (force_pts/vitesse_pts/endurance_pts + buffs), calculées à la volée à chaque affichage.
 CREATE TABLE IF NOT EXISTS character_profiles (
     character_id INTEGER PRIMARY KEY,
     pv_actuel INTEGER DEFAULT 100,
@@ -241,6 +244,32 @@ CREATE TABLE IF NOT EXISTS character_backgrounds (
     character_id INTEGER PRIMARY KEY,
     image_path TEXT,
     uploaded_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS character_stats (
+    character_id INTEGER PRIMARY KEY,
+    force_pts INTEGER DEFAULT 0,
+    rct_pts INTEGER DEFAULT 0,
+    vitesse_pts INTEGER DEFAULT 0,
+    territoire_pts INTEGER DEFAULT 0,
+    endurance_pts INTEGER DEFAULT 0,
+    sorts_pts INTEGER DEFAULT 0,
+    armes_maudites_pts INTEGER DEFAULT 0,
+    energie_occulte_pts INTEGER DEFAULT 0,
+    points_restants INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS character_buffs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id INTEGER,
+    buff_name TEXT
+);
+
+CREATE TABLE IF NOT EXISTS character_buff_effects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    buff_id INTEGER,
+    stat_key TEXT,
+    points INTEGER
 );
 """
 
@@ -858,6 +887,152 @@ def set_background(character_id: int, image_path: str, uploaded_at: str):
             "INSERT OR REPLACE INTO character_backgrounds (character_id, image_path, uploaded_at) "
             "VALUES (?, ?, ?)",
             (character_id, image_path, uploaded_at),
+        )
+
+
+# ---------- Statistiques de personnage (points liés + buffs) ----------
+_STAT_KEYS_DB = ("force", "rct", "vitesse", "territoire", "endurance", "sorts", "armes_maudites", "energie_occulte")
+
+
+def _stat_col(stat_key: str) -> str:
+    """Nom de colonne _pts sûr (whitelist) pour éviter toute injection dans un SQL dynamique."""
+    if stat_key not in _STAT_KEYS_DB:
+        raise ValueError(f"stat inconnue : {stat_key}")
+    return f"{stat_key}_pts"
+
+
+def create_stats_default(character_id: int):
+    """Crée la ligne character_stats par défaut (tout à 0, points_restants à 0 pour l'instant).
+    Appelé à la validation de fiche. Idempotent."""
+    with get_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO character_stats (character_id) VALUES (?)", (character_id,))
+
+
+def get_or_create_stats(character_id: int):
+    with get_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO character_stats (character_id) VALUES (?)", (character_id,))
+        return conn.execute(
+            "SELECT * FROM character_stats WHERE character_id = ?", (character_id,)
+        ).fetchone()
+
+
+def get_stat_base_pts(character_id: int, stat_key: str) -> int:
+    col = _stat_col(stat_key)
+    with get_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO character_stats (character_id) VALUES (?)", (character_id,))
+        row = conn.execute(
+            f"SELECT {col} AS v FROM character_stats WHERE character_id = ?", (character_id,)
+        ).fetchone()
+    return row["v"] if row else 0
+
+
+def set_stat_base_pts(character_id: int, stat_key: str, value: int):
+    """Écriture ABSOLUE de la base d'une stat (remplacement, pas additif)."""
+    col = _stat_col(stat_key)
+    with get_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO character_stats (character_id) VALUES (?)", (character_id,))
+        conn.execute(
+            f"UPDATE character_stats SET {col} = ? WHERE character_id = ?", (int(value), character_id)
+        )
+
+
+def add_stat_points_from_pool(character_id: int, stat_key: str, n: int):
+    """Répartition joueur : +n sur la stat et -n sur points_restants, ATOMIQUE. Retourne le nouveau
+    points_restants, ou None si le solde de points est insuffisant (aucune modification faite)."""
+    col = _stat_col(stat_key)
+    with get_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO character_stats (character_id) VALUES (?)", (character_id,))
+        row = conn.execute(
+            "SELECT points_restants FROM character_stats WHERE character_id = ?", (character_id,)
+        ).fetchone()
+        if row is None or row["points_restants"] < n:
+            return None
+        conn.execute(
+            f"UPDATE character_stats SET {col} = {col} + ?, points_restants = points_restants - ? "
+            "WHERE character_id = ?",
+            (n, n, character_id),
+        )
+        new = conn.execute(
+            "SELECT points_restants FROM character_stats WHERE character_id = ?", (character_id,)
+        ).fetchone()
+    return new["points_restants"]
+
+
+def set_points_restants(character_id: int, value: int):
+    with get_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO character_stats (character_id) VALUES (?)", (character_id,))
+        conn.execute(
+            "UPDATE character_stats SET points_restants = ? WHERE character_id = ?", (int(value), character_id)
+        )
+
+
+def sum_buff_points(character_id: int, stat_key: str) -> int:
+    """Somme des effets de buffs actifs pour une stat précise (0 si aucun)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(cbe.points), 0) AS s FROM character_buff_effects cbe "
+            "JOIN character_buffs cb ON cbe.buff_id = cb.id "
+            "WHERE cb.character_id = ? AND cbe.stat_key = ?",
+            (character_id, stat_key),
+        ).fetchone()
+    return row["s"] if row else 0
+
+
+def add_buff(character_id: int, buff_name: str) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO character_buffs (character_id, buff_name) VALUES (?, ?)", (character_id, buff_name)
+        )
+        return cur.lastrowid
+
+
+def add_buff_effect(buff_id: int, stat_key: str, points: int):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO character_buff_effects (buff_id, stat_key, points) VALUES (?, ?, ?)",
+            (buff_id, stat_key, int(points)),
+        )
+
+
+def get_buff_names(character_id: int):
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT buff_name FROM character_buffs WHERE character_id = ? ORDER BY buff_name",
+            (character_id,),
+        ).fetchall()
+    return [r["buff_name"] for r in rows]
+
+
+def get_buffs_with_effects(character_id: int):
+    """Pour l'affichage : [(buff_name, [(stat_key, points), ...]), ...], regroupé par buff_name."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT cb.buff_name, cbe.stat_key, cbe.points FROM character_buffs cb "
+            "LEFT JOIN character_buff_effects cbe ON cbe.buff_id = cb.id "
+            "WHERE cb.character_id = ? ORDER BY cb.id, cbe.id",
+            (character_id,),
+        ).fetchall()
+    grouped, order = {}, []
+    for r in rows:
+        name = r["buff_name"]
+        if name not in grouped:
+            grouped[name] = []
+            order.append(name)
+        if r["stat_key"] is not None:
+            grouped[name].append((r["stat_key"], r["points"]))
+    return [(name, grouped[name]) for name in order]
+
+
+def remove_buff(character_id: int, buff_name: str):
+    """Supprime un buff (par nom) et tous ses effets."""
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM character_buff_effects WHERE buff_id IN "
+            "(SELECT id FROM character_buffs WHERE character_id = ? AND buff_name = ?)",
+            (character_id, buff_name),
+        )
+        conn.execute(
+            "DELETE FROM character_buffs WHERE character_id = ? AND buff_name = ?", (character_id, buff_name)
         )
 
 

@@ -1708,6 +1708,8 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
         ).fetchone()
     if prof_row is not None:
         db.create_profile_from_fiche(prof_row["id"], progress.get("eo_value"))
+        # Ligne de stats par défaut (tout à 0). Points de départ à définir (cf. TODO.md).
+        db.create_stats_default(prof_row["id"])
 
     # 3 bis) Place de clan : comptage basé sur la base (TOUS les personnages du clan, slots réels ET
     # virtuels), APRÈS l'insertion pour inclure ce nouveau personnage. Ferme / redistribue si le cap
@@ -2866,6 +2868,14 @@ def delete_character_cascade(character_id):
         # Profil (/profil) et fond d'écran propres au personnage
         conn.execute("DELETE FROM character_profiles WHERE character_id = ?", (character_id,))
         conn.execute("DELETE FROM character_backgrounds WHERE character_id = ?", (character_id,))
+        # Statistiques + buffs (et effets de buffs via sous requête sur buff_id)
+        conn.execute("DELETE FROM character_stats WHERE character_id = ?", (character_id,))
+        conn.execute(
+            "DELETE FROM character_buff_effects WHERE buff_id IN "
+            "(SELECT id FROM character_buffs WHERE character_id = ?)",
+            (character_id,),
+        )
+        conn.execute("DELETE FROM character_buffs WHERE character_id = ?", (character_id,))
 
 
 class DeleteConfirmView(discord.ui.View):
