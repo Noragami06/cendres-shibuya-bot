@@ -20,6 +20,7 @@
 - [ ] Système de niveau général (Level/XP) : actuellement fixé à niveau 1 / 0 XP pour tout le monde à la création, formule temporaire (N*1000 XP par niveau) en attendant le vrai système.
 - [ ] Force / Vitesse / Défense : actuellement fixées à niveau 1 / 0% pour tout le monde à la création, doivent être liées à un futur système de statistiques pas encore développé. Les 4 Maîtrises (EO/Sort/Territoire/RCT) dépendront aussi de ce futur système une fois prêt.
 - [ ] Définir combien de points de stats un personnage reçoit à la création de sa fiche (actuellement `points_restants` = 0 par défaut dans character_stats).
+- [x] Système de stockage des relations (famille/amis/autres) : table `character_relations` + ajout/retrait par le joueur (sur son perso) ou le staff (sur n'importe qui), via les boutons de la page 🤝 Relation.
 
 ## Divers
 

@@ -271,6 +271,14 @@ CREATE TABLE IF NOT EXISTS character_buff_effects (
     stat_key TEXT,
     points INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS character_relations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id INTEGER,
+    related_character_id INTEGER,
+    category TEXT,
+    label TEXT
+);
 """
 
 
@@ -1033,6 +1041,93 @@ def remove_buff(character_id: int, buff_name: str):
         )
         conn.execute(
             "DELETE FROM character_buffs WHERE character_id = ? AND buff_name = ?", (character_id, buff_name)
+        )
+
+
+# ---------- Relations / liens entre personnages (/profil -> 🤝 Relation) ----------
+_RELATION_CATEGORIES = ("Famille", "Amis", "Autres")
+
+
+def add_relation(character_id: int, related_character_id: int, category: str, label: str) -> int:
+    """Crée un lien orienté de character_id vers related_character_id (catégorie + intitulé libre).
+    Retourne l'id de la ligne créée. Un même couple peut avoir plusieurs liens (catégories/labels
+    différents) : c'est volontaire, on n'impose pas d'unicité."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO character_relations (character_id, related_character_id, category, label) "
+            "VALUES (?, ?, ?, ?)",
+            (character_id, related_character_id, category, label),
+        )
+        return cur.lastrowid
+
+
+def get_relations(character_id: int):
+    """Liste des liens du personnage : [(id, related_character_id, category, label, related_name), ...]
+    dans l'ordre de création. related_name vient d'un JOIN sur validated_characters (None si le
+    personnage lié a été supprimé — ne devrait plus arriver grâce au nettoyage cascade)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT r.id, r.related_character_id, r.category, r.label, v.character_name AS related_name "
+            "FROM character_relations r "
+            "LEFT JOIN validated_characters v ON v.id = r.related_character_id "
+            "WHERE r.character_id = ? ORDER BY r.id ASC",
+            (character_id,),
+        ).fetchall()
+    return [
+        (r["id"], r["related_character_id"], r["category"], r["label"], r["related_name"])
+        for r in rows
+    ]
+
+
+def has_relations(character_id: int) -> bool:
+    """True si le personnage possède au moins un lien (pour n'afficher '➖ Retirer un lien' que si utile)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM character_relations WHERE character_id = ? LIMIT 1", (character_id,)
+        ).fetchone()
+    return row is not None
+
+
+def get_relations_between(character_id: int, related_character_id: int):
+    """Tous les liens existants de character_id VERS related_character_id (peut y en avoir plusieurs) :
+    [(id, category, label), ...]."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, category, label FROM character_relations "
+            "WHERE character_id = ? AND related_character_id = ? ORDER BY id ASC",
+            (character_id, related_character_id),
+        ).fetchall()
+    return [(r["id"], r["category"], r["label"]) for r in rows]
+
+
+def get_linked_characters_of_user(character_id: int, target_user_id: int, guild_id: int):
+    """Personnages validés de target_user_id qui ont AU MOINS UN lien reçu depuis character_id.
+    Retourne [(related_character_id, character_name, slot_number, nb_liens), ...]. Sert au flux
+    '➖ Retirer un lien' : on ne propose que les personnages réellement liés."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT v.id AS cid, v.character_name AS name, v.slot_number AS slot, COUNT(r.id) AS n "
+            "FROM validated_characters v "
+            "JOIN character_relations r ON r.related_character_id = v.id AND r.character_id = ? "
+            "WHERE v.user_id = ? AND v.guild_id = ? "
+            "GROUP BY v.id ORDER BY v.slot_number ASC",
+            (character_id, target_user_id, guild_id),
+        ).fetchall()
+    return [(r["cid"], r["name"], r["slot"], r["n"]) for r in rows]
+
+
+def delete_relation_by_id(relation_id: int):
+    """Supprime un lien précis (par son id)."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM character_relations WHERE id = ?", (relation_id,))
+
+
+def delete_relations_between(character_id: int, related_character_id: int):
+    """Supprime TOUS les liens de character_id vers related_character_id."""
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM character_relations WHERE character_id = ? AND related_character_id = ?",
+            (character_id, related_character_id),
         )
 
 

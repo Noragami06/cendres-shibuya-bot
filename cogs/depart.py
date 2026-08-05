@@ -2876,6 +2876,11 @@ def delete_character_cascade(character_id):
             (character_id,),
         )
         conn.execute("DELETE FROM character_buffs WHERE character_id = ?", (character_id,))
+        # Relations : le personnage disparaît de SES liens ET des liens que d'autres avaient créés vers lui.
+        conn.execute(
+            "DELETE FROM character_relations WHERE character_id = ? OR related_character_id = ?",
+            (character_id, character_id),
+        )
 
 
 class DeleteConfirmView(discord.ui.View):

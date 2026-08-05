@@ -969,3 +969,138 @@ def generate_stats_image(name, stats, buffs, points_restants, out_path, portrait
 
     img.save(out_path)
     return out_path
+
+
+REL_FAMILLE_COLOR = (230, 90, 90)
+REL_AMIS_COLOR = (100, 200, 150)
+REL_AUTRES_COLOR = (150, 120, 230)
+REL_CATEGORIES_ORDER = [("Famille", REL_FAMILLE_COLOR), ("Amis", REL_AMIS_COLOR), ("Autres", REL_AUTRES_COLOR)]
+
+
+def _rel_frame(d, xy, gold, width=3, radius=14):
+    d.rounded_rectangle(xy, radius=radius, outline=gold, width=width)
+
+
+def _rel_estimate_entry_height(d, person_name, max_card_w, f_name, f_label):
+    """Hauteur (carte + marge) qu'occupera une entrée, selon si le nom tient sur 1 ou 2 lignes."""
+    if text_w(d, person_name, f_name) > max_card_w - 24:
+        return 58 + 14
+    return 46 + 14
+
+
+def _rel_build_columns(relations: dict, max_column_height: int, col_w: int) -> list:
+    """
+    Construit la liste des colonnes à afficher (chunks), dans l'ordre Famille -> Amis -> Autres.
+    Chaque colonne déborde vers une NOUVELLE colonne de la MÊME catégorie si elle ne tient plus,
+    plutôt que de s'étirer verticalement.
+    Retourne une liste de dicts : {"category", "color", "is_continuation", "entries"}.
+    """
+    dummy_img = Image.new("RGBA", (10, 10))
+    dd = ImageDraw.Draw(dummy_img)
+    f_name = font(13, True)
+    f_label = font(11)
+    max_card_w = col_w - 40
+
+    columns = []
+    for cat, color in REL_CATEGORIES_ORDER:
+        entries = relations.get(cat, [])
+        if not entries:
+            columns.append({"category": cat, "color": color, "is_continuation": False, "entries": []})
+            continue
+        current_chunk = []
+        current_height = 0
+        is_first = True
+        for entry in entries:
+            person_name = entry[0]
+            entry_h = _rel_estimate_entry_height(dd, person_name, max_card_w, f_name, f_label)
+            if current_chunk and current_height + entry_h > max_column_height:
+                columns.append({"category": cat, "color": color, "is_continuation": not is_first, "entries": current_chunk})
+                current_chunk = []
+                current_height = 0
+                is_first = False
+            current_chunk.append(entry)
+            current_height += entry_h
+        columns.append({"category": cat, "color": color, "is_continuation": not is_first, "entries": current_chunk})
+    return columns
+
+
+def generate_relations_image(name: str, relations: dict, page: int, out_path: str, portrait_path=None):
+    """
+    relations : dict {"Famille": [(nom, lien), ...], "Amis": [...], "Autres": [...]}
+    page : numéro de page à générer (1-indexé)
+    Retourne (chemin_fichier, total_pages).
+    """
+    W, H = 1150, 780
+    col_w = (W - 40 * 2 - 40) // 3
+    max_column_height = H - 40 - 280  # espace vertical disponible dans une colonne
+
+    all_columns = _rel_build_columns(relations, max_column_height, col_w)
+    total_pages = max(1, (len(all_columns) + 2) // 3)
+    page = max(1, min(page, total_pages))
+    page_columns = all_columns[(page - 1) * 3: page * 3]
+
+    BG_R = (10, 9, 15, 255)
+    TEXT_R = (235, 235, 240, 255)
+    HEADER_COLOR_R = (255, 200, 60, 255)
+    gold = (232, 197, 121, 255)
+
+    img = Image.new("RGBA", (W, H), BG_R)
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, W, H), outline=gold, width=2)
+
+    # Hexagone : contour doré + photo recadrée dedans si portrait_path fourni, sinon remplissage uni.
+    # Un seul dessin cohérent, via _stats_hexagon (même principe que generate_stats_image).
+    _stats_hexagon(d, img, W - 110, 90, 65, gold, portrait_path)
+
+    title = f"RELATIONS DE {name.upper()}"
+    d.text((40, 40), title, font=font(26, True), fill=HEADER_COLOR_R)
+    if total_pages > 1:
+        page_txt = f"Page {page} / {total_pages}"
+        pw = text_w(d, page_txt, font(13))
+        d.text((W - 40 - pw, 168), page_txt, font=font(13), fill=(150, 148, 160, 255))
+    d.line((40, 190, W - 40, 190), fill=(55, 52, 65, 255), width=2)
+
+    f_name = font(13, True)
+    f_label = font(11)
+    max_card_w = col_w - 40
+
+    for i, col in enumerate(page_columns):
+        x = 40 + i * (col_w + 20)
+        color = col["color"]
+        _rel_frame(d, (x, 220, x + col_w, H - 40), color, width=3, radius=12)
+        cat_title = col["category"].upper() + (" (suite)" if col["is_continuation"] else "")
+        cw = text_w(d, cat_title, font(15, True))
+        d.text((x + col_w / 2 - cw / 2, 236), cat_title, font=font(15, True), fill=color)
+        d.line((x + 20, 264, x + col_w - 20, 264), fill=(50, 47, 58, 255), width=1)
+
+        yy = 280
+        for person_name, lien in col["entries"]:
+            content_w = max(text_w(d, person_name, f_name), text_w(d, lien, f_label))
+            card_w = min(max_card_w, content_w + 24)
+            if text_w(d, person_name, f_name) > max_card_w - 24:
+                words = person_name.split()
+                line1, line2 = "", ""
+                for w in words:
+                    trial = (line1 + " " + w).strip()
+                    if text_w(d, trial, f_name) <= max_card_w - 24:
+                        line1 = trial
+                    else:
+                        line2 = (line2 + " " + w).strip()
+                card_h = 58
+                cx0 = x + 20
+                d.rounded_rectangle((cx0, yy, cx0 + max_card_w, yy + card_h), radius=8, fill=(22, 20, 28, 255))
+                d.rectangle((cx0, yy, cx0 + 4, yy + card_h), fill=color)
+                d.text((cx0 + 14, yy + 6), line1, font=f_name, fill=TEXT_R)
+                d.text((cx0 + 14, yy + 22), line2, font=font(10, True), fill=TEXT_R)
+                d.text((cx0 + 14, yy + 40), lien, font=f_label, fill=color)
+            else:
+                card_h = 46
+                cx0 = x + 20
+                d.rounded_rectangle((cx0, yy, cx0 + card_w, yy + card_h), radius=8, fill=(22, 20, 28, 255))
+                d.rectangle((cx0, yy, cx0 + 4, yy + card_h), fill=color)
+                d.text((cx0 + 14, yy + 8), person_name, font=f_name, fill=TEXT_R)
+                d.text((cx0 + 14, yy + 26), lien, font=f_label, fill=color)
+            yy += card_h + 14
+
+    img.save(out_path)
+    return out_path, total_pages

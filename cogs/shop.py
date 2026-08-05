@@ -9,6 +9,9 @@
 #    immédiatement au premier clic pour empêcher les doubles exécutions.
 # 5. Toute suppression de personnage/objet/compte doit être ajoutée à delete_character_cascade()
 #    si une nouvelle table le référence.
+# 6. Toute action déclenchée par un bouton de confirmation/exécution doit systématiquement avoir
+#    une protection anti double-clic (retrait immédiat de la View + verrou en mémoire), appliquée
+#    par défaut à chaque nouveau bouton de ce type, sans attendre qu'on te le demande.
 
 import asyncio
 import os

@@ -8,7 +8,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from cogs.utils import database as db
-from cogs.utils.image_gen import generate_profil_image, generate_stats_image
+from cogs.utils.image_gen import generate_profil_image, generate_stats_image, generate_relations_image
 # Réutilise les helpers déjà en place (personnages / comptes / couleur).
 from cogs.banque import get_characters, get_character, PHOENIX_COLOR
 # Réutilise la validation + téléchargement + compression d'image du parcours /depart, et le rôle staff.
@@ -340,6 +340,96 @@ class StatsPageView(discord.ui.View):
             custom_id=f"stats_repartir:{character_id}:{user_id}"))
 
 
+class RelationsPageView(discord.ui.View):
+    """Boutons persistants sous l'image Relations :
+    - ligne 0 : pagination (uniquement si plusieurs pages ; page courante encodée dans le custom_id) ;
+    - ligne 1 : '➕ Créer un lien' (toujours) et '➖ Retirer un lien' (seulement s'il existe au moins
+      un lien pour ce personnage)."""
+
+    def __init__(self, character_id: int, user_id: int, page: int, total_pages: int, has_rel: bool):
+        super().__init__(timeout=None)
+        if total_pages > 1:
+            self.add_item(discord.ui.Button(
+                label="Page précédente", emoji="◀️", style=discord.ButtonStyle.secondary,
+                custom_id=f"rel_page_prev:{character_id}:{user_id}:{page}", disabled=(page <= 1), row=0))
+            self.add_item(discord.ui.Button(
+                label="Page suivante", emoji="▶️", style=discord.ButtonStyle.secondary,
+                custom_id=f"rel_page_next:{character_id}:{user_id}:{page}", disabled=(page >= total_pages), row=0))
+        self.add_item(discord.ui.Button(
+            label="Créer un lien", emoji="➕", style=discord.ButtonStyle.success,
+            custom_id=f"rel_create:{character_id}:{user_id}", row=1))
+        if has_rel:
+            self.add_item(discord.ui.Button(
+                label="Retirer un lien", emoji="➖", style=discord.ButtonStyle.danger,
+                custom_id=f"rel_remove:{character_id}:{user_id}", row=1))
+
+
+class RelationCategoryView(discord.ui.View):
+    """Choix du type de relation (Famille / Amis / Autres) — vue en session (le flux de création est
+    déjà verrouillé). Au clic, les 3 boutons sont désactivés pour figer visuellement le choix."""
+
+    CATS = [("Famille", "👨‍👩‍👧"), ("Amis", "🤝"), ("Autres", "❓")]
+
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=WAIT_TIMEOUT)
+        self.owner_id = owner_id
+        self.result = None
+        for label, emoji in self.CATS:
+            btn = discord.ui.Button(label=label, emoji=emoji, style=discord.ButtonStyle.secondary)
+            btn.callback = self._make_cb(label)
+            self.add_item(btn)
+
+    def _make_cb(self, category):
+        async def cb(interaction):
+            if interaction.user.id != self.owner_id:
+                await interaction.response.send_message("Ce choix ne t'appartient pas.", ephemeral=True)
+                return
+            self.result = category
+            for item in self.children:
+                item.disabled = True
+            await interaction.response.edit_message(view=self)
+            self.stop()
+        return cb
+
+
+class ReplaceRelationView(discord.ui.View):
+    """Confirmation de remplacement d'une relation existante — vue en session (flux déjà verrouillé).
+    result vaut "replace" ou "cancel"."""
+
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=WAIT_TIMEOUT)
+        self.owner_id = owner_id
+        self.result = None
+        self._done = False  # anti double clic (notamment sur "✅ Remplacer")
+        rep = discord.ui.Button(label="Remplacer", emoji="✅", style=discord.ButtonStyle.success)
+        can = discord.ui.Button(label="Annuler", emoji="❌", style=discord.ButtonStyle.danger)
+        rep.callback = self._make_cb("replace")
+        can.callback = self._make_cb("cancel")
+        self.add_item(rep)
+        self.add_item(can)
+
+    def _make_cb(self, result):
+        async def cb(interaction):
+            if interaction.user.id != self.owner_id:
+                await interaction.response.send_message("Ce choix ne t'appartient pas.", ephemeral=True)
+                return
+            # Anti double clic : le premier clic fige le choix (retrait des boutons) ; les suivants
+            # sont absorbés silencieusement pendant que le flux traite le résultat.
+            if self._done:
+                try:
+                    await interaction.response.defer()
+                except discord.HTTPException:
+                    pass
+                return
+            self._done = True
+            self.result = result
+            for item in self.children:
+                item.disabled = True
+            await interaction.response.edit_message(view=self)
+            self.stop()
+        return cb
+
+
 class StaffActionView(discord.ui.View):
     def __init__(self, character_id: int, user_id: int):
         super().__init__(timeout=None)
@@ -357,6 +447,9 @@ class Profil(commands.Cog):
         self._active_users = set()  # isolation des flux textuels par joueur (mémoire)
         # Répartitions de points en cours (character_id) : anti double clic sur "🎯 Répartir les points".
         self._repartir_lock = set()
+        # Flux de liens en cours, clés (user_id, character_id) : anti double clic sur les boutons
+        # "➕ Créer un lien" / "➖ Retirer un lien" (même principe que /shop et Répartir les points).
+        self._relation_lock = set()
 
     # ---------- verrou de flux ----------
     def _acquire(self, *user_ids) -> bool:
@@ -506,6 +599,16 @@ class Profil(commands.Cog):
             await self.handle_stats(interaction, cid)
         elif cid.startswith("stats_repartir:"):
             await self.handle_repartir(interaction, cid)
+        elif cid.startswith("profil_todo_relation:"):
+            await self.handle_relations(interaction, cid)
+        elif cid.startswith("rel_page_prev:"):
+            await self.handle_rel_page(interaction, cid, "prev")
+        elif cid.startswith("rel_page_next:"):
+            await self.handle_rel_page(interaction, cid, "next")
+        elif cid.startswith("rel_create:"):
+            await self.handle_rel_create(interaction, cid)
+        elif cid.startswith("rel_remove:"):
+            await self.handle_rel_remove(interaction, cid)
         elif cid.startswith("profil_todo_"):
             await interaction.response.send_message(
                 "🔧 Cette section n'est pas encore développée.", ephemeral=True
@@ -580,6 +683,350 @@ class Profil(commands.Cog):
             description="\n".join(f"• {n}" for n in names), color=PHOENIX_COLOR,
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # =================================================================
+    # PAGE RELATIONS (Famille / Amis / Autres)
+    # =================================================================
+    def _get_relations(self, character_id):
+        """Relations du personnage {"Famille": [(nom, lien), ...], "Amis": [...], "Autres": [...]},
+        construites depuis character_relations (JOIN sur validated_characters pour le nom). Une
+        catégorie inconnue (données legacy) retombe dans "Autres"."""
+        result = {"Famille": [], "Amis": [], "Autres": []}
+        for _rid, _related_cid, category, label, related_name in db.get_relations(character_id):
+            cat = category if category in result else "Autres"
+            result[cat].append((related_name or "Personnage supprimé", label or ""))
+        return result
+
+    async def _render_relations(self, character_id, page):
+        """Retourne (chemin_image, total_pages, page_clampée)."""
+        char = get_character(character_id)
+        name = char["character_name"] if char else "?"
+        portrait_path = char["portrait_path"] if char else None
+        relations = self._get_relations(character_id)
+        path = _tmp_profile("relations")
+        path, total_pages = generate_relations_image(name, relations, page, path, portrait_path=portrait_path)
+        clamped = max(1, min(page, total_pages))
+        return path, total_pages, clamped
+
+    async def send_relations(self, channel, character_id, user_id, page=1):
+        """Génère et envoie la page Relations d'un personnage, avec les boutons persistants
+        (pagination + créer / retirer). user_id = joueur autorisé à utiliser ces boutons (le
+        propriétaire du personnage affiché)."""
+        path, total_pages, clamped = await self._render_relations(character_id, page)
+        view = RelationsPageView(character_id, user_id, clamped, total_pages, db.has_relations(character_id))
+        await channel.send(file=discord.File(path, filename="relations.png"), view=view)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    async def handle_relations(self, interaction, cid):
+        _, character_id, user_id = cid.split(":")  # profil_todo_relation:{cid}:{uid}
+        character_id, user_id = int(character_id), int(user_id)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self.send_relations(interaction.channel, character_id, user_id, page=1)
+
+    async def handle_rel_page(self, interaction, cid, direction):
+        _, character_id, user_id, page = cid.split(":")
+        character_id, user_id, page = int(character_id), int(user_id), int(page)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Cette pagination n'est pas la tienne.", ephemeral=True)
+            return
+        new_page = page + (1 if direction == "next" else -1)
+        path, total_pages, clamped = await self._render_relations(character_id, new_page)
+        view = RelationsPageView(character_id, user_id, clamped, total_pages, db.has_relations(character_id))
+        await interaction.response.edit_message(
+            attachments=[discord.File(path, filename="relations.png")], view=view
+        )
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    # -----------------------------------------------------------------
+    # CRÉATION / RETRAIT D'UN LIEN (joueur propriétaire, ou staff sur n'importe qui)
+    # -----------------------------------------------------------------
+    async def _resolve_ref_character(self, channel, actor, button_character_id, is_staff):
+        """Détermine le personnage de RÉFÉRENCE sur lequel porte l'ajout/retrait de lien.
+        - Joueur : c'est directement le personnage du bouton (le sien).
+        - Staff : étape préalable — on lui demande de quel joueur gérer les liens, puis quel
+          personnage. Retourne (ref_character_id, ref_owner_id) ou (None, None) si annulé."""
+        if not is_staff:
+            char = get_character(button_character_id)
+            return button_character_id, (char["user_id"] if char else actor.id)
+        await channel.send("De quel joueur veux tu gérer les liens ? Mentionne le.")
+        target = await self._await_mention(channel, actor)
+        if target is None:
+            return None, None
+        ref_cid = await self.select_character_await(
+            channel, target, actor.id, "Ce joueur n'a aucun personnage validé."
+        )
+        if ref_cid is None:
+            return None, None
+        return ref_cid, target.id
+
+    async def _await_mention(self, channel, actor):
+        """Attend un message mentionnant un joueur. Retourne le Member mentionné, ou None si timeout.
+        (Isolation : wait_message filtre déjà strictement sur actor + salon courant.)"""
+        while True:
+            m = await self.wait_message(channel, actor)
+            if m is None:
+                await channel.send("⏳ Annulé.")
+                return None
+            if m.mentions:
+                return m.mentions[0]
+            await channel.send("Merci de **mentionner** un joueur (ex : @Pseudo).")
+
+    async def _select_related_character(self, channel, actor, target, ref_cid, ref_owner):
+        """Détermine le personnage CIBLE d'un lien à partir du joueur mentionné.
+        Gère l'auto-mention : si le joueur mentionné est le propriétaire du personnage de référence,
+        on ne propose QUE ses autres personnages (jamais ref_cid lui même). Retourne le related_cid,
+        ou None (annulation / aucun candidat, message déjà envoyé)."""
+        if target.id == ref_owner:
+            others = [c for c in get_characters(ref_owner, channel.guild.id) if c["id"] != ref_cid]
+            if not others:
+                await channel.send(
+                    "Tu n'as pas d'autre personnage, impossible de créer un lien avec toi même."
+                )
+                return None
+            if len(others) == 1:
+                return others[0]["id"]
+            view = ProfilCharacterSelectView(others, actor.id)
+            await channel.send("Avec lequel de tes autres personnages veux tu créer ce lien ?", view=view)
+            await view.wait()
+            return view.result
+        # Joueur différent : sélection standard parmi SES personnages.
+        return await self.select_character_await(
+            channel, target, actor.id, "Ce joueur n'a aucun personnage."
+        )
+
+    async def handle_rel_create(self, interaction, cid):
+        _, character_id, user_id = cid.split(":")
+        character_id, user_id = int(character_id), int(user_id)
+        is_staff = _is_staff(interaction.user)
+        if interaction.user.id != user_id and not is_staff:
+            await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
+            return
+        # Anti double clic (même principe que /shop) : verrou mémoire (utilisateur, personnage) +
+        # retrait immédiat de la View. Tout clic redondant est absorbé silencieusement.
+        lock_key = (interaction.user.id, character_id)
+        if lock_key in self._relation_lock:
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException:
+                pass
+            return
+        self._relation_lock.add(lock_key)
+        try:
+            await interaction.response.edit_message(view=None)
+        except discord.HTTPException:
+            pass
+        if not self._acquire(interaction.user.id):
+            await interaction.followup.send(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True
+            )
+            self._relation_lock.discard(lock_key)
+            return
+        try:
+            channel = interaction.channel
+            ref_cid, ref_owner = await self._resolve_ref_character(
+                channel, interaction.user, character_id, is_staff
+            )
+            if ref_cid is None:
+                return
+
+            # 1) Catégorie (vue en session, choix figé au clic).
+            catview = RelationCategoryView(interaction.user.id)
+            await channel.send(
+                embed=discord.Embed(
+                    title="Quel type de relation veux tu ajouter ?",
+                    description="Choisis une catégorie.", color=PHOENIX_COLOR,
+                ),
+                view=catview,
+            )
+            await catview.wait()
+            if catview.result is None:
+                await channel.send("⏳ Aucun choix, création annulée.")
+                return
+            category = catview.result
+
+            # 2) Joueur puis personnage cible du lien (avec gestion de l'auto-mention).
+            await channel.send("Mentionne le joueur avec qui tu veux créer ce lien.")
+            target = await self._await_mention(channel, interaction.user)
+            if target is None:
+                return
+            related_cid = await self._select_related_character(
+                channel, interaction.user, target, ref_cid, ref_owner
+            )
+            if related_cid is None:
+                return
+            # Garde fou : jamais un lien d'un personnage vers lui même.
+            if related_cid == ref_cid:
+                await channel.send("Impossible de créer un lien avec soi même.")
+                return
+
+            # 3) Intitulé du lien.
+            await channel.send("Écris le nom de cette relation (ex : Père, Meilleur ami, Rival).")
+            m = await self.wait_message(channel, interaction.user)
+            if m is None:
+                await channel.send("⏳ Annulé.")
+                return
+            label = m.content.strip()
+            if not label:
+                await channel.send("Intitulé vide, création annulée.")
+                return
+
+            related = get_character(related_cid)
+            related_name = related["character_name"] if related else "?"
+
+            # 4) Anti doublon + écriture finale, protégés par un filet de sécurité : si un personnage
+            # disparaît entre temps (FOREIGN KEY, character_id devenu invalide...), on abandonne
+            # proprement sans casser l'interaction.
+            try:
+                existing = db.get_relations_between(ref_cid, related_cid)
+                if existing:
+                    rel_id, cur_cat, cur_label = existing[0]
+                    confirm = ReplaceRelationView(interaction.user.id)
+                    await channel.send(
+                        embed=discord.Embed(
+                            title="Une relation existe déjà",
+                            description=(
+                                f"Une relation existe déjà avec **{related_name}** : "
+                                f"**{cur_cat}** — {cur_label}.\n\n"
+                                f"Veux tu la remplacer par la nouvelle (**{category}** — {label}) ?"
+                            ),
+                            color=PHOENIX_COLOR,
+                        ),
+                        view=confirm,
+                    )
+                    await confirm.wait()
+                    if confirm.result != "replace":
+                        await channel.send("Opération annulée, l'ancienne relation est conservée.")
+                        return
+                    with db.get_connection() as conn:
+                        conn.execute(
+                            "UPDATE character_relations SET category = ?, label = ? WHERE id = ?",
+                            (category, label, rel_id),
+                        )
+                    await channel.send(embed=discord.Embed(
+                        description=f"✅ Relation remplacée — **{category}** : {related_name} ({label}).",
+                        color=PHOENIX_COLOR,
+                    ))
+                else:
+                    db.add_relation(ref_cid, related_cid, category, label)
+                    await channel.send(embed=discord.Embed(
+                        description=f"✅ Lien créé — **{category}** : {related_name} ({label}).",
+                        color=PHOENIX_COLOR,
+                    ))
+                await self.send_relations(channel, ref_cid, ref_owner, page=1)
+            except Exception:
+                await interaction.followup.send(
+                    "❌ Une erreur d'interaction est survenue, réessaie.", ephemeral=True
+                )
+                return
+        finally:
+            self._release(interaction.user.id)
+            self._relation_lock.discard(lock_key)
+
+    async def handle_rel_remove(self, interaction, cid):
+        _, character_id, user_id = cid.split(":")
+        character_id, user_id = int(character_id), int(user_id)
+        is_staff = _is_staff(interaction.user)
+        if interaction.user.id != user_id and not is_staff:
+            await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
+            return
+        # Anti double clic (même principe que /shop) : verrou mémoire (utilisateur, personnage) +
+        # retrait immédiat de la View.
+        lock_key = (interaction.user.id, character_id)
+        if lock_key in self._relation_lock:
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException:
+                pass
+            return
+        self._relation_lock.add(lock_key)
+        try:
+            await interaction.response.edit_message(view=None)
+        except discord.HTTPException:
+            pass
+        if not self._acquire(interaction.user.id):
+            await interaction.followup.send(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True
+            )
+            self._relation_lock.discard(lock_key)
+            return
+        try:
+            channel = interaction.channel
+            ref_cid, ref_owner = await self._resolve_ref_character(
+                channel, interaction.user, character_id, is_staff
+            )
+            if ref_cid is None:
+                return
+
+            await channel.send("Mentionne le joueur avec qui tu veux retirer un lien.")
+            target = await self._await_mention(channel, interaction.user)
+            if target is None:
+                return
+
+            linked = db.get_linked_characters_of_user(ref_cid, target.id, channel.guild.id)
+            if not linked:
+                await channel.send("Aucun lien trouvé avec ce joueur.")
+                return
+            if len(linked) == 1:
+                related_cid = linked[0][0]
+            else:
+                chars = [
+                    {"id": lc[0], "character_name": lc[1], "slot_number": lc[2]} for lc in linked
+                ]
+                view = ProfilCharacterSelectView(chars, interaction.user.id)
+                await channel.send("Plusieurs personnages de ce joueur sont liés au tien. Lequel ?", view=view)
+                await view.wait()
+                related_cid = view.result
+                if related_cid is None:
+                    await channel.send("⏳ Annulé.")
+                    return
+
+            # Si plusieurs liens (catégories/labels) existent entre les deux, on demande lequel retirer.
+            links = db.get_relations_between(ref_cid, related_cid)
+            if not links:
+                await channel.send("Ce lien n'existe déjà plus.")
+                return
+            if len(links) == 1:
+                relation_id = links[0][0]
+                _cat, _label = links[0][1], links[0][2]
+            else:
+                lines = [f"**{i + 1}.** {cat} — {label}" for i, (_id, cat, label) in enumerate(links)]
+                await channel.send(embed=discord.Embed(
+                    title="Plusieurs liens existent avec ce personnage",
+                    description="\n".join(lines) + "\n\nRéponds avec le numéro du lien à retirer.",
+                    color=PHOENIX_COLOR,
+                ))
+                relation_id = None
+                while relation_id is None:
+                    mm = await self.wait_message(channel, interaction.user)
+                    if mm is None:
+                        await channel.send("⏳ Annulé.")
+                        return
+                    c = mm.content.strip()
+                    if c.isdigit() and 1 <= int(c) <= len(links):
+                        relation_id, _cat, _label = links[int(c) - 1]
+                    else:
+                        await channel.send(f"Réponds avec un numéro entre 1 et {len(links)}.")
+
+            db.delete_relation_by_id(relation_id)
+            related = get_character(related_cid)
+            related_name = related["character_name"] if related else "?"
+            await channel.send(embed=discord.Embed(
+                description=f"✅ Lien retiré avec {related_name} (**{_cat}** — {_label}).",
+                color=PHOENIX_COLOR,
+            ))
+            await self.send_relations(channel, ref_cid, ref_owner, page=1)
+        finally:
+            self._release(interaction.user.id)
+            self._relation_lock.discard(lock_key)
 
     # =================================================================
     # PAGE STATS + RÉPARTITION (joueur)
