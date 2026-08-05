@@ -355,6 +355,8 @@ class Profil(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self._active_users = set()  # isolation des flux textuels par joueur (mémoire)
+        # Répartitions de points en cours (character_id) : anti double clic sur "🎯 Répartir les points".
+        self._repartir_lock = set()
 
     # ---------- verrou de flux ----------
     def _acquire(self, *user_ids) -> bool:
@@ -597,13 +599,29 @@ class Profil(commands.Cog):
         if interaction.user.id != user_id:
             await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
             return
+
+        # Anti double clic (même protection que les achats /shop) : verrou mémoire par character_id ;
+        # un clic redondant pendant qu'un traitement est en cours est absorbé silencieusement.
+        if character_id in self._repartir_lock:
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException:
+                pass
+            return
+        self._repartir_lock.add(character_id)
+        # Premier clic : on retire immédiatement la View (plus aucun bouton actif pendant le traitement).
+        try:
+            await interaction.response.edit_message(view=None)
+        except discord.HTTPException:
+            pass
+
         if not self._acquire(user_id):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True
             )
+            self._repartir_lock.discard(character_id)
             return
         try:
-            await interaction.response.send_message("🎯 Répartition des points…", ephemeral=True)
             channel = interaction.channel
             s = db.get_or_create_stats(character_id)
             if s["points_restants"] <= 0:
@@ -639,7 +657,10 @@ class Profil(commands.Cog):
             ))
             await self.send_stats(channel, character_id, user_id)
         finally:
+            # Répartition terminée (pillow régénéré) : on libère le verrou utilisateur ET le verrou
+            # anti double clic de ce personnage.
             self._release(user_id)
+            self._repartir_lock.discard(character_id)
 
     async def _pick_stat(self, channel, user, allowed_keys):
         await channel.send(embed=discord.Embed(
@@ -934,16 +955,16 @@ class Profil(commands.Cog):
             pts = None
             while pts is None:
                 await channel.send(
-                    f"Combien de points **{STAT_DISPLAY_NAMES[stat]}** donne ce buff ? (entier, négatif possible)"
+                    f"Combien de points **{STAT_DISPLAY_NAMES[stat]}** donne ce buff ? (entier positif)"
                 )
                 mm = await self.wait_message(channel, staff)
                 if mm is None:
                     return None
-                pts = _parse_any_int(mm.content)
+                pts = _parse_int(mm.content, minimum=1)  # strictement positif : jamais 0 ni négatif
                 if pts is None:
-                    await channel.send("Entre un entier (ex : 200 ou -50).")
+                    await channel.send("Le nombre de points d'un buff doit être positif.")
             db.add_buff_effect(buff_id, stat, pts)
-            recap.append(f"{STAT_DISPLAY_NAMES[stat]} {'+' if pts >= 0 else ''}{pts}")
+            recap.append(f"{STAT_DISPLAY_NAMES[stat]} +{pts}")
 
         await channel.send(f"✅ Buff « {buff_name} » créé : " + " · ".join(recap))
         await self.send_stats(channel, character_id, staff.id)
