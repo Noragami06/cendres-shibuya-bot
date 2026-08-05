@@ -780,13 +780,39 @@ class Profil(commands.Cog):
                 return m.mentions[0]
             await channel.send("Merci de **mentionner** un joueur (ex : @Pseudo).")
 
-    async def _select_related_character(self, channel, actor, target, ref_cid, ref_owner):
-        """Détermine le personnage CIBLE d'un lien à partir du joueur mentionné.
-        Gère l'auto-mention : si le joueur mentionné est le propriétaire du personnage de référence,
-        on ne propose QUE ses autres personnages (jamais ref_cid lui même). Retourne le related_cid,
-        ou None (annulation / aucun candidat, message déjà envoyé)."""
-        if target.id == ref_owner:
-            others = [c for c in get_characters(ref_owner, channel.guild.id) if c["id"] != ref_cid]
+    async def _choose_link_target(self, channel, actor, ref_cid):
+        """Étape « Mentionne le joueur avec qui tu veux créer ce lien. » : attend un message, extrait le
+        membre RÉELLEMENT mentionné (message.mentions[0], jamais une variable réutilisée ni actor), puis
+        décide s'il s'agit d'une auto-mention en comparant CE membre au propriétaire Discord du
+        personnage ref_cid (validated_characters.user_id — récupéré ici même, jamais interaction.user :
+        crucial en mode staff où l'acteur n'est pas le propriétaire). Retourne le related_cid ou None."""
+        # Propriétaire Discord du personnage sur lequel on travaille (source de vérité : la base).
+        ref_char = get_character(ref_cid)
+        owner_user_id = ref_char["user_id"] if ref_char else None
+
+        mentioned_member = None
+        while mentioned_member is None:
+            message = await self.wait_message(channel, actor)
+            if message is None:
+                await channel.send("⏳ Annulé.")
+                return None
+            mentioned_member = message.mentions[0] if message.mentions else None
+
+            # --- Diagnostic temporaire ---
+            print(f"🔍 [liens] Auteur du message : {message.author.id}")
+            print(f"🔍 [liens] Mentions détectées dans le message : {[m.id for m in message.mentions]}")
+            print(f"🔍 [liens] Membre mentionné retenu : {mentioned_member.id if mentioned_member else 'AUCUN'}")
+            print(f"🔍 [liens] Propriétaire du personnage actuel (character_id {ref_cid}) : {owner_user_id}")
+            print(f"🔍 [liens] Comparaison auto-mention : mentioned_member.id == owner_user_id ? "
+                  f"{mentioned_member.id == owner_user_id if mentioned_member else 'N/A'}")
+            # --- fin diagnostic ---
+
+            if mentioned_member is None:
+                await channel.send("Merci de **mentionner** un joueur (ex : @Pseudo).")
+
+        # Auto-mention UNIQUEMENT si le membre mentionné EST le propriétaire du personnage de référence.
+        if mentioned_member.id == owner_user_id:
+            others = [c for c in get_characters(owner_user_id, channel.guild.id) if c["id"] != ref_cid]
             if not others:
                 await channel.send(
                     "Tu n'as pas d'autre personnage, impossible de créer un lien avec toi même."
@@ -798,9 +824,10 @@ class Profil(commands.Cog):
             await channel.send("Avec lequel de tes autres personnages veux tu créer ce lien ?", view=view)
             await view.wait()
             return view.result
-        # Joueur différent : sélection standard parmi SES personnages.
+
+        # Joueur DIFFÉRENT : sélection standard parmi SES personnages.
         return await self.select_character_await(
-            channel, target, actor.id, "Ce joueur n'a aucun personnage."
+            channel, mentioned_member, actor.id, "Ce joueur n'a aucun personnage."
         )
 
     async def handle_rel_create(self, interaction, cid):
@@ -853,14 +880,9 @@ class Profil(commands.Cog):
                 return
             category = catview.result
 
-            # 2) Joueur puis personnage cible du lien (avec gestion de l'auto-mention).
+            # 2) Personnage cible du lien (extraction + comparaison d'auto-mention faites au bon endroit).
             await channel.send("Mentionne le joueur avec qui tu veux créer ce lien.")
-            target = await self._await_mention(channel, interaction.user)
-            if target is None:
-                return
-            related_cid = await self._select_related_character(
-                channel, interaction.user, target, ref_cid, ref_owner
-            )
+            related_cid = await self._choose_link_target(channel, interaction.user, ref_cid)
             if related_cid is None:
                 return
             # Garde fou : jamais un lien d'un personnage vers lui même.
