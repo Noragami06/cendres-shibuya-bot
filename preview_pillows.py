@@ -84,3 +84,22 @@ generate_profil_image(
     out_path="temp/preview_profil.png",
 )
 print("9ème image (profil) générée dans temp/")
+
+from cogs.utils.image_gen import generate_stats_image
+
+stats_exemple = [
+    ("Force", (215, 80, 80), 45, 245, 38, "Tranche 2 : 10-100"),
+    ("RCT", (100, 220, 150), 75, 75, 72, "Tranche 2 : 10-100"),
+    ("Vitesse", (90, 150, 240), 320, 520, 24, "Tranche 3 : 100-1000"),
+    ("Territoire", (190, 100, 240), 5, 155, 50, "Tranche 1 : 0-10"),
+    ("Endurance", (230, 170, 60), 850, 850, 83, "Tranche 3 : 100-1000"),
+    ("Sorts", (230, 220, 70), 990, 1290, 98, "Tranche 3 : 100-1000"),
+    ("Armes maudites", (230, 140, 60), 250, 250, 16, "Tranche 3 : 100-1000"),
+    ("Énergie occulte", (100, 160, 230), 1200, 1900, 2, "Tranche 4 : 1000-10000"),
+]
+buffs_exemple = [
+    "Six Eyes  →  Force +200 · Vitesse +200 · Énergie occulte +500 · Sorts +300",
+    "Clan Gojo  →  Territoire +150 · Énergie occulte +200",
+]
+generate_stats_image("Daisuke", stats_exemple, buffs_exemple, 12, "temp/preview_stats.png")
+print("10ème image (stats) générée dans temp/")

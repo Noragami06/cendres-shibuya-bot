@@ -1698,6 +1698,17 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
     )
     update_progress(target_uid, fiche_status="validated")
 
+    # 3 ter) Crée le profil (/profil) avec les VRAIES valeurs de la fiche plutôt que les DEFAULT
+    # génériques : la réserve d'énergie occulte réellement tirée devient eo_actuel = eo_max (réserve
+    # pleine). eo_value est NULL pour Humain / Hybride chez les humains -> 0/0 géré côté DB.
+    with db.get_connection() as conn:
+        prof_row = conn.execute(
+            "SELECT id FROM validated_characters WHERE user_id = ? AND guild_id = ? AND slot_number = ?",
+            (target_uid, progress.get("guild_id"), slot),
+        ).fetchone()
+    if prof_row is not None:
+        db.create_profile_from_fiche(prof_row["id"], progress.get("eo_value"))
+
     # 3 bis) Place de clan : comptage basé sur la base (TOUS les personnages du clan, slots réels ET
     # virtuels), APRÈS l'insertion pour inclure ce nouveau personnage. Ferme / redistribue si le cap
     # est atteint. S'applique quel que soit le slot (un slot 2/3 occupe aussi une place de clan).

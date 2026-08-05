@@ -295,8 +295,10 @@ class Profil(commands.Cog):
             ("Défense", p["defense_level"], pct(p["defense_xp_actuel"], p["defense_xp_max"]),
              (p["defense_xp_actuel"], p["defense_xp_max"])),
         ]
+        # Les 4 maîtrises restent à niveau 1 / 0 % pour tout le monde, sans exception, tant que le
+        # futur système de maîtrises liées aux stats n'est pas développé (cf. TODO.md).
         maitrises = [
-            ("Maîtrise EO", p["maitrise_eo_level"], min(100, p["maitrise_eo_level"] * 10)),
+            ("Maîtrise EO", 1, 0),
             ("Maîtrise Sort", 1, 0),
             ("Maîtrise Territoire", 1, 0),
             ("RCT", 1, 0),

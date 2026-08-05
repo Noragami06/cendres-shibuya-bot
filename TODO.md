@@ -16,6 +16,9 @@
 
 - [ ] Argent / XP obtenus en récompense : enregistrés mais aucun système économique/niveau ne leur donne d'effet réel.
 - [ ] Objets (reliques, armes) obtenus en récompense : enregistrés mais aucun système d'inventaire n'existe.
+- [ ] Système de PV (points de vie) : actuellement fixé à 100/100 pour tout le monde à la création, aucune formule ni évolution définie.
+- [ ] Système de niveau général (Level/XP) : actuellement fixé à niveau 1 / 0 XP pour tout le monde à la création, formule temporaire (N*1000 XP par niveau) en attendant le vrai système.
+- [ ] Force / Vitesse / Défense : actuellement fixées à niveau 1 / 0% pour tout le monde à la création, doivent être liées à un futur système de statistiques pas encore développé. Les 4 Maîtrises (EO/Sort/Territoire/RCT) dépendront aussi de ce futur système une fois prêt.
 
 ## Divers
 

@@ -814,6 +814,34 @@ def update_profile(character_id: int, **fields):
         )
 
 
+def create_profile_from_fiche(character_id: int, eo_value):
+    """Crée (ou remplace) la ligne character_profiles d'un personnage avec les VRAIES valeurs issues
+    du parcours /depart, au lieu de laisser les DEFAULT génériques de la table s'appliquer.
+
+    - eo_actuel/eo_max = eo_value (réserve pleine au départ). Si eo_value est None (Humain / Hybride
+      chez les humains, sans réserve tirée) : 0/0 au lieu de planter sur NULL.
+    - Le reste (PV, level/XP, Force/Vitesse/Défense, maîtrise, combats) reste neutre tant que les
+      systèmes correspondants ne sont pas développés (cf. TODO.md).
+    INSERT OR REPLACE : idempotent si une ligne existait déjà (sécurité, pas d'erreur de PK)."""
+    eo = int(eo_value) if eo_value is not None else 0
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO character_profiles (
+                   character_id,
+                   pv_actuel, pv_max,
+                   eo_actuel, eo_max,
+                   level, xp_actuel, xp_max,
+                   force_level, force_xp_actuel, force_xp_max,
+                   vitesse_level, vitesse_xp_actuel, vitesse_xp_max,
+                   defense_level, defense_xp_actuel, defense_xp_max,
+                   maitrise_eo_level,
+                   victoires, defaites, nuls
+               ) VALUES (?, 100, 100, ?, ?, 1, 0, 1000,
+                         1, 0, 1000, 1, 0, 1000, 1, 0, 1000, 1, 0, 0, 0)""",
+            (character_id, eo, eo),
+        )
+
+
 def get_background(character_id: int):
     """Fond d'écran propre à CE personnage (jamais partagé entre personnages), ou None."""
     with get_connection() as conn:

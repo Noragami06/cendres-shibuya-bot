@@ -856,3 +856,116 @@ def generate_profil_image(name, pv, eo, level, xp, stats, maitrises, clan, rang,
 
     img.save(out_path)
     return out_path
+
+
+BG_STATS = (10, 9, 15, 255)
+TEXT_STATS = (235, 235, 240, 255)
+SUB_STATS = (150, 148, 160, 255)
+GOLD_STATS = (232, 197, 121, 255)
+HEADER_COLOR_STATS = (255, 200, 60, 255)
+TRANCHE_COLOR = (100, 225, 225, 255)
+SEG_BG_STATS = (35, 33, 42, 255)
+
+
+def _stats_frame(d, xy, gold, width=3, radius=14):
+    d.rounded_rectangle(xy, radius=radius, outline=gold, width=width)
+
+
+def _stats_seg_bar(d, x0, y0, x1, y1, pct, color, n_seg=20):
+    d.rounded_rectangle((x0, y0, x1, y1), radius=4, fill=SEG_BG_STATS)
+    total_w = x1 - x0
+    seg_w = total_w / n_seg
+    filled = int(n_seg * pct / 100)
+    for i in range(n_seg):
+        sx0 = x0 + i * seg_w + 1
+        sx1 = x0 + (i + 1) * seg_w - 1
+        if i < filled:
+            d.rectangle((sx0, y0 + 1, sx1, y1 - 1), fill=color)
+    d.rounded_rectangle((x0, y0, x1, y1), radius=4, outline=color, width=1)
+
+
+# Reçoit directement l'objet Image (img) pour coller la photo : on évite d._image (attribut privé de
+# ImageDraw pas garanti stable selon la version de Pillow).
+def _stats_hexagon(d, img, cx, cy, r, gold, portrait_path=None):
+    pts = [(cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a))) for a in range(-90, 271, 60)]
+    if portrait_path and os.path.exists(portrait_path):
+        size = int(r * 1.6)
+        photo = Image.open(portrait_path).convert("RGB")
+        photo = ImageOps.fit(photo, (size, size), method=Image.LANCZOS)
+        mask = Image.new("L", (size, size), 0)
+        md = ImageDraw.Draw(mask)
+        hex_local = [(size / 2 + r * math.cos(math.radians(a)), size / 2 + r * math.sin(math.radians(a))) for a in range(-90, 271, 60)]
+        md.polygon(hex_local, fill=255)
+        img.paste(photo, (int(cx - size / 2), int(cy - size / 2)), mask)
+    else:
+        d.polygon(pts, fill=(20, 20, 28, 255))
+    d.polygon(pts, outline=gold, width=3)
+
+
+def _stats_row(d, x, y, w, name, color, base, total, pct, tranche):
+    d.text((x, y), name.upper(), font=font(14, True), fill=color)
+    ptxt = f"{base:,} pts ({total:,})".replace(",", " ") if total != base else f"{base:,} pts".replace(",", " ")
+    pw = text_w(d, ptxt, font(12, True))
+    pctw = text_w(d, f"{pct}%", font(12, True))
+    d.text((x + w - pw - pctw - 14, y), ptxt, font=font(12, True), fill=TEXT_STATS)
+    d.text((x + w - pctw, y), f"{pct}%", font=font(12, True), fill=SUB_STATS)
+    _stats_seg_bar(d, x, y + 22, x + w, y + 34, pct, color)
+    d.text((x, y + 40), tranche, font=font(12, True), fill=TRANCHE_COLOR)
+
+
+def _stats_buffs_frame(d, xy, gold, buffs):
+    _stats_frame(d, xy, gold, width=3, radius=12)
+    x0, y0, x1, y1 = xy
+    title = "BUFFS ACTIFS"
+    tw = text_w(d, title, font(13, True))
+    d.text(((x0 + x1) / 2 - tw / 2, y0 + 14), title, font=font(13, True), fill=(230, 90, 90, 255))
+    d.line((x0 + 20, y0 + 38, x1 - 20, y0 + 38), fill=(80, 40, 45, 255), width=1)
+    yy = y0 + 52
+    if not buffs:
+        d.text((x0 + 20, yy), "Aucun buff actif.", font=font(11), fill=SUB_STATS)
+    for b in buffs:
+        d.text((x0 + 20, yy), b, font=font(11), fill=TEXT_STATS)
+        yy += 22
+
+
+def _stats_points_badge(d, x, y, w, h, gold, points_restants):
+    _stats_frame(d, (x, y, x + w, y + h), gold, width=3, radius=10)
+    txt = f"Points de stats restants : {points_restants}"
+    tw = text_w(d, txt, font(13, True))
+    d.text((x + w / 2 - tw / 2, y + h / 2 - 8), txt, font=font(13, True), fill=GOLD_STATS)
+
+
+def generate_stats_image(name, stats, buffs, points_restants, out_path, portrait_path=None):
+    """
+    stats : liste de 8 tuples (nom, (r,g,b), base_pts, total_pts, pct, tranche_txt)
+             ordre attendu : Force, RCT, Vitesse, Territoire, Endurance, Sorts, Armes maudites, Énergie occulte
+    buffs : liste de chaines deja formatees, ex "Six Eyes  →  Force +200 · Vitesse +200"
+    points_restants : entier
+    portrait_path : chemin vers la photo du personnage, integree dans l'hexagone si fournie
+    """
+    W, H = 1100, 880
+    img = Image.new("RGBA", (W, H), BG_STATS)
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, W, H), outline=GOLD_STATS, width=2)
+
+    _stats_hexagon(d, img, W // 2, 100, 70, GOLD_STATS, portrait_path)
+
+    title = f"STATISTIQUES · {name}"
+    tw = text_w(d, title, font(26, True))
+    d.text((W / 2 - tw / 2, 190), title, font=font(26, True), fill=HEADER_COLOR_STATS)
+    d.line((40, 230, W - 40, 230), fill=(55, 52, 65, 255), width=2)
+
+    col_w = (W - 40 * 2 - 30) // 2
+    y0 = 258
+    for i, (sname, color, base, total, pct, tranche) in enumerate(stats[:8]):
+        col, row = i % 2, i // 2
+        x = 40 + col * (col_w + 30)
+        y = y0 + row * 84
+        _stats_row(d, x, y, col_w, sname, color, base, total, pct, tranche)
+
+    buffs_y = y0 + 4 * 84 + 16
+    _stats_buffs_frame(d, (40, buffs_y, W - 40, H - 88), GOLD_STATS, buffs)
+    _stats_points_badge(d, W - 320, H - 64, 280, 42, GOLD_STATS, points_restants)
+
+    img.save(out_path)
+    return out_path
