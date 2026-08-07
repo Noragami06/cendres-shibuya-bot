@@ -103,3 +103,31 @@ buffs_exemple = [
 ]
 generate_stats_image("Daisuke", stats_exemple, buffs_exemple, 12, "temp/preview_stats.png")
 print("10ème image (stats) générée dans temp/")
+
+from cogs.utils.image_gen import generate_ordre_image
+
+members_exemple = [
+    ("Chef d'ordre", 1, (255, 165, 60)),
+    ("Sous-chef", 1, (230, 90, 90)),
+    ("Formateur", 2, (100, 200, 150)),
+    ("Chef d'équipe", 3, (90, 150, 240)),
+    ("Membre d'équipe", 12, (170, 170, 180)),
+    ("Corps administratif", 2, (190, 100, 240)),
+]
+salons_exemple = [
+    ("quartier-historique", "Acheté"),
+    ("pont-sumida", "Location"),
+    ("marché-nocturne", "Louée"),
+    ("quai-est", "Acheté"),
+    ("place-du-marché", "Location"),
+]
+generate_ordre_image(
+    "Ordre du Phénix Ardent",
+    members_exemple,
+    458200,
+    [12000, -5000, 8000, 15000, -2000, 20000, 6000],
+    ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"],
+    salons_exemple,
+    "temp/preview_ordre.png",
+)
+print("11ème image (ordre) générée dans temp/")

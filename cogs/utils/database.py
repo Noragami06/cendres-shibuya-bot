@@ -279,6 +279,39 @@ CREATE TABLE IF NOT EXISTS character_relations (
     category TEXT,
     label TEXT
 );
+
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chef_character_id INTEGER UNIQUE,
+    type TEXT,                      -- 'educatif', 'direct', 'hybride'
+    name TEXT,
+    solde_courant INTEGER DEFAULT 0,
+    created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS order_members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER,
+    character_id INTEGER,
+    role_label TEXT                 -- 'Sous-chef', 'Formateur', 'Chef d''équipe', 'Membre d''équipe', 'Corps administratif'
+);
+
+CREATE TABLE IF NOT EXISTS order_salons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER,
+    channel_id INTEGER,
+    status TEXT,                    -- 'Acheté', 'Louée', 'Location'
+    linked_order_id INTEGER,        -- ordre source (Louée) ou ordre cible (Location)
+    location_expiry TEXT            -- date de fin si statut = Location, sinon NULL
+);
+
+CREATE TABLE IF NOT EXISTS order_transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER,
+    label TEXT,
+    amount INTEGER,
+    date TEXT
+);
 """
 
 
@@ -1129,6 +1162,156 @@ def delete_relations_between(character_id: int, related_character_id: int):
             "DELETE FROM character_relations WHERE character_id = ? AND related_character_id = ?",
             (character_id, related_character_id),
         )
+
+
+# ---------- Ordres (/ordre) ----------
+def get_order(order_id: int):
+    with get_connection() as conn:
+        return conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+
+
+def get_order_by_chief(chef_character_id: int):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM orders WHERE chef_character_id = ?", (chef_character_id,)
+        ).fetchone()
+
+
+def create_order(chef_character_id: int, type_: str, name: str, created_at: str) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO orders (chef_character_id, type, name, solde_courant, created_at) "
+            "VALUES (?, ?, ?, 0, ?)",
+            (chef_character_id, type_, name, created_at),
+        )
+        return cur.lastrowid
+
+
+def adjust_order_solde(order_id: int, delta: int) -> int:
+    """Ajoute delta (peut être négatif) au solde de l'ordre, retourne le nouveau solde."""
+    with get_connection() as conn:
+        conn.execute("UPDATE orders SET solde_courant = solde_courant + ? WHERE id = ?", (delta, order_id))
+        return conn.execute(
+            "SELECT solde_courant FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()["solde_courant"]
+
+
+def add_order_transaction(order_id: int, label: str, amount: int, date: str):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO order_transactions (order_id, label, amount, date) VALUES (?, ?, ?, ?)",
+            (order_id, label, amount, date),
+        )
+
+
+def get_order_transactions_since(order_id: int, since_iso: str):
+    """Transactions de l'ordre depuis une date ISO (pour le graphe de profit hebdo)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT amount, date FROM order_transactions WHERE order_id = ? AND date >= ?",
+            (order_id, since_iso),
+        ).fetchall()
+    return [(r["amount"], r["date"]) for r in rows]
+
+
+def get_order_members(order_id: int):
+    """Membres de l'ordre (hors chef) avec les infos du personnage."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT m.id, m.character_id, m.role_label, v.character_name, v.user_id, v.slot_number "
+            "FROM order_members m LEFT JOIN validated_characters v ON v.id = m.character_id "
+            "WHERE m.order_id = ? ORDER BY m.id ASC",
+            (order_id,),
+        ).fetchall()
+
+
+def get_order_member(order_id: int, character_id: int):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM order_members WHERE order_id = ? AND character_id = ?",
+            (order_id, character_id),
+        ).fetchone()
+
+
+def add_order_member(order_id: int, character_id: int, role_label: str):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO order_members (order_id, character_id, role_label) VALUES (?, ?, ?)",
+            (order_id, character_id, role_label),
+        )
+
+
+def remove_order_member(order_id: int, character_id: int):
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM order_members WHERE order_id = ? AND character_id = ?", (order_id, character_id)
+        )
+
+
+def update_order_member_role(order_id: int, character_id: int, role_label: str):
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE order_members SET role_label = ? WHERE order_id = ? AND character_id = ?",
+            (role_label, order_id, character_id),
+        )
+
+
+def get_order_salons(order_id: int):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM order_salons WHERE order_id = ? ORDER BY id ASC", (order_id,)
+        ).fetchall()
+
+
+def add_order_salon(order_id: int, channel_id: int, status: str,
+                    linked_order_id=None, location_expiry=None) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO order_salons (order_id, channel_id, status, linked_order_id, location_expiry) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (order_id, channel_id, status, linked_order_id, location_expiry),
+        )
+        return cur.lastrowid
+
+
+def get_salon_owner(channel_id: int, status: str = "Acheté"):
+    """Order_salon (n'importe quel ordre) possédant ce salon avec ce statut, ou None. Sert à détecter
+    les conflits d'achat (un salon déjà possédé par un ordre ne peut pas être racheté)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM order_salons WHERE channel_id = ? AND status = ?", (channel_id, status)
+        ).fetchone()
+
+
+def remove_order_salon_by_channel(order_id: int, channel_id: int, status: str = "Acheté"):
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM order_salons WHERE order_id = ? AND channel_id = ? AND status = ?",
+            (order_id, channel_id, status),
+        )
+
+
+def transfer_salon(channel_id: int, from_order_id: int, to_order_id: int):
+    """Transfère la propriété d'un salon 'Acheté' d'un ordre à un autre (revente à un joueur)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE order_salons SET order_id = ? "
+            "WHERE order_id = ? AND channel_id = ? AND status = 'Acheté'",
+            (to_order_id, from_order_id, channel_id),
+        )
+
+
+def get_orders_in_guild(guild_id: int, exclude_order_id=None):
+    """Ordres du serveur (le guild est déterminé via le personnage chef) :
+    [(order_id, name, chef_name), ...]."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT o.id, o.name, v.character_name AS chef_name FROM orders o "
+            "JOIN validated_characters v ON v.id = o.chef_character_id "
+            "WHERE v.guild_id = ? AND (? IS NULL OR o.id != ?) ORDER BY o.id ASC",
+            (guild_id, exclude_order_id, exclude_order_id),
+        ).fetchall()
+    return [(r["id"], r["name"], r["chef_name"]) for r in rows]
 
 
 def renumber_character_slots(user_id: int, guild_id: int):

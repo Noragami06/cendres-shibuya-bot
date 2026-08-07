@@ -1104,3 +1104,221 @@ def generate_relations_image(name: str, relations: dict, page: int, out_path: st
 
     img.save(out_path)
     return out_path, total_pages
+
+
+ORDRE_STATUS_COLORS = {
+    "Acheté": (100, 220, 150),
+    "Louée": (90, 150, 240),
+    "Location": (200, 140, 240),
+}
+
+def _ordre_rounded(d, xy, r, **kw):
+    d.rounded_rectangle(xy, radius=r, **kw)
+
+def _ordre_member_row(d, x, y, w, label, count, color, text_color):
+    d.rounded_rectangle((x, y, x + w, y + 40), radius=8, fill=(28, 28, 34, 255))
+    d.rectangle((x, y, x + 4, y + 40), fill=color)
+    d.text((x + 16, y + 11), label, font=font(12, True), fill=text_color)
+    cw = text_w(d, str(count), font(14, True))
+    d.text((x + w - 20 - cw, y + 9), str(count), font=font(14, True), fill=color)
+
+def _ordre_line_chart(d, x0, y0, x1, y1, values, days, sub_color):
+    w, h = x1 - x0, y1 - y0
+    max_abs = max(abs(v) for v in values) * 1.2 if values else 1
+    zero_y = y0 + h / 2
+    d.line((x0, zero_y, x1, zero_y), fill=(40, 40, 48, 255), width=1)
+    n = len(values)
+    if n < 2:
+        return
+    step_x = w / (n - 1)
+    pts = []
+    for i, v in enumerate(values):
+        px = x0 + i * step_x
+        py = zero_y - (v / max_abs) * (h / 2)
+        pts.append((px, py))
+    for i in range(len(pts) - 1):
+        x_a, y_a = pts[i]
+        x_b, y_b = pts[i + 1]
+        seg_color = (100, 220, 150, 255) if (values[i] + values[i + 1]) >= 0 else (230, 90, 90, 255)
+        d.line((x_a, y_a, x_b, y_b), fill=seg_color, width=2)
+    for (px, py), v in zip(pts, values):
+        c = (100, 220, 150, 255) if v >= 0 else (230, 90, 90, 255)
+        d.ellipse((px - 3, py - 3, px + 3, py + 3), fill=c)
+    for i, day in enumerate(days):
+        px = x0 + i * step_x
+        dw = text_w(d, day, font(8))
+        d.text((px - dw / 2, y1 + 4), day, font=font(8), fill=sub_color)
+
+
+def generate_ordre_image(order_name: str, members: list, tresorerie: int, week_profit: list, week_days: list, salons: list, out_path: str):
+    """
+    members : liste de tuples (label, count, (r,g,b)) — n'inclut QUE les rôles réellement présents dans cet ordre
+    week_profit : liste de 7 valeurs (int, peuvent être négatives)
+    week_days : liste de 7 libellés courts, ex ["Lun","Mar",...]
+    salons : liste de tuples (nom_salon, statut) — statut parmi "Acheté", "Louée", "Location"
+    """
+    W = 1300
+    BG = (13, 13, 17, 255)
+    CARD = (20, 20, 26, 255)
+    TEXT = (235, 235, 240, 255)
+    SUB = (150, 150, 160, 255)
+    ACCENT = (255, 165, 60, 255)
+
+    top_y = 100
+    top_h = 320
+    gap = 20
+
+    # calcule la hauteur necessaire pour la zone salons AVANT de creer l'image (flux adaptatif)
+    f_name = font(12, True)
+    f_badge = font(10, True)
+    card_h = 62
+    gap_x = 14
+    gap_y = 14
+    zone_x0, zone_x1 = 60, W - 60
+
+    dummy = Image.new("RGBA", (10, 10))
+    dd = ImageDraw.Draw(dummy)
+    cx = zone_x0
+    rows = 1
+    for salon_name, status in salons:
+        name_txt = f"#{salon_name}"
+        name_w = text_w(dd, name_txt, f_name)
+        badge_w = text_w(dd, status, f_badge) + 20
+        cw = max(name_w, badge_w) + 28
+        if cx + cw > zone_x1:
+            cx = zone_x0
+            rows += 1
+        cx += cw + gap_x
+    salons_content_h = 66 + rows * (card_h + gap_y)
+
+    salons_y0 = top_y + top_h + 30
+    H = salons_y0 + salons_content_h + 30
+
+    img = Image.new("RGBA", (W, H), BG)
+    d = ImageDraw.Draw(img)
+
+    d.text((40, 30), order_name, font=font(24, True), fill=ACCENT)
+    d.line((40, 76, W - 40, 76), fill=(40, 40, 48, 255), width=1)
+
+    col_w = (W - 40 * 2 - gap * 2) // 3
+
+    # Effectifs
+    x1_ = 40
+    _ordre_rounded(d, (x1_, top_y, x1_ + col_w, top_y + top_h), 12, outline=ACCENT, width=1, fill=CARD)
+    d.text((x1_ + 16, top_y + 14), "EFFECTIFS", font=font(13, True), fill=ACCENT)
+    y = top_y + 46
+    for label, count, color in members:
+        _ordre_member_row(d, x1_ + 16, y, col_w - 32, label, count, color, TEXT)
+        y += 46
+
+    # Tresorerie
+    x2_ = x1_ + col_w + gap
+    _ordre_rounded(d, (x2_, top_y, x2_ + col_w, top_y + top_h), 12, outline=ACCENT, width=1, fill=CARD)
+    d.text((x2_ + 16, top_y + 14), "TRÉSORERIE DE L'ORDRE", font=font(13, True), fill=ACCENT)
+    solde_txt = f"{tresorerie:,} ¥".replace(",", " ")
+    sw = text_w(d, solde_txt, font(30, True))
+    solde_color = (120, 230, 170, 255) if tresorerie >= 0 else (230, 90, 90, 255)
+    d.text((x2_ + col_w / 2 - sw / 2, top_y + top_h / 2 - 15), solde_txt, font=font(30, True), fill=solde_color)
+    d.text((x2_ + 16, top_y + top_h - 30), "Solde actuel", font=font(10), fill=SUB)
+
+    # Profit
+    x3_ = x2_ + col_w + gap
+    _ordre_rounded(d, (x3_, top_y, x3_ + col_w, top_y + top_h), 12, outline=ACCENT, width=1, fill=CARD)
+    d.text((x3_ + 16, top_y + 14), "PROFIT DE LA SEMAINE", font=font(13, True), fill=ACCENT)
+    _ordre_line_chart(d, x3_ + 24, top_y + 60, x3_ + col_w - 24, top_y + top_h - 40, week_profit, week_days, SUB)
+
+    # Salons (flux adaptatif)
+    _ordre_rounded(d, (40, salons_y0, W - 40, H - 40), 14, outline=ACCENT, width=1, fill=CARD)
+    d.text((60, salons_y0 + 16), "SALONS", font=font(15, True), fill=ACCENT)
+    d.line((60, salons_y0 + 46, W - 60, salons_y0 + 46), fill=(40, 40, 48, 255), width=1)
+
+    if not salons:
+        d.text((60, salons_y0 + 66), "Aucun salon pour l'instant.", font=font(12), fill=SUB)
+    else:
+        cx, cy = zone_x0, salons_y0 + 66
+        for salon_name, status in salons:
+            name_txt = f"#{salon_name}"
+            status_color = ORDRE_STATUS_COLORS.get(status, (150, 150, 160))
+            name_w = text_w(d, name_txt, f_name)
+            badge_w = text_w(d, status, f_badge) + 20
+            cw = max(name_w, badge_w) + 28
+
+            if cx + cw > zone_x1:
+                cx = zone_x0
+                cy += card_h + gap_y
+
+            d.rounded_rectangle((cx, cy, cx + cw, cy + card_h), radius=8, fill=(28, 28, 34, 255))
+            d.rectangle((cx, cy, cx + 4, cy + card_h), fill=status_color)
+            d.text((cx + 14, cy + 10), name_txt, font=f_name, fill=TEXT)
+            d.rounded_rectangle((cx + 14, cy + 34, cx + 14 + badge_w, cy + 34 + 18), radius=8, fill=status_color)
+            d.text((cx + 14 + 10, cy + 36), status, font=f_badge, fill=(15, 15, 18, 255))
+
+            cx += cw + gap_x
+
+    img.save(out_path)
+    return out_path
+
+
+def generate_ordre_educatif_image(order_name: str, members: list, ca_total: int, week_profit: list, week_days: list, out_path: str):
+    """
+    Variante ÉDUCATIF du dashboard : 3 cadres en haut (Effectifs / Chiffre d'affaire total des
+    éducateurs à la place de Trésorerie / Profit de la semaine) et un cadre bas CONTRATS (placeholder
+    tant que le système de contrats n'existe pas). Réutilise le même style que generate_ordre_image.
+    members : liste de tuples (label, count, (r,g,b)).
+    """
+    W = 1300
+    BG = (13, 13, 17, 255)
+    CARD = (20, 20, 26, 255)
+    TEXT = (235, 235, 240, 255)
+    SUB = (150, 150, 160, 255)
+    ACCENT = (255, 165, 60, 255)
+
+    top_y = 100
+    top_h = 320
+    gap = 20
+
+    contrats_y0 = top_y + top_h + 30
+    contrats_h = 160
+    H = contrats_y0 + contrats_h + 30
+
+    img = Image.new("RGBA", (W, H), BG)
+    d = ImageDraw.Draw(img)
+
+    d.text((40, 30), order_name, font=font(24, True), fill=ACCENT)
+    d.line((40, 76, W - 40, 76), fill=(40, 40, 48, 255), width=1)
+
+    col_w = (W - 40 * 2 - gap * 2) // 3
+
+    # Effectifs
+    x1_ = 40
+    _ordre_rounded(d, (x1_, top_y, x1_ + col_w, top_y + top_h), 12, outline=ACCENT, width=1, fill=CARD)
+    d.text((x1_ + 16, top_y + 14), "EFFECTIFS", font=font(13, True), fill=ACCENT)
+    y = top_y + 46
+    for label, count, color in members:
+        _ordre_member_row(d, x1_ + 16, y, col_w - 32, label, count, color, TEXT)
+        y += 46
+
+    # Chiffre d'affaire total des educateurs (a la place de la tresorerie)
+    x2_ = x1_ + col_w + gap
+    _ordre_rounded(d, (x2_, top_y, x2_ + col_w, top_y + top_h), 12, outline=ACCENT, width=1, fill=CARD)
+    d.text((x2_ + 16, top_y + 14), "CHIFFRE D'AFFAIRE DES ÉDUCATEURS", font=font(11, True), fill=ACCENT)
+    ca_txt = f"{ca_total:,} ¥".replace(",", " ")
+    sw = text_w(d, ca_txt, font(30, True))
+    ca_color = (120, 230, 170, 255) if ca_total >= 0 else (230, 90, 90, 255)
+    d.text((x2_ + col_w / 2 - sw / 2, top_y + top_h / 2 - 15), ca_txt, font=font(30, True), fill=ca_color)
+    d.text((x2_ + 16, top_y + top_h - 30), "Total reversé aux éducateurs", font=font(10), fill=SUB)
+
+    # Profit
+    x3_ = x2_ + col_w + gap
+    _ordre_rounded(d, (x3_, top_y, x3_ + col_w, top_y + top_h), 12, outline=ACCENT, width=1, fill=CARD)
+    d.text((x3_ + 16, top_y + 14), "PROFIT DE LA SEMAINE", font=font(13, True), fill=ACCENT)
+    _ordre_line_chart(d, x3_ + 24, top_y + 60, x3_ + col_w - 24, top_y + top_h - 40, week_profit, week_days, SUB)
+
+    # Contrats (placeholder)
+    _ordre_rounded(d, (40, contrats_y0, W - 40, H - 40), 14, outline=ACCENT, width=1, fill=CARD)
+    d.text((60, contrats_y0 + 16), "CONTRATS", font=font(15, True), fill=ACCENT)
+    d.line((60, contrats_y0 + 46, W - 60, contrats_y0 + 46), fill=(40, 40, 48, 255), width=1)
+    d.text((60, contrats_y0 + 70), "Aucun contrat pour l'instant (système à venir).", font=font(12), fill=SUB)
+
+    img.save(out_path)
+    return out_path

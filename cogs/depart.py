@@ -2881,6 +2881,19 @@ def delete_character_cascade(character_id):
             "DELETE FROM character_relations WHERE character_id = ? OR related_character_id = ?",
             (character_id, character_id),
         )
+        # Ordres (/ordre) : si ce personnage est CHEF d'un ordre, on NE supprime PAS l'ordre
+        # automatiquement (log clair pour le staff), on le retire seulement de order_members ailleurs.
+        chef_order = conn.execute(
+            "SELECT id, name FROM orders WHERE chef_character_id = ?", (character_id,)
+        ).fetchone()
+        if chef_order is not None:
+            # TODO : décider quoi faire d'un ordre dont le chef est supprimé, à ajouter aux points non abordés
+            print(
+                f"[cascade] Personnage {character_id} supprimé alors qu'il est CHEF de l'ordre "
+                f"#{chef_order['id']} « {chef_order['name']} » : l'ordre n'est PAS supprimé automatiquement, "
+                f"à traiter manuellement."
+            )
+        conn.execute("DELETE FROM order_members WHERE character_id = ?", (character_id,))
 
 
 class DeleteConfirmView(discord.ui.View):
