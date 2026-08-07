@@ -1007,10 +1007,12 @@ class Banque(commands.Cog):
         await interaction.response.send_message("💸 Virement — suis les instructions ci-dessous.", ephemeral=True)
         channel = interaction.channel
 
-        # 1) IBAN destinataire (courant OU livret). On accepte son PROPRE Livret A.
+        # 1) IBAN destinataire : compte personnel (courant OU livret, y compris son propre Livret A)
+        # OU compte d'un ORDRE (orders.iban).
         dest = None
+        dest_order = None
         dest_iban = None
-        while dest is None:
+        while dest is None and dest_order is None:
             await channel.send("Entre l'IBAN du destinataire (format JA suivi de 13 chiffres).")
             m = await self.wait_message(channel, interaction.user)
             if m is None:
@@ -1018,16 +1020,22 @@ class Banque(commands.Cog):
                 return
             iban = m.content.strip().upper().replace(" ", "")
             found = find_account_by_any_iban(iban)
-            if found is None:
-                await channel.send("❌ Aucun compte trouvé avec cet IBAN. Réessaie.")
-            elif found["character_id"] == character_id and found["type_compte"] == "courant":
-                await channel.send(
-                    "❌ Tu ne peux pas te virer de l'argent sur ton propre compte courant "
-                    "(utilise ton IBAN Livret A pour épargner). Réessaie."
-                )
+            if found is not None:
+                if found["character_id"] == character_id and found["type_compte"] == "courant":
+                    await channel.send(
+                        "❌ Tu ne peux pas te virer de l'argent sur ton propre compte courant "
+                        "(utilise ton IBAN Livret A pour épargner). Réessaie."
+                    )
+                else:
+                    dest = found
+                    dest_iban = iban
             else:
-                dest = found
-                dest_iban = iban
+                order_row = db.get_order_by_iban(iban)
+                if order_row is not None:
+                    dest_order = order_row
+                    dest_iban = iban
+                else:
+                    await channel.send("❌ Aucun compte trouvé avec cet IBAN. Réessaie.")
 
         # 2) Montant : entier STRICTEMENT positif et <= solde_courant de l'expéditeur.
         amount = None
@@ -1050,9 +1058,22 @@ class Banque(commands.Cog):
                 continue
             amount = val
 
-        # 3) Application : crédite le destinataire sur le bon solde (courant OU livret),
-        # débite toujours le compte courant de l'expéditeur.
+        # 3) Application : débite toujours le compte courant de l'expéditeur.
         sender_iban = account["iban_courant"]
+
+        # Cas destinataire = ORDRE : on crédite orders.solde_courant + order_transactions.
+        if dest_order is not None:
+            db.adjust_order_solde(dest_order["id"], amount)
+            db.add_order_transaction(dest_order["id"], f"Virement reçu de {sender_iban}", amount, _now())
+            add_transaction(character_id, f"Virement envoyé à l'ordre {dest_order['name']}", -amount, dest_iban)
+            await self.apply_debit(character_id, amount, interaction.guild, compte="courant")
+            await channel.send(
+                f"✅ Virement de {amount:,} ¥ envoyé à l'ordre **{dest_order['name']}** avec succès !"
+            )
+            await self.show_account_screen(channel, character_id)
+            return
+
+        # Cas destinataire = compte personnel : crédite le bon solde (courant OU livret).
         dest_target = dest["type_compte"]  # "courant" | "livret"
         credit_account(dest["character_id"], dest_target, amount)
         if dest_target == "livret":

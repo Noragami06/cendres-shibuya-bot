@@ -14,11 +14,17 @@ from discord.ext import commands
 from cogs.utils import database as db
 from cogs.utils.image_gen import (
     generate_ordre_image, generate_ordre_educatif_image, generate_contrats_educatifs_image,
-    generate_staff_image,
+    generate_staff_image, generate_contrats_direct_image,
+    generate_pin_image, generate_tresorerie_ordre_image,
 )
 # Helpers bancaires déjà existants (personnages / comptes / couleur). apply_debit est une MÉTHODE
 # du cog Banque (protection découvert + compte à rebours) : on la récupère via get_cog("Banque").
-from cogs.banque import get_characters, get_character, get_account, PHOENIX_COLOR
+# On réutilise aussi tels quels l'IBAN/PIN, l'affichage du clavier PIN, la fenêtre de session (1 h)
+# et le format de date, pour ne pas dupliquer la logique de /banque.
+from cogs.banque import (
+    get_characters, get_character, get_account, PHOENIX_COLOR,
+    generate_unique_iban, generate_pin_code, _pin_values, _within_1h, _fmt_date, OWNER_ID,
+)
 # Méthode standard du projet : rôle appliqué à un PERSONNAGE (réel slot 1 / virtuel slot 2-3).
 from cogs.profil import character_has_role
 
@@ -336,6 +342,19 @@ class ContratsPageView(discord.ui.View):
             custom_id=f"ordre_contrats_next:{order_id}:{user_id}:{page}", disabled=(page >= total_pages)))
 
 
+class ContratsDirectPageView(discord.ui.View):
+    """Pagination persistante sous la pillow des contrats côté ordre employeur (Direct/Hybride)."""
+
+    def __init__(self, order_id, user_id, page, total_pages):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Page précédente", emoji="◀️", style=discord.ButtonStyle.secondary,
+            custom_id=f"ordre_cdir_prev:{order_id}:{user_id}:{page}", disabled=(page <= 1)))
+        self.add_item(discord.ui.Button(
+            label="Page suivante", emoji="▶️", style=discord.ButtonStyle.secondary,
+            custom_id=f"ordre_cdir_next:{order_id}:{user_id}:{page}", disabled=(page >= total_pages)))
+
+
 class OrdreStaffView(discord.ui.View):
     """Sous la pillow du staff : pagination (ligne 0, seulement si plusieurs pages, page encodée dans
     le custom_id) + actions Ajouter / Virer / Muter (ligne 1)."""
@@ -360,6 +379,59 @@ class OrdreStaffView(discord.ui.View):
             custom_id=f"ordre_staff_mute:{order_id}:{user_id}", row=1))
 
 
+# --- Banque de l'ordre (réutilise le principe du clavier PIN de /banque) ---
+class OrdrePinOpenView(discord.ui.View):
+    def __init__(self, order_id, user_id):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Entrer le code", emoji="🔓", style=discord.ButtonStyle.primary,
+            custom_id=f"ordre_pin_open:{order_id}:{user_id}"))
+
+
+class OrdrePinKeypadView(discord.ui.View):
+    """Clavier numérique de saisie du code de l'ordre (mêmes boutons/logique que /banque)."""
+
+    def __init__(self, order_id, user_id):
+        super().__init__(timeout=None)
+        base = f"{order_id}:{user_id}"
+        for row, digits in enumerate((["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"])):
+            for dg in digits:
+                self.add_item(discord.ui.Button(
+                    label=dg, style=discord.ButtonStyle.secondary,
+                    custom_id=f"ordre_pin_digit:{base}:{dg}", row=row))
+        self.add_item(discord.ui.Button(
+            label="⌫", style=discord.ButtonStyle.danger, custom_id=f"ordre_pin_clear:{base}", row=3))
+        self.add_item(discord.ui.Button(
+            label="0", style=discord.ButtonStyle.secondary, custom_id=f"ordre_pin_digit:{base}:0", row=3))
+        self.add_item(discord.ui.Button(
+            label="✅", style=discord.ButtonStyle.success, custom_id=f"ordre_pin_confirm:{base}", row=3))
+
+
+class OrdrePinErrorView(discord.ui.View):
+    def __init__(self, order_id, user_id):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Réessayer", emoji="🔁", style=discord.ButtonStyle.danger,
+            custom_id=f"ordre_pin_retry:{order_id}:{user_id}"))
+        self.add_item(discord.ui.Button(
+            label="Recevoir mon code", emoji="📩", style=discord.ButtonStyle.secondary,
+            custom_id=f"ordre_resend_pin:{order_id}:{user_id}"))
+
+
+class TresorerieView(discord.ui.View):
+    def __init__(self, order_id, user_id):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="IBAN", emoji="📇", style=discord.ButtonStyle.secondary,
+            custom_id=f"ordre_iban:{order_id}"))
+        self.add_item(discord.ui.Button(
+            label="Virement", emoji="💸", style=discord.ButtonStyle.primary,
+            custom_id=f"ordre_virement:{order_id}:{user_id}"))
+        self.add_item(discord.ui.Button(
+            label="Salaire", emoji="💰", style=discord.ButtonStyle.secondary,
+            custom_id=f"ordre_salaire:{order_id}"))
+
+
 # =====================================================================
 # COG
 # =====================================================================
@@ -368,6 +440,7 @@ class Ordre(commands.Cog):
         self.bot = bot
         self._active_users = set()   # isolation des flux textuels par joueur
         self._creating = set()       # anti double-clic sur la création (par character_id)
+        self._pin_buffers = {}       # saisie du code de la banque d'ordre, clé (user_id, order_id)
 
     # ---------- verrou de flux ----------
     def _acquire(self, user_id) -> bool:
@@ -550,7 +623,31 @@ class Ordre(commands.Cog):
             await self.handle_contrats_page(interaction, cid, "next")
         elif cid.startswith("ordre_contrats_view:"):
             await self.handle_contrats(interaction, cid)
-        elif cid.startswith("ordre_contrat:") or cid.startswith("ordre_tresorerie:"):
+        elif cid.startswith("ordre_cdir_prev:"):
+            await self.handle_contrats_direct_page(interaction, cid, "prev")
+        elif cid.startswith("ordre_cdir_next:"):
+            await self.handle_contrats_direct_page(interaction, cid, "next")
+        elif cid.startswith("ordre_contrat:"):
+            await self.handle_contrats_direct(interaction, cid)
+        elif cid.startswith("ordre_tresorerie:"):
+            await self.handle_tresorerie(interaction, cid)
+        elif cid.startswith("ordre_pin_open:"):
+            await self.handle_pin_open(interaction, cid)
+        elif cid.startswith("ordre_pin_digit:"):
+            await self.handle_pin_digit(interaction, cid)
+        elif cid.startswith("ordre_pin_clear:"):
+            await self.handle_pin_clear(interaction, cid)
+        elif cid.startswith("ordre_pin_confirm:"):
+            await self.handle_pin_confirm(interaction, cid)
+        elif cid.startswith("ordre_pin_retry:"):
+            await self.handle_pin_retry(interaction, cid)
+        elif cid.startswith("ordre_resend_pin:"):
+            await self.handle_resend_pin(interaction, cid)
+        elif cid.startswith("ordre_iban:"):
+            await self.handle_iban(interaction, cid)
+        elif cid.startswith("ordre_virement:"):
+            await self.handle_virement(interaction, cid)
+        elif cid.startswith("ordre_salaire:"):
             await self.handle_placeholder(interaction, cid)
 
     # =================================================================
@@ -639,10 +736,15 @@ class Ordre(commands.Cog):
             name_full = (char["character_name"] if char and char["character_name"] else "?").strip()
             prenom = name_full.split()[0] if name_full else "?"
             now = _now()
-            order_id = db.create_order(character_id, type_, f"Ordre de {prenom}", now)
+            order_name = f"Ordre de {prenom}"
+            order_id = db.create_order(character_id, type_, order_name, now)
             db.add_order_transaction(order_id, "Frais de construction", -prix, now)
+            # Compte bancaire de l'ordre créé automatiquement (IBAN + code envoyés en DM).
+            await self._setup_order_bank(interaction, order_id, order_name)
             await channel.send(embed=discord.Embed(
-                description=f"✅ **{info['label']}** créé ! ({_fmt(prix)} ¥ débités)", color=PHOENIX_COLOR,
+                description=f"✅ **{info['label']}** créé ! ({_fmt(prix)} ¥ débités)\n"
+                            "🏦 Le compte bancaire de l'ordre t'a été envoyé en message privé.",
+                color=PHOENIX_COLOR,
             ))
             await self._send_dashboard(channel, db.get_order(order_id), user_id)
         finally:
@@ -765,6 +867,304 @@ class Ordre(commands.Cog):
         await interaction.response.edit_message(
             attachments=[discord.File(path, filename="contrats.png")], view=view)
         _rm(path)
+
+    # =================================================================
+    # CONTRATS CÔTÉ EMPLOYEUR (bouton "📄 Contrat" des ordres Direct/Hybride)
+    # =================================================================
+    def _contrats_direct_data(self, order_id):
+        """Contrats actifs côté ordre employeur :
+        [(nom_disciple, ordre_origine, educateur, montant_str), ...]."""
+        # TODO : brancher sur la vraie table de contrats une fois le système de négociation
+        # éducateur/joueur développé (point non abordé).
+        return []
+
+    async def _send_contrats_direct(self, channel, order_id, user_id, page):
+        order = db.get_order(order_id)
+        contrats = self._contrats_direct_data(order_id)
+        path = _tmp("cdir")
+        path, total_pages = generate_contrats_direct_image(order["name"], contrats, page, path)
+        view = ContratsDirectPageView(order_id, user_id, max(1, min(page, total_pages)), total_pages) \
+            if total_pages > 1 else None
+        await channel.send(file=discord.File(path, filename="contrats.png"), view=view)
+        _rm(path)
+
+    async def handle_contrats_direct(self, interaction, cid):
+        order_id = int(cid.split(":")[1])
+        if not self._is_chief(order_id, interaction.user.id):
+            await interaction.response.send_message("Seul le chef de l'ordre peut faire ça.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self._send_contrats_direct(interaction.channel, order_id, interaction.user.id, 1)
+
+    async def handle_contrats_direct_page(self, interaction, cid, direction):
+        _, order_id, user_id, page = cid.split(":")
+        order_id, user_id, page = int(order_id), int(user_id), int(page)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Cette pagination n'est pas la tienne.", ephemeral=True)
+            return
+        new_page = page + (1 if direction == "next" else -1)
+        order = db.get_order(order_id)
+        contrats = self._contrats_direct_data(order_id)
+        path = _tmp("cdir")
+        path, total_pages = generate_contrats_direct_image(order["name"], contrats, new_page, path)
+        clamped = max(1, min(new_page, total_pages))
+        view = ContratsDirectPageView(order_id, user_id, clamped, total_pages) if total_pages > 1 else None
+        await interaction.response.edit_message(
+            attachments=[discord.File(path, filename="contrats.png")], view=view)
+        _rm(path)
+
+    # =================================================================
+    # BANQUE DE L'ORDRE (bouton "💰 Trésorerie" : compte + code PIN + virement)
+    # =================================================================
+    def _generate_order_creds(self):
+        """IBAN unique (vs comptes personnels ET ordres) + code PIN à 4 chiffres, en réutilisant les
+        générateurs de /banque."""
+        pin = generate_pin_code()
+        with db.get_connection() as conn:
+            cur = conn.cursor()
+            while True:
+                iban = generate_unique_iban(cur)  # unicité vs bank_accounts
+                if cur.execute("SELECT 1 FROM orders WHERE iban = ?", (iban,)).fetchone() is None:
+                    return iban, pin
+
+    async def _setup_order_bank(self, interaction, order_id, order_name):
+        """Crée le compte de l'ordre (IBAN + code) et envoie les identifiants en DM au chef, avec copie
+        au propriétaire du bot."""
+        iban, pin = self._generate_order_creds()
+        db.set_order_bank_creds(order_id, iban, pin)
+        dm_text = (
+            "🏦 Ton ordre a maintenant un compte bancaire !\n\n"
+            f"**IBAN :** {iban}\n"
+            f"**Code secret :** {pin}\n\n"
+            "Garde ces informations précieusement."
+        )
+        try:
+            await interaction.user.send(dm_text)
+        except discord.HTTPException:
+            pass
+        try:
+            owner_user = await self.bot.fetch_user(OWNER_ID)
+            await owner_user.send(
+                f"Compte d'ordre créé — **{order_name}** (chef {interaction.user.mention})\n\n{dm_text}")
+        except discord.HTTPException:
+            pass
+
+    # ---------- clavier PIN ----------
+    def _render_order_pin(self, buffer):
+        path = _tmp("pin")
+        generate_pin_image(None, _pin_values(buffer), path)  # None : un ordre n'a pas de portrait
+        return path
+
+    async def _refresh_order_keypad(self, interaction, order_id, user_id):
+        buf = self._pin_buffers.get((user_id, order_id), "")
+        path = self._render_order_pin(buf)
+        await interaction.response.edit_message(
+            attachments=[discord.File(path, filename="pin.png")],
+            view=OrdrePinKeypadView(order_id, user_id))
+        _rm(path)
+
+    async def handle_tresorerie(self, interaction, cid):
+        order_id = int(cid.split(":")[1])
+        if not self._is_chief(order_id, interaction.user.id):
+            await interaction.response.send_message("Seul le chef de l'ordre peut faire ça.", ephemeral=True)
+            return
+        user_id = interaction.user.id
+        sess = db.get_order_bank_session(user_id, order_id)
+        if sess and _within_1h(sess["verified_at"]):
+            await interaction.response.defer()
+            await self._send_tresorerie(interaction.channel, order_id, user_id)
+            return
+        # Sinon : écran de saisie du code.
+        self._pin_buffers[(user_id, order_id)] = ""
+        path = self._render_order_pin("")
+        await interaction.response.send_message(
+            content="🔒 Vérifie ton identité pour accéder à la trésorerie de l'ordre.",
+            file=discord.File(path, filename="pin.png"),
+            view=OrdrePinOpenView(order_id, user_id))
+        _rm(path)
+
+    async def handle_pin_open(self, interaction, cid):
+        _, order_id, user_id = cid.split(":")
+        order_id, user_id = int(order_id), int(user_id)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
+            return
+        self._pin_buffers[(user_id, order_id)] = ""
+        path = self._render_order_pin("")
+        await interaction.response.edit_message(
+            content="🔒 Entre le code secret de l'ordre à l'aide du clavier ci dessous.",
+            attachments=[discord.File(path, filename="pin.png")],
+            view=OrdrePinKeypadView(order_id, user_id))
+        _rm(path)
+
+    async def handle_pin_digit(self, interaction, cid):
+        parts = cid.split(":")  # ordre_pin_digit:{oid}:{uid}:{digit}
+        order_id, user_id, digit = int(parts[1]), int(parts[2]), parts[3]
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce clavier ne t'appartient pas.", ephemeral=True)
+            return
+        buf = self._pin_buffers.get((user_id, order_id), "")
+        if len(buf) >= 4:
+            await interaction.response.defer()
+            return
+        self._pin_buffers[(user_id, order_id)] = buf + digit
+        await self._refresh_order_keypad(interaction, order_id, user_id)
+
+    async def handle_pin_clear(self, interaction, cid):
+        parts = cid.split(":")  # ordre_pin_clear:{oid}:{uid}
+        order_id, user_id = int(parts[1]), int(parts[2])
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce clavier ne t'appartient pas.", ephemeral=True)
+            return
+        buf = self._pin_buffers.get((user_id, order_id), "")
+        self._pin_buffers[(user_id, order_id)] = buf[:-1] if buf else ""
+        await self._refresh_order_keypad(interaction, order_id, user_id)
+
+    async def handle_pin_confirm(self, interaction, cid):
+        parts = cid.split(":")  # ordre_pin_confirm:{oid}:{uid}
+        order_id, user_id = int(parts[1]), int(parts[2])
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce clavier ne t'appartient pas.", ephemeral=True)
+            return
+        buf = self._pin_buffers.get((user_id, order_id), "")
+        if len(buf) != 4:
+            await interaction.response.send_message("Entre les 4 chiffres avant de valider.", ephemeral=True)
+            return
+        order = db.get_order(order_id)
+        if order and buf == order["pin_code"]:
+            self._pin_buffers[(user_id, order_id)] = ""
+            db.set_order_bank_session(user_id, order_id, _now())
+            path, view = self._build_tresorerie(order_id, user_id)
+            await interaction.response.edit_message(
+                content=None, embed=None,
+                attachments=[discord.File(path, filename="tresorerie.png")], view=view)
+            _rm(path)
+        else:
+            self._pin_buffers[(user_id, order_id)] = ""
+            embed = discord.Embed(description="❌ Code incorrect.", color=discord.Color.red())
+            await interaction.response.edit_message(
+                content=None, embed=embed, attachments=[], view=OrdrePinErrorView(order_id, user_id))
+
+    async def handle_pin_retry(self, interaction, cid):
+        parts = cid.split(":")  # ordre_pin_retry:{oid}:{uid}
+        order_id, user_id = int(parts[1]), int(parts[2])
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce clavier ne t'appartient pas.", ephemeral=True)
+            return
+        self._pin_buffers[(user_id, order_id)] = ""
+        path = self._render_order_pin("")
+        await interaction.response.edit_message(
+            content="🔒 Entre le code secret de l'ordre à l'aide du clavier ci dessous.",
+            embed=None, attachments=[discord.File(path, filename="pin.png")],
+            view=OrdrePinKeypadView(order_id, user_id))
+        _rm(path)
+
+    async def handle_resend_pin(self, interaction, cid):
+        _, order_id, user_id = cid.split(":")
+        order_id, user_id = int(order_id), int(user_id)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
+            return
+        order = db.get_order(order_id)
+        if not order or not order["pin_code"]:
+            await interaction.response.send_message("Compte de l'ordre introuvable.", ephemeral=True)
+            return
+        try:
+            await interaction.user.send(
+                f"🔑 Code secret de la banque de l'ordre **{order['name']}** : **{order['pin_code']}**\n"
+                "Ne le partage avec personne.")
+            await interaction.response.send_message("📩 Le code t'a été renvoyé en message privé.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ Impossible de t'envoyer un MP (ouvre tes messages privés).", ephemeral=True)
+
+    # ---------- écran trésorerie ----------
+    def _build_tresorerie(self, order_id, user_id):
+        order = db.get_order(order_id)
+        nb_salons = db.count_order_salons(order_id, "Acheté")
+        txs = db.get_recent_order_transactions(order_id, 4)
+        transactions = [
+            (t["label"], _fmt_date(t["date"]),
+             (f"+{_fmt(t['amount'])} ¥" if t["amount"] >= 0 else f"-{_fmt(-t['amount'])} ¥"),
+             t["amount"] >= 0)
+            for t in txs
+        ]
+        path = _tmp("tresor")
+        generate_tresorerie_ordre_image(
+            order["name"], order["solde_courant"], nb_salons, TAXE_SALON, None, transactions, path)
+        return path, TresorerieView(order_id, user_id)
+
+    async def _send_tresorerie(self, channel, order_id, user_id):
+        path, view = self._build_tresorerie(order_id, user_id)
+        await channel.send(file=discord.File(path, filename="tresorerie.png"), view=view)
+        _rm(path)
+
+    async def handle_iban(self, interaction, cid):
+        order_id = int(cid.split(":")[1])
+        order = db.get_order(order_id)
+        if not order or not order["iban"]:
+            await interaction.response.send_message("Cet ordre n'a pas d'IBAN.", ephemeral=True)
+            return
+        # Publiquement (ephemeral=False) : l'IBAN est fait pour être partagé afin de recevoir des virements.
+        await interaction.response.send_message(f"**IBAN de l'ordre :** {order['iban']}", ephemeral=False)
+
+    async def handle_virement(self, interaction, cid):
+        _, order_id, user_id = cid.split(":")
+        order_id, user_id = int(order_id), int(user_id)
+        if not self._is_chief(order_id, interaction.user.id):
+            await interaction.response.send_message("Seul le chef de l'ordre peut faire ça.", ephemeral=True)
+            return
+        if not self._acquire(interaction.user.id):
+            await interaction.response.send_message(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True)
+            return
+        try:
+            await interaction.response.send_message(
+                "💸 Virement de l'ordre — suis les instructions ci-dessous.", ephemeral=True)
+            channel = interaction.channel
+            # 1) IBAN de l'ordre destinataire.
+            dest = None
+            while dest is None:
+                await channel.send("Entre l'IBAN de l'ordre destinataire (format JA suivi de 13 chiffres).")
+                m = await self.wait_message(channel, interaction.user)
+                if m is None:
+                    await channel.send("⏳ Virement annulé (délai dépassé).")
+                    return
+                iban = m.content.strip().upper().replace(" ", "")
+                row = db.get_order_by_iban(iban)
+                if row is None:
+                    await channel.send("❌ Aucun ordre trouvé avec cet IBAN. Réessaie.")
+                elif row["id"] == order_id:
+                    await channel.send("❌ Tu ne peux pas virer vers ton propre ordre. Réessaie.")
+                else:
+                    dest = row
+            # 2) Montant : entier > 0 et <= solde de l'ordre expéditeur (aucun découvert autorisé).
+            amount = None
+            while amount is None:
+                await channel.send("Quel montant veux tu envoyer ?")
+                m = await self.wait_message(channel, interaction.user)
+                if m is None:
+                    await channel.send("⏳ Virement annulé (délai dépassé).")
+                    return
+                v = _parse_int(m.content)
+                if v is None or v <= 0:
+                    await channel.send("Le montant doit être un nombre entier positif.")
+                    continue
+                solde = db.get_order(order_id)["solde_courant"]  # revérif temps réel du solde
+                if v > solde:
+                    await channel.send(f"❌ Solde insuffisant (l'ordre a {_fmt(solde)} ¥). Réessaie.")
+                    continue
+                amount = v
+            # 3) Application (aucun découvert pour les ordres).
+            sender = db.get_order(order_id)
+            db.adjust_order_solde(order_id, -amount)
+            db.adjust_order_solde(dest["id"], amount)
+            db.add_order_transaction(order_id, f"Virement envoyé à {dest['iban']}", -amount, _now())
+            db.add_order_transaction(dest["id"], f"Virement reçu de {sender['iban']}", amount, _now())
+            await channel.send(f"✅ Virement de {_fmt(amount)} ¥ envoyé à **{dest['name']}** avec succès !")
+            await self._send_tresorerie(channel, order_id, interaction.user.id)
+        finally:
+            self._release(interaction.user.id)
 
     # =================================================================
     # STAFF

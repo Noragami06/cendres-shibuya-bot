@@ -286,7 +286,16 @@ CREATE TABLE IF NOT EXISTS orders (
     type TEXT,                      -- 'educatif', 'direct', 'hybride'
     name TEXT,
     solde_courant INTEGER DEFAULT 0,
+    iban TEXT,                      -- unicité garantie par idx_orders_iban (créé dans init_db)
+    pin_code TEXT,
     created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS order_bank_sessions (
+    user_id INTEGER,
+    order_id INTEGER,
+    verified_at TEXT,
+    PRIMARY KEY (user_id, order_id)
 );
 
 CREATE TABLE IF NOT EXISTS order_members (
@@ -453,6 +462,19 @@ def _migrate_item_categorie_id(conn):
             )
 
 
+def _ensure_order_columns(conn):
+    """Ajoute iban / pin_code à une table orders préexistante (créée avant l'ajout du système
+    bancaire des ordres). SQLite interdit d'ajouter une colonne UNIQUE via ALTER : l'unicité de
+    l'IBAN est assurée par un index unique créé juste après (idx_orders_iban)."""
+    cols = _column_names(conn, "orders")
+    if not cols:
+        return
+    if "iban" not in cols:
+        conn.execute("ALTER TABLE orders ADD COLUMN iban TEXT")
+    if "pin_code" not in cols:
+        conn.execute("ALTER TABLE orders ADD COLUMN pin_code TEXT")
+
+
 def init_db():
     """Crée les tables manquantes et applique les migrations légères. N'efface jamais de données."""
     with get_connection() as conn:
@@ -463,6 +485,9 @@ def init_db():
         _ensure_progress_columns(conn)
         _ensure_validated_columns(conn)
         _ensure_bank_columns(conn)
+        _ensure_order_columns(conn)
+        # Unicité de l'IBAN d'ordre (fonctionne aussi sur une base migrée ; NULL multiples autorisés).
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_iban ON orders(iban)")
         _migrate_item_categorie_id(conn)
 
 
@@ -1312,6 +1337,50 @@ def get_orders_in_guild(guild_id: int, exclude_order_id=None):
             (guild_id, exclude_order_id, exclude_order_id),
         ).fetchall()
     return [(r["id"], r["name"], r["chef_name"]) for r in rows]
+
+
+# ---------- Banque des ordres ----------
+# NB : le jour où une suppression d'ordre sera implémentée, penser à nettoyer TOUTES les tables liées
+# à l'ordre : orders, order_members, order_salons, order_transactions ET order_bank_sessions.
+def get_order_by_iban(iban: str):
+    with get_connection() as conn:
+        return conn.execute("SELECT * FROM orders WHERE iban = ?", (iban,)).fetchone()
+
+
+def set_order_bank_creds(order_id: int, iban: str, pin_code: str):
+    with get_connection() as conn:
+        conn.execute("UPDATE orders SET iban = ?, pin_code = ? WHERE id = ?", (iban, pin_code, order_id))
+
+
+def get_order_bank_session(user_id: int, order_id: int):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT verified_at FROM order_bank_sessions WHERE user_id = ? AND order_id = ?",
+            (user_id, order_id),
+        ).fetchone()
+
+
+def set_order_bank_session(user_id: int, order_id: int, verified_at: str):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO order_bank_sessions (user_id, order_id, verified_at) VALUES (?, ?, ?)",
+            (user_id, order_id, verified_at),
+        )
+
+
+def get_recent_order_transactions(order_id: int, limit: int = 4):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT label, amount, date FROM order_transactions WHERE order_id = ? ORDER BY id DESC LIMIT ?",
+            (order_id, limit),
+        ).fetchall()
+
+
+def count_order_salons(order_id: int, status: str) -> int:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM order_salons WHERE order_id = ? AND status = ?", (order_id, status)
+        ).fetchone()["n"]
 
 
 def renumber_character_slots(user_id: int, guild_id: int):

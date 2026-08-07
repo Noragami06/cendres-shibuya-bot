@@ -510,12 +510,18 @@ class Profil(commands.Cog):
             ("Maîtrise Territoire", 1, 0), ("RCT", 1, 0),
         ]
         path = _tmp_profile("profil")
+        # --- DIAGNOSTIC TEMPORAIRE (fond) ---
+        print(f"🔍 [profil-bg] Appel à generate_profil_image pour character_id={character_id}")
+        print(f"🔍 [profil-bg] background_path récupéré : {background_path}")
+        print(f"🔍 [profil-bg] Le fichier existe ? {os.path.exists(background_path) if background_path else 'N/A (None)'}")
         generate_profil_image(
             name, (p["pv_actuel"], p["pv_max"]), (p["eo_actuel"], p["eo_max"]), p["level"],
             (p["xp_actuel"], p["xp_max"]), stats, maitrises, clan, rang,
             p["victoires"], p["defaites"], p["nuls"], path,
             portrait_path=portrait_path, background_path=background_path,
         )
+        print(f"🔍 [profil-bg] Image générée avec succès : {path}")
+        # --- fin diagnostic ---
         return path
 
     async def send_profile(self, channel, character_id, user_id):
@@ -551,7 +557,15 @@ class Profil(commands.Cog):
             )
             buffs.append(f"{bname}  →  {parts}" if parts else bname)
         path = _tmp_profile("stats")
+        # --- DIAGNOSTIC TEMPORAIRE (fond) ---
+        print(f"🔍 [profil-bg] Appel à generate_stats_image pour character_id={character_id}")
+        _bg = db.get_background(character_id)
+        background_path = _bg["image_path"] if _bg else None
+        print(f"🔍 [profil-bg] background_path récupéré : {background_path}")
+        print(f"🔍 [profil-bg] Le fichier existe ? {os.path.exists(background_path) if background_path else 'N/A (None)'}")
         generate_stats_image(name, stats, buffs, s["points_restants"], path, portrait_path=portrait_path)
+        print(f"🔍 [profil-bg] Image générée avec succès : {path}")
+        # --- fin diagnostic ---
         return path, s["points_restants"]
 
     async def send_stats(self, channel, character_id, user_id):
@@ -704,7 +718,15 @@ class Profil(commands.Cog):
         portrait_path = char["portrait_path"] if char else None
         relations = self._get_relations(character_id)
         path = _tmp_profile("relations")
+        # --- DIAGNOSTIC TEMPORAIRE (fond) ---
+        print(f"🔍 [profil-bg] Appel à generate_relations_image pour character_id={character_id}")
+        _bg = db.get_background(character_id)
+        background_path = _bg["image_path"] if _bg else None
+        print(f"🔍 [profil-bg] background_path récupéré : {background_path}")
+        print(f"🔍 [profil-bg] Le fichier existe ? {os.path.exists(background_path) if background_path else 'N/A (None)'}")
         path, total_pages = generate_relations_image(name, relations, page, path, portrait_path=portrait_path)
+        print(f"🔍 [profil-bg] Image générée avec succès : {path}")
+        # --- fin diagnostic ---
         clamped = max(1, min(page, total_pages))
         return path, total_pages, clamped
 

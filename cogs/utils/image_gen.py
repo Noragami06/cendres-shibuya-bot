@@ -1547,3 +1547,211 @@ def generate_staff_image(order_name: str, members: list, page: int, out_path: st
 
     img.save(out_path)
     return out_path, total_pages
+
+
+CDIR_BG = (13, 13, 17, 255)
+CDIR_CARD = (20, 20, 26, 255)
+CDIR_TEXT = (235, 235, 240, 255)
+CDIR_SUB = (150, 150, 160, 255)
+CDIR_ACCENT = (255, 165, 60, 255)
+CDIR_ORDER_COLORS_CYCLE = [
+    (255, 165, 60), (90, 150, 240), (100, 200, 150), (230, 90, 90), (190, 100, 240), (100, 220, 220),
+]
+CDIR_CARD_W = 240
+CDIR_CARD_H = 50
+CDIR_GAP_X = 14
+CDIR_GAP_Y = 12
+CDIR_PER_PAGE = 24
+
+def generate_contrats_direct_image(order_name: str, contrats: list, page: int, out_path: str):
+    """
+    contrats : liste de tuples (nom_disciple, ordre_origine, educateur, montant_str)
+               nom_disciple : le membre employé dans CET ordre (order_name), venant d'un ordre éducatif
+               ordre_origine : le nom de l'ordre éducatif où il a été formé
+               educateur : le nom de l'éducateur précis qui touche le %
+               montant_str : déjà formaté, ex "45 000 ¥"
+    page : page à générer (1-indexée)
+    Retourne (chemin_fichier, total_pages)
+    """
+    W = 1200
+    cols = 4
+    header_h = 34
+    x0 = 40
+    y_start = 96
+
+    orders_seen = []
+    grouped = {}
+    for nom, ordre_origine, educateur, montant in contrats:
+        if ordre_origine not in grouped:
+            grouped[ordre_origine] = []
+            orders_seen.append(ordre_origine)
+        grouped[ordre_origine].append((nom, educateur, montant))
+
+    order_colors = {o: CDIR_ORDER_COLORS_CYCLE[i % len(CDIR_ORDER_COLORS_CYCLE)] for i, o in enumerate(orders_seen)}
+
+    flat_items = []
+    for ordre_origine in orders_seen:
+        entries = grouped[ordre_origine]
+        flat_items.append(("header", ordre_origine, len(entries)))
+        for nom, educateur, montant in entries:
+            flat_items.append(("card", nom, (educateur, montant, ordre_origine)))
+
+    pages = []
+    current = []
+    card_count = 0
+    for item in flat_items:
+        if item[0] == "card" and card_count >= CDIR_PER_PAGE:
+            pages.append(current)
+            current = []
+            card_count = 0
+        current.append(item)
+        if item[0] == "card":
+            card_count += 1
+    if current:
+        pages.append(current)
+
+    total_pages = max(1, len(pages))
+    page = max(1, min(page, total_pages))
+    page_items = pages[page - 1] if pages else []
+
+    def layout_pass(items):
+        positions = []
+        x, y = x0, y_start
+        col_i = 0
+        for item in items:
+            if item[0] == "header":
+                if col_i != 0:
+                    y += CDIR_CARD_H + CDIR_GAP_Y
+                x, col_i = x0, 0
+                positions.append(("header", item[1], item[2], x, y))
+                y += header_h
+            else:
+                if col_i >= cols:
+                    col_i = 0
+                    x = x0
+                    y += CDIR_CARD_H + CDIR_GAP_Y
+                positions.append(("card", item[1], item[2], x, y))
+                x += CDIR_CARD_W + CDIR_GAP_X
+                col_i += 1
+        final_y = y + CDIR_CARD_H + 40
+        return positions, final_y
+
+    positions, H = layout_pass(page_items)
+
+    img = Image.new("RGBA", (W, H), CDIR_BG)
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, W, H), outline=CDIR_ACCENT, width=2)
+    d.text((40, 30), f"Contrats — {order_name}", font=font(22, True), fill=CDIR_ACCENT)
+    if total_pages > 1:
+        page_txt = f"Page {page} / {total_pages}"
+        pw = text_w(d, page_txt, font(12))
+        d.text((W - 40 - pw, 36), page_txt, font=font(12), fill=CDIR_SUB)
+    d.line((40, 74, W - 40, 74), fill=(40, 40, 48, 255), width=1)
+
+    if not page_items:
+        d.text((40, 96), "Aucun contrat pour l'instant.", font=font(13), fill=CDIR_SUB)
+
+    for kind, a, b, x, y in positions:
+        if kind == "header":
+            ordre_origine, count = a, b
+            color = order_colors[ordre_origine]
+            d.text((x, y), f"{ordre_origine.upper()} ({count})", font=font(13, True), fill=color)
+        else:
+            nom = a
+            educateur, montant, ordre_origine = b
+            color = order_colors[ordre_origine]
+            d.rounded_rectangle((x, y, x + CDIR_CARD_W, y + CDIR_CARD_H), radius=8, fill=CDIR_CARD)
+            d.rectangle((x, y, x + 4, y + CDIR_CARD_H), fill=color)
+
+            display_name = nom
+            max_text_w = CDIR_CARD_W - 24
+            if text_w(d, display_name, font(11, True)) > max_text_w:
+                while text_w(d, display_name + "...", font(11, True)) > max_text_w and len(display_name) > 1:
+                    display_name = display_name[:-1]
+                display_name = display_name + "..."
+            d.text((x + 14, y + 8), display_name, font=font(11, True), fill=CDIR_TEXT)
+
+            info_txt = f"{educateur} · {montant}"
+            display_info = info_txt
+            if text_w(d, display_info, font(9)) > max_text_w:
+                while text_w(d, display_info + "...", font(9)) > max_text_w and len(display_info) > 1:
+                    display_info = display_info[:-1]
+                display_info = display_info + "..."
+            d.text((x + 14, y + 28), display_info, font=font(9), fill=color)
+
+    img.save(out_path)
+    return out_path, total_pages
+
+
+def _tresorerie_ordre_grad_h(size, c1, c2):
+    w, h = size
+    card = Image.new("RGBA", (w, h), (0, 0, 0, 255))
+    cd = ImageDraw.Draw(card)
+    for x in range(w):
+        t = x / w
+        r = int(c1[0] * (1 - t) + c2[0] * t)
+        g = int(c1[1] * (1 - t) + c2[1] * t)
+        b = int(c1[2] * (1 - t) + c2[2] * t)
+        cd.line([(x, 0), (x, h)], fill=(r, g, b, 255))
+    return card
+
+def generate_tresorerie_ordre_image(order_name, solde, nb_salons, taxe_par_salon, salaires_total, transactions, out_path):
+    W, H = 1200, 650
+    BG = (16, 15, 26, 255)
+    TEXT = (245, 245, 250, 255)
+    SUB = (170, 165, 190, 255)
+    POS = (140, 255, 190, 255)
+    NEG = (255, 140, 160, 255)
+    LABEL = (255, 255, 255, 255)
+    LINE = (50, 47, 65, 255)
+
+    img = Image.new("RGBA", (W, H), BG)
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, W, 74), fill=(22, 20, 34, 255))
+    d.text((40, 22), "Banque de l'Ordre", font=font(18, True), fill=(255, 255, 255, 255))
+    name_w = text_w(d, order_name, font(14, True))
+    d.text((W - 40 - name_w, 27), order_name, font=font(14, True), fill=TEXT)
+
+    card_w = W - 80
+    card = _tresorerie_ordre_grad_h((card_w, 150), (255, 90, 160), (130, 80, 255))
+    mask = Image.new("L", (card_w, 150), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, card_w - 1, 149), radius=20, fill=255)
+    img.paste(card, (40, 100), mask)
+    d.text((64, 122), "SOLDE ACTUEL", font=font(15, True), fill=LABEL)
+    d.text((64, 156), f"{solde:,} ¥".replace(",", " "), font=font(38, True), fill=(255, 255, 255, 255))
+
+    mini_y = 270
+    mini_h = 90
+    mini_w = (W - 80 - 20) // 2
+
+    taxe_totale = nb_salons * taxe_par_salon
+    d.rounded_rectangle((40, mini_y, 40 + mini_w, mini_y + mini_h), radius=16, fill=(28, 26, 40, 255))
+    d.text((60, mini_y + 14), "TAXES DE SALON / SEMAINE", font=font(11, True), fill=SUB)
+    d.text((60, mini_y + 36), f"-{taxe_totale:,} ¥".replace(",", " "), font=font(22, True), fill=NEG)
+    d.text((60, mini_y + 66), f"{nb_salons} salon(s) × {taxe_par_salon:,} ¥".replace(",", " "), font=font(10), fill=SUB)
+
+    rx = 40 + mini_w + 20
+    d.rounded_rectangle((rx, mini_y, rx + mini_w, mini_y + mini_h), radius=16, fill=(28, 26, 40, 255))
+    d.text((rx + 20, mini_y + 14), "SALAIRES / SEMAINE", font=font(11, True), fill=SUB)
+    if salaires_total is None:
+        d.text((rx + 20, mini_y + 36), "À venir", font=font(18, True), fill=SUB)
+    else:
+        d.text((rx + 20, mini_y + 36), f"-{salaires_total:,} ¥".replace(",", " "), font=font(22, True), fill=NEG)
+
+    d.text((40, 388), "Transactions récentes", font=font(16, True), fill=TEXT)
+    d.rounded_rectangle((40, 420, W - 40, H - 30), radius=20, fill=(28, 26, 40, 255))
+    y = 442
+    display_transactions = transactions[:4]
+    for i, (label, date, amount, pos) in enumerate(display_transactions):
+        d.text((64, y), label, font=font(13, True), fill=TEXT)
+        d.text((64, y + 20), date, font=font(11), fill=SUB)
+        aw = text_w(d, amount, font(14, True))
+        d.text((W - 64 - aw, y + 8), amount, font=font(14, True), fill=POS if pos else NEG)
+        if i != len(display_transactions) - 1:
+            d.line((64, y + 50, W - 64, y + 50), fill=LINE, width=1)
+        y += 60
+    if not display_transactions:
+        d.text((64, 450), "Aucune transaction pour l'instant.", font=font(13), fill=SUB)
+
+    img.save(out_path)
+    return out_path
