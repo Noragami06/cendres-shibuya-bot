@@ -935,16 +935,26 @@ def _stats_points_badge(d, x, y, w, h, gold, points_restants):
     d.text((x + w / 2 - tw / 2, y + h / 2 - 8), txt, font=font(13, True), fill=GOLD_STATS)
 
 
-def generate_stats_image(name, stats, buffs, points_restants, out_path, portrait_path=None):
+def generate_stats_image(name, stats, buffs, points_restants, out_path, portrait_path=None, background_path=None):
     """
     stats : liste de 8 tuples (nom, (r,g,b), base_pts, total_pts, pct, tranche_txt)
              ordre attendu : Force, RCT, Vitesse, Territoire, Endurance, Sorts, Armes maudites, Énergie occulte
     buffs : liste de chaines deja formatees, ex "Six Eyes  →  Force +200 · Vitesse +200"
     points_restants : entier
     portrait_path : chemin vers la photo du personnage, integree dans l'hexagone si fournie
+    background_path : image de fond couvrant tout le canvas, floutée + assombrie. Si None/absent : fond uni.
     """
     W, H = 1100, 880
-    img = Image.new("RGBA", (W, H), BG_STATS)
+    # Fond : image floutée + assombrie si fournie, sinon couleur unie (comme avant).
+    if background_path and os.path.exists(background_path):
+        try:
+            bg = ImageOps.fit(Image.open(background_path).convert("RGB"), (W, H), method=Image.LANCZOS)
+            bg = bg.filter(ImageFilter.GaussianBlur(radius=8)).convert("RGBA")
+            img = Image.alpha_composite(bg, Image.new("RGBA", (W, H), (0, 0, 0, 140)))
+        except Exception:
+            img = Image.new("RGBA", (W, H), BG_STATS)
+    else:
+        img = Image.new("RGBA", (W, H), BG_STATS)
     d = ImageDraw.Draw(img)
     d.rectangle((0, 0, W, H), outline=GOLD_STATS, width=2)
 
@@ -1024,10 +1034,11 @@ def _rel_build_columns(relations: dict, max_column_height: int, col_w: int) -> l
     return columns
 
 
-def generate_relations_image(name: str, relations: dict, page: int, out_path: str, portrait_path=None):
+def generate_relations_image(name: str, relations: dict, page: int, out_path: str, portrait_path=None, background_path=None):
     """
     relations : dict {"Famille": [(nom, lien), ...], "Amis": [...], "Autres": [...]}
     page : numéro de page à générer (1-indexé)
+    background_path : image de fond couvrant tout le canvas, floutée + assombrie. Si None/absent : fond uni.
     Retourne (chemin_fichier, total_pages).
     """
     W, H = 1150, 780
@@ -1044,7 +1055,16 @@ def generate_relations_image(name: str, relations: dict, page: int, out_path: st
     HEADER_COLOR_R = (255, 200, 60, 255)
     gold = (232, 197, 121, 255)
 
-    img = Image.new("RGBA", (W, H), BG_R)
+    # Fond : image floutée + assombrie si fournie, sinon couleur unie (comme avant).
+    if background_path and os.path.exists(background_path):
+        try:
+            bg = ImageOps.fit(Image.open(background_path).convert("RGB"), (W, H), method=Image.LANCZOS)
+            bg = bg.filter(ImageFilter.GaussianBlur(radius=8)).convert("RGBA")
+            img = Image.alpha_composite(bg, Image.new("RGBA", (W, H), (0, 0, 0, 140)))
+        except Exception:
+            img = Image.new("RGBA", (W, H), BG_R)
+    else:
+        img = Image.new("RGBA", (W, H), BG_R)
     d = ImageDraw.Draw(img)
     d.rectangle((0, 0, W, H), outline=gold, width=2)
 
