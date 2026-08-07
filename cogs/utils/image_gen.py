@@ -1322,3 +1322,228 @@ def generate_ordre_educatif_image(order_name: str, members: list, ca_total: int,
 
     img.save(out_path)
     return out_path
+
+
+CONTRATS_BG = (13, 13, 17, 255)
+CONTRATS_ACCENT = (255, 165, 60, 255)
+CONTRATS_TEXT = (235, 235, 240, 255)
+CONTRATS_SUB = (150, 150, 160, 255)
+CONTRATS_CARD_COLOR = (100, 200, 220)
+CONTRATS_MAX_PER_BOX = 15
+
+def _contrats_frame(d, xy, gold, width=2, radius=12):
+    d.rounded_rectangle(xy, radius=radius, outline=gold, width=width)
+
+def _contrats_build_boxes(educateurs, max_per_box=CONTRATS_MAX_PER_BOX):
+    """Decoupe chaque educateur en plusieurs boites de max_per_box disciples chacune (jamais plus)."""
+    boxes = []
+    for educ_name, disciples in educateurs:
+        if not disciples:
+            boxes.append({"educateur": educ_name, "is_continuation": False, "disciples": []})
+            continue
+        for i in range(0, len(disciples), max_per_box):
+            chunk = disciples[i:i + max_per_box]
+            boxes.append({"educateur": educ_name, "is_continuation": i > 0, "disciples": chunk})
+    return boxes
+
+def generate_contrats_educatifs_image(order_name: str, educateurs: list, page: int, out_path: str):
+    """
+    educateurs : liste de tuples (nom_educateur, [(nom_disciple, ordre_destination, revenu_str), ...])
+                 Un éducateur SANS disciple doit quand même apparaître avec une case vide.
+    page : page à générer (1-indexée)
+    Retourne (chemin_fichier, total_pages)
+    """
+    W = 1300
+    cols = 3
+    col_gap = 24
+    row_gap = 10
+    box_w = (W - 40 * 2 - col_gap * (cols - 1)) // cols
+    header_h = 46
+    CARD_H = 58
+    fixed_box_height = header_h + CONTRATS_MAX_PER_BOX * (CARD_H + row_gap) + 10
+
+    f_educ = font(14, True)
+    f_name = font(13, True)
+    f_info = font(11)
+
+    boxes = _contrats_build_boxes(educateurs)
+    total_pages = max(1, (len(boxes) + cols - 1) // cols)
+    page = max(1, min(page, total_pages))
+    page_boxes = boxes[(page - 1) * cols: page * cols]
+
+    H = 160 + fixed_box_height
+    img = Image.new("RGBA", (W, H), CONTRATS_BG)
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, W, H), outline=CONTRATS_ACCENT, width=2)
+
+    title = f"Contrats éducatifs — {order_name}"
+    d.text((40, 30), title, font=font(24, True), fill=CONTRATS_ACCENT)
+    if total_pages > 1:
+        page_txt = f"Page {page} / {total_pages}"
+        pw = text_w(d, page_txt, font(13))
+        d.text((W - 40 - pw, 36), page_txt, font=font(13), fill=CONTRATS_SUB)
+    d.line((40, 76, W - 40, 76), fill=(40, 40, 48, 255), width=2)
+
+    y = 100
+    for col, box in enumerate(page_boxes):
+        x = 40 + col * (box_w + col_gap)
+        _contrats_frame(d, (x, y, x + box_w, y + fixed_box_height), CONTRATS_ACCENT, width=2, radius=12)
+
+        educ_title = box["educateur"] + (" (suite)" if box["is_continuation"] else "")
+        et_w = text_w(d, educ_title, f_educ)
+        d.text((x + box_w / 2 - et_w / 2, y + 12), educ_title, font=f_educ, fill=CONTRATS_ACCENT)
+        d.line((x + 14, y + header_h - 6, x + box_w - 14, y + header_h - 6), fill=(45, 42, 50, 255), width=1)
+
+        yy = y + header_h
+        card_w = box_w - 24
+        if not box["disciples"]:
+            d.text((x + 14, yy + 4), "Aucun disciple.", font=f_info, fill=CONTRATS_SUB)
+        for disciple_name, dest_ordre, revenu in box["disciples"]:
+            cx0 = x + 12
+            d.rounded_rectangle((cx0, yy, cx0 + card_w, yy + CARD_H), radius=8, fill=(22, 20, 28, 255))
+            d.rectangle((cx0, yy, cx0 + 4, yy + CARD_H), fill=CONTRATS_CARD_COLOR)
+
+            display_name = disciple_name
+            max_text_w = card_w - 24
+            if text_w(d, display_name, f_name) > max_text_w:
+                while text_w(d, display_name + "...", f_name) > max_text_w and len(display_name) > 1:
+                    display_name = display_name[:-1]
+                display_name = display_name + "..."
+            d.text((cx0 + 14, yy + 6), display_name, font=f_name, fill=CONTRATS_TEXT)
+
+            info_txt = f"{revenu} · {dest_ordre}"
+            display_info = info_txt
+            if text_w(d, display_info, f_info) > max_text_w:
+                while text_w(d, display_info + "...", f_info) > max_text_w and len(display_info) > 1:
+                    display_info = display_info[:-1]
+                display_info = display_info + "..."
+            d.text((cx0 + 14, yy + 40), display_info, font=f_info, fill=CONTRATS_CARD_COLOR)
+
+            yy += CARD_H + row_gap
+
+    img.save(out_path)
+    return out_path, total_pages
+
+
+STAFF_BG = (13, 13, 17, 255)
+STAFF_CARD = (20, 20, 26, 255)
+STAFF_TEXT = (235, 235, 240, 255)
+STAFF_SUB = (150, 150, 160, 255)
+STAFF_ACCENT = (255, 165, 60, 255)
+
+STAFF_ROLE_COLORS = {
+    "Chef d'ordre": (255, 165, 60),
+    "Sous-chef": (230, 90, 90),
+    "Formateur": (100, 200, 150),
+    "Chef d'équipe": (90, 150, 240),
+    "Membre d'équipe": (170, 170, 180),
+    "Corps administratif": (190, 100, 240),
+}
+STAFF_ROLE_ORDER = ["Chef d'ordre", "Sous-chef", "Formateur", "Chef d'équipe", "Membre d'équipe", "Corps administratif"]
+
+STAFF_CARD_W = 220
+STAFF_CARD_H = 46
+STAFF_GAP_X = 14
+STAFF_GAP_Y = 12
+STAFF_MEMBERS_PER_PAGE = 24
+
+def generate_staff_image(order_name: str, members: list, page: int, out_path: str):
+    """
+    members : liste de tuples (nom, role) — role doit être une clé de STAFF_ROLE_COLORS.
+               Un rôle sans membre (0 personne) n'apparaît simplement pas dans le rendu.
+    page : page à générer (1-indexée)
+    Retourne (chemin_fichier, total_pages)
+    """
+    W = 1200
+    cols = 4
+    header_h = 34
+    x0 = 40
+    y_start = 96
+
+    grouped = {role: [n for n, r in members if r == role] for role in STAFF_ROLE_ORDER}
+    flat_items = []
+    for role in STAFF_ROLE_ORDER:
+        names = grouped[role]
+        if not names:
+            continue
+        flat_items.append(("header", role, len(names)))
+        for n in names:
+            flat_items.append(("card", n, role))
+
+    pages = []
+    current = []
+    card_count = 0
+    for item in flat_items:
+        if item[0] == "card" and card_count >= STAFF_MEMBERS_PER_PAGE:
+            pages.append(current)
+            current = []
+            card_count = 0
+        current.append(item)
+        if item[0] == "card":
+            card_count += 1
+    if current:
+        pages.append(current)
+
+    total_pages = max(1, len(pages))
+    page = max(1, min(page, total_pages))
+    page_items = pages[page - 1] if pages else []
+
+    def layout_pass(items):
+        positions = []
+        x, y = x0, y_start
+        col_i = 0
+        for item in items:
+            if item[0] == "header":
+                if col_i != 0:
+                    y += STAFF_CARD_H + STAFF_GAP_Y
+                x, col_i = x0, 0
+                positions.append(("header", item[1], item[2], x, y))
+                y += header_h
+            else:
+                if col_i >= cols:
+                    col_i = 0
+                    x = x0
+                    y += STAFF_CARD_H + STAFF_GAP_Y
+                positions.append(("card", item[1], item[2], x, y))
+                x += STAFF_CARD_W + STAFF_GAP_X
+                col_i += 1
+        final_y = y + STAFF_CARD_H + 40
+        return positions, final_y
+
+    positions, H = layout_pass(page_items)
+
+    img = Image.new("RGBA", (W, H), STAFF_BG)
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, W, H), outline=STAFF_ACCENT, width=2)
+    d.text((40, 30), f"Staff — {order_name}", font=font(22, True), fill=STAFF_ACCENT)
+    if total_pages > 1:
+        page_txt = f"Page {page} / {total_pages}"
+        pw = text_w(d, page_txt, font(12))
+        d.text((W - 40 - pw, 36), page_txt, font=font(12), fill=STAFF_SUB)
+    d.line((40, 74, W - 40, 74), fill=(40, 40, 48, 255), width=1)
+
+    if not page_items:
+        d.text((40, 96), "Aucun membre pour l'instant.", font=font(13), fill=STAFF_SUB)
+
+    f_header = font(13, True)
+    f_card = font(12, True)
+    for kind, a, b, x, y in positions:
+        if kind == "header":
+            role, count = a, b
+            color = STAFF_ROLE_COLORS.get(role, (150, 150, 160))
+            d.text((x, y), f"{role.upper()}  ({count})", font=f_header, fill=color)
+        else:
+            name, role = a, b
+            color = STAFF_ROLE_COLORS.get(role, (150, 150, 160))
+            d.rounded_rectangle((x, y, x + STAFF_CARD_W, y + STAFF_CARD_H), radius=8, fill=STAFF_CARD)
+            d.rectangle((x, y, x + 4, y + STAFF_CARD_H), fill=color)
+            display = name
+            max_text_w = STAFF_CARD_W - 24
+            if text_w(d, display, f_card) > max_text_w:
+                while text_w(d, display + "...", f_card) > max_text_w and len(display) > 1:
+                    display = display[:-1]
+                display = display + "..."
+            d.text((x + 14, y + 14), display, font=f_card, fill=STAFF_TEXT)
+
+    img.save(out_path)
+    return out_path, total_pages

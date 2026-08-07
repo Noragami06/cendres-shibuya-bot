@@ -12,7 +12,10 @@ from discord import app_commands
 from discord.ext import commands
 
 from cogs.utils import database as db
-from cogs.utils.image_gen import generate_ordre_image, generate_ordre_educatif_image
+from cogs.utils.image_gen import (
+    generate_ordre_image, generate_ordre_educatif_image, generate_contrats_educatifs_image,
+    generate_staff_image,
+)
 # Helpers bancaires déjà existants (personnages / comptes / couleur). apply_debit est une MÉTHODE
 # du cog Banque (protection découvert + compte à rebours) : on la récupère via get_cog("Banque").
 from cogs.banque import get_characters, get_character, get_account, PHOENIX_COLOR
@@ -319,18 +322,42 @@ class OrdreEducatifView(discord.ui.View):
             custom_id=f"ordre_staff:{order_id}:{user_id}"))
 
 
-class OrdreStaffView(discord.ui.View):
-    def __init__(self, order_id, user_id):
+class ContratsPageView(discord.ui.View):
+    """Pagination persistante sous la pillow des contrats éducatifs (même pattern que /inventaire,
+    /shop et la page Relation de /profil : page encodée dans le custom_id, désactivée en bout)."""
+
+    def __init__(self, order_id, user_id, page, total_pages):
         super().__init__(timeout=None)
         self.add_item(discord.ui.Button(
+            label="Page précédente", emoji="◀️", style=discord.ButtonStyle.secondary,
+            custom_id=f"ordre_contrats_prev:{order_id}:{user_id}:{page}", disabled=(page <= 1)))
+        self.add_item(discord.ui.Button(
+            label="Page suivante", emoji="▶️", style=discord.ButtonStyle.secondary,
+            custom_id=f"ordre_contrats_next:{order_id}:{user_id}:{page}", disabled=(page >= total_pages)))
+
+
+class OrdreStaffView(discord.ui.View):
+    """Sous la pillow du staff : pagination (ligne 0, seulement si plusieurs pages, page encodée dans
+    le custom_id) + actions Ajouter / Virer / Muter (ligne 1)."""
+
+    def __init__(self, order_id, user_id, page=1, total_pages=1):
+        super().__init__(timeout=None)
+        if total_pages > 1:
+            self.add_item(discord.ui.Button(
+                label="Page précédente", emoji="◀️", style=discord.ButtonStyle.secondary,
+                custom_id=f"ordre_staff_prev:{order_id}:{user_id}:{page}", disabled=(page <= 1), row=0))
+            self.add_item(discord.ui.Button(
+                label="Page suivante", emoji="▶️", style=discord.ButtonStyle.secondary,
+                custom_id=f"ordre_staff_next:{order_id}:{user_id}:{page}", disabled=(page >= total_pages), row=0))
+        self.add_item(discord.ui.Button(
             label="Ajouter", emoji="➕", style=discord.ButtonStyle.success,
-            custom_id=f"ordre_staff_add:{order_id}:{user_id}"))
+            custom_id=f"ordre_staff_add:{order_id}:{user_id}", row=1))
         self.add_item(discord.ui.Button(
             label="Virer", emoji="➖", style=discord.ButtonStyle.danger,
-            custom_id=f"ordre_staff_fire:{order_id}:{user_id}"))
+            custom_id=f"ordre_staff_fire:{order_id}:{user_id}", row=1))
         self.add_item(discord.ui.Button(
             label="Muter", emoji="🔄", style=discord.ButtonStyle.primary,
-            custom_id=f"ordre_staff_mute:{order_id}:{user_id}"))
+            custom_id=f"ordre_staff_mute:{order_id}:{user_id}", row=1))
 
 
 # =====================================================================
@@ -507,14 +534,23 @@ class Ordre(commands.Cog):
             await self.handle_staff_fire(interaction, cid)
         elif cid.startswith("ordre_staff_mute:"):
             await self.handle_staff_mute(interaction, cid)
+        elif cid.startswith("ordre_staff_prev:"):
+            await self.handle_staff_page(interaction, cid, "prev")
+        elif cid.startswith("ordre_staff_next:"):
+            await self.handle_staff_page(interaction, cid, "next")
         elif cid.startswith("ordre_staff:"):
             await self.handle_staff(interaction, cid)
         elif cid.startswith("ordre_salons_buy:"):
             await self.handle_salons_buy(interaction, cid)
         elif cid.startswith("ordre_salon:"):
             await self.handle_salon(interaction, cid)
-        elif cid.startswith("ordre_contrats_view:") or cid.startswith("ordre_contrat:") \
-                or cid.startswith("ordre_tresorerie:"):
+        elif cid.startswith("ordre_contrats_prev:"):
+            await self.handle_contrats_page(interaction, cid, "prev")
+        elif cid.startswith("ordre_contrats_next:"):
+            await self.handle_contrats_page(interaction, cid, "next")
+        elif cid.startswith("ordre_contrats_view:"):
+            await self.handle_contrats(interaction, cid)
+        elif cid.startswith("ordre_contrat:") or cid.startswith("ordre_tresorerie:"):
             await self.handle_placeholder(interaction, cid)
 
     # =================================================================
@@ -679,25 +715,102 @@ class Ordre(commands.Cog):
         await interaction.response.send_message("🔧 Pas encore développé.", ephemeral=True)
 
     # =================================================================
+    # CONTRATS ÉDUCATIFS (bouton "📄 Voir les contrats" des ordres éducatifs)
+    # =================================================================
+    def _educateurs_data(self, order_id):
+        """Liste (nom_educateur, [disciples...]) pour la pillow. Un Formateur SANS disciple apparaît
+        quand même (case vide), jamais filtré."""
+        result = []
+        for m in db.get_order_members(order_id):
+            if m["role_label"] == "Formateur":
+                # TODO : brancher sur la vraie table de contrats une fois le système de négociation
+                # éducateur/joueur développé (point non abordé).
+                disciples = []
+                result.append((m["character_name"] or "?", disciples))
+        return result
+
+    async def _send_contrats(self, channel, order_id, user_id, page):
+        order = db.get_order(order_id)
+        educateurs = self._educateurs_data(order_id)
+        path = _tmp("contrats")
+        path, total_pages = generate_contrats_educatifs_image(order["name"], educateurs, page, path)
+        # page courante encodée dans le custom_id (isolée par user_id) — pas de bouton si une seule page.
+        view = ContratsPageView(order_id, user_id, max(1, min(page, total_pages)), total_pages) \
+            if total_pages > 1 else None
+        await channel.send(file=discord.File(path, filename="contrats.png"), view=view)
+        _rm(path)
+
+    async def handle_contrats(self, interaction, cid):
+        _, order_id, user_id = cid.split(":")
+        order_id = int(order_id)
+        if not self._is_chief(order_id, interaction.user.id):
+            await interaction.response.send_message("Seul le chef de l'ordre peut faire ça.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self._send_contrats(interaction.channel, order_id, interaction.user.id, 1)
+
+    async def handle_contrats_page(self, interaction, cid, direction):
+        _, order_id, user_id, page = cid.split(":")
+        order_id, user_id, page = int(order_id), int(user_id), int(page)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Cette pagination n'est pas la tienne.", ephemeral=True)
+            return
+        new_page = page + (1 if direction == "next" else -1)
+        order = db.get_order(order_id)
+        educateurs = self._educateurs_data(order_id)
+        path = _tmp("contrats")
+        path, total_pages = generate_contrats_educatifs_image(order["name"], educateurs, new_page, path)
+        clamped = max(1, min(new_page, total_pages))
+        view = ContratsPageView(order_id, user_id, clamped, total_pages) if total_pages > 1 else None
+        await interaction.response.edit_message(
+            attachments=[discord.File(path, filename="contrats.png")], view=view)
+        _rm(path)
+
+    # =================================================================
     # STAFF
     # =================================================================
-    def _members_embed(self, order_id):
+    def _staff_members(self, order_id):
+        """Liste (nom, role) pour la pillow du staff : le chef ('Chef d'ordre') puis les membres."""
         order = db.get_order(order_id)
         chef = get_character(order["chef_character_id"])
-        lines = [f"👑 **Chef d'ordre** — {chef['character_name'] if chef else '?'}"]
+        members = [((chef["character_name"] if chef and chef["character_name"] else "?"), "Chef d'ordre")]
         for m in db.get_order_members(order_id):
-            lines.append(f"• **{m['role_label']}** — {m['character_name'] or '?'}")
-        if len(lines) == 1:
-            lines.append("*(Aucun autre membre pour l'instant.)*")
-        return discord.Embed(title="👥 Staff de l'ordre", description="\n".join(lines), color=PHOENIX_COLOR)
+            members.append((m["character_name"] or "?", m["role_label"]))
+        return members
+
+    async def _send_staff(self, channel, order_id, user_id, page):
+        order = db.get_order(order_id)
+        members = self._staff_members(order_id)
+        path = _tmp("staff")
+        path, total_pages = generate_staff_image(order["name"], members, page, path)
+        # La View porte toujours les actions (Ajouter/Virer/Muter) ; la pagination n'apparaît que si >1 page.
+        view = OrdreStaffView(order_id, user_id, max(1, min(page, total_pages)), total_pages)
+        await channel.send(file=discord.File(path, filename="staff.png"), view=view)
+        _rm(path)
 
     async def handle_staff(self, interaction, cid):
         order_id = int(cid.split(":")[1])
         if not await self._require_staff_manager(interaction, order_id):
             return
-        await interaction.response.send_message(
-            embed=self._members_embed(order_id), view=OrdreStaffView(order_id, interaction.user.id)
-        )
+        await interaction.response.defer()
+        await self._send_staff(interaction.channel, order_id, interaction.user.id, 1)
+
+    async def handle_staff_page(self, interaction, cid, direction):
+        _, order_id, user_id, page = cid.split(":")
+        order_id, user_id, page = int(order_id), int(user_id), int(page)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Cette pagination n'est pas la tienne.", ephemeral=True)
+            return
+        new_page = page + (1 if direction == "next" else -1)
+        order = db.get_order(order_id)
+        members = self._staff_members(order_id)
+        path = _tmp("staff")
+        path, total_pages = generate_staff_image(order["name"], members, new_page, path)
+        clamped = max(1, min(new_page, total_pages))
+        view = OrdreStaffView(order_id, user_id, clamped, total_pages)
+        await interaction.response.edit_message(
+            attachments=[discord.File(path, filename="staff.png")], view=view)
+        _rm(path)
 
     async def handle_staff_add(self, interaction, cid):
         order_id = int(cid.split(":")[1])
@@ -730,6 +843,7 @@ class Ordre(commands.Cog):
             name = get_character(target_cid)["character_name"]
             await channel.send(embed=discord.Embed(
                 description=f"✅ {name} ajouté à l'ordre comme **{role}**.", color=PHOENIX_COLOR))
+            await self._send_staff(channel, order_id, interaction.user.id, 1)
         finally:
             self._release(interaction.user.id)
 
@@ -763,10 +877,11 @@ class Ordre(commands.Cog):
                 if target_cid is None:
                     await channel.send("⏳ Annulé.")
                     return
-            db.remove_order_member(order_id, target_cid)
             name = get_character(target_cid)["character_name"] if get_character(target_cid) else "?"
+            db.remove_order_member(order_id, target_cid)
             await channel.send(embed=discord.Embed(
                 description=f"✅ {name} a été retiré de l'ordre.", color=PHOENIX_COLOR))
+            await self._send_staff(channel, order_id, interaction.user.id, 1)
         finally:
             self._release(interaction.user.id)
 
@@ -808,6 +923,7 @@ class Ordre(commands.Cog):
             name = get_character(target_cid)["character_name"] if get_character(target_cid) else "?"
             await channel.send(embed=discord.Embed(
                 description=f"✅ {name} est désormais **{role}**.", color=PHOENIX_COLOR))
+            await self._send_staff(channel, order_id, interaction.user.id, 1)
         finally:
             self._release(interaction.user.id)
 
