@@ -15,7 +15,7 @@ from cogs.utils import database as db
 from cogs.utils.image_gen import (
     generate_ordre_image, generate_ordre_educatif_image, generate_contrats_educatifs_image,
     generate_staff_image, generate_contrats_direct_image,
-    generate_pin_image, generate_tresorerie_ordre_image,
+    generate_pin_image, generate_tresorerie_ordre_image, generate_salons_ordre_image,
 )
 # Helpers bancaires déjà existants (personnages / comptes / couleur). apply_debit est une MÉTHODE
 # du cog Banque (protection découvert + compte à rebours) : on la récupère via get_cog("Banque").
@@ -31,8 +31,7 @@ from cogs.profil import character_has_role
 # ---------- Constantes ----------
 WAIT_TIMEOUT = 300
 DM_TIMEOUT = 300  # 5 minutes pour la négociation de revente à un joueur
-SALONS_PER_PAGE = 8
-MAX_DASHBOARD_SALONS = 6
+MAX_DASHBOARD_SALONS = 6  # nb de salons montrés sur le dashboard principal (la pillow dédiée les affiche tous)
 
 ORDER_TYPES = {
     "educatif": {"label": "Ordre Éducatif", "prix": 84300},
@@ -207,73 +206,32 @@ class NegotiationView(discord.ui.View):
         return cb
 
 
-class SalonListView(discord.ui.View):
-    """Liste paginée des salons + menu d'action (revendre / louer). Les flèches paginent (sans stop),
-    le menu fixe le résultat et arrête la vue (le flux verrouillé enchaîne alors)."""
-
-    def __init__(self, owner_id, pages):
-        super().__init__(timeout=WAIT_TIMEOUT)
-        self.owner_id = owner_id
-        self.pages = pages or ["Aucun salon pour l'instant."]
-        self.page = 0
-        self.result = None
-        self._prev = discord.ui.Button(emoji="◀️", style=discord.ButtonStyle.secondary)
-        self._next = discord.ui.Button(emoji="▶️", style=discord.ButtonStyle.secondary)
-        self._prev.callback = self._go_prev
-        self._next.callback = self._go_next
-        self.add_item(self._prev)
-        self.add_item(self._next)
-        self._sel = discord.ui.Select(
-            placeholder="Action sur les salons...", min_values=1, max_values=1,
-            options=[
-                discord.SelectOption(label="💸 Revendre un salon", value="revendre"),
-                discord.SelectOption(label="🏠 Louer un salon", value="louer"),
-            ],
-        )
-        self._sel.callback = self._sel_cb
-        self.add_item(self._sel)
-        self._refresh()
-
-    def embed(self):
-        return discord.Embed(
-            title="🏘️ Salons de l'ordre", description=self.pages[self.page], color=PHOENIX_COLOR,
-        ).set_footer(text=f"Page {self.page + 1}/{len(self.pages)}")
-
-    def _refresh(self):
-        self._prev.disabled = self.page <= 0
-        self._next.disabled = self.page >= len(self.pages) - 1
-
-    async def _guard(self, interaction):
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("Ce menu ne t'appartient pas.", ephemeral=True)
-            return False
-        return True
-
-    async def _go_prev(self, interaction):
-        if not await self._guard(interaction):
-            return
-        self.page = max(0, self.page - 1)
-        self._refresh()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
-
-    async def _go_next(self, interaction):
-        if not await self._guard(interaction):
-            return
-        self.page = min(len(self.pages) - 1, self.page + 1)
-        self._refresh()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
-
-    async def _sel_cb(self, interaction):
-        if not await self._guard(interaction):
-            return
-        self.result = self._sel.values[0]
-        await interaction.response.edit_message(view=None)
-        self.stop()
-
-
 # =====================================================================
 # VUES PERSISTANTES (custom_id dynamiques -> listener on_interaction)
 # =====================================================================
+class SalonPageView(discord.ui.View):
+    """Sous la pillow de TOUS les salons : pagination persistante (ligne 0, seulement si plusieurs
+    pages, page encodée dans le custom_id) + menu Revendre / Louer (ligne 1), tous persistants."""
+
+    def __init__(self, order_id, user_id, page, total_pages):
+        super().__init__(timeout=None)
+        if total_pages > 1:
+            self.add_item(discord.ui.Button(
+                label="Page précédente", emoji="◀️", style=discord.ButtonStyle.secondary,
+                custom_id=f"ordre_salon_prev:{order_id}:{user_id}:{page}", disabled=(page <= 1), row=0))
+            self.add_item(discord.ui.Button(
+                label="Page suivante", emoji="▶️", style=discord.ButtonStyle.secondary,
+                custom_id=f"ordre_salon_next:{order_id}:{user_id}:{page}", disabled=(page >= total_pages), row=0))
+        self.add_item(discord.ui.Select(
+            placeholder="Action sur les salons...", min_values=1, max_values=1,
+            custom_id=f"ordre_salon_action:{order_id}:{user_id}",
+            options=[
+                discord.SelectOption(label="💸 Revendre un salon", value="revendre"),
+                discord.SelectOption(label="🏠 Louer un salon", value="louer"),
+            ], row=1))
+
+
+
 class OrdreCreateConfirmView(discord.ui.View):
     def __init__(self, character_id, user_id):
         super().__init__(timeout=None)
@@ -615,6 +573,12 @@ class Ordre(commands.Cog):
             await self.handle_staff(interaction, cid)
         elif cid.startswith("ordre_salons_buy:"):
             await self.handle_salons_buy(interaction, cid)
+        elif cid.startswith("ordre_salon_prev:"):
+            await self.handle_salon_page(interaction, cid, "prev")
+        elif cid.startswith("ordre_salon_next:"):
+            await self.handle_salon_page(interaction, cid, "next")
+        elif cid.startswith("ordre_salon_action:"):
+            await self.handle_salon_action(interaction, cid)
         elif cid.startswith("ordre_salon:"):
             await self.handle_salon(interaction, cid)
         elif cid.startswith("ordre_contrats_prev:"):
@@ -1428,18 +1392,22 @@ class Ordre(commands.Cog):
     # =================================================================
     # SALONS — GESTION (section 9)
     # =================================================================
-    def _salon_pages(self, salons, guild):
-        if not salons:
-            return ["Aucun salon pour l'instant."]
-        lines = []
-        for s in salons:
+    def _salon_tuples(self, order_id, guild):
+        """[(nom_salon, statut), ...] pour la pillow — nom résolu via guild.get_channel."""
+        result = []
+        for s in db.get_order_salons(order_id):
             ch = guild.get_channel(s["channel_id"]) if guild else None
-            name = ch.name if ch else str(s["channel_id"])
-            extra = ""
-            if s["status"] == "Location" and s["location_expiry"]:
-                extra = f" (jusqu'au {s['location_expiry'][:10]})"
-            lines.append(f"• #{name} — **{s['status']}**{extra}")
-        return ["\n".join(lines[i:i + SALONS_PER_PAGE]) for i in range(0, len(lines), SALONS_PER_PAGE)]
+            result.append((ch.name if ch else str(s["channel_id"]), s["status"]))
+        return result
+
+    async def _send_salons(self, channel, order_id, user_id, page):
+        order = db.get_order(order_id)
+        salons = self._salon_tuples(order_id, channel.guild)
+        path = _tmp("salons")
+        path, total_pages = generate_salons_ordre_image(order["name"], salons, page, path)
+        view = SalonPageView(order_id, user_id, max(1, min(page, total_pages)), total_pages)
+        await channel.send(file=discord.File(path, filename="salons.png"), view=view)
+        _rm(path)
 
     async def handle_salon(self, interaction, cid):
         order_id = int(cid.split(":")[1])
@@ -1450,20 +1418,46 @@ class Ordre(commands.Cog):
             await interaction.response.send_message(
                 "Seuls les ordres Direct/Hybride gèrent des salons.", ephemeral=True)
             return
+        await interaction.response.defer()
+        await self._send_salons(interaction.channel, order_id, interaction.user.id, 1)
+
+    async def handle_salon_page(self, interaction, cid, direction):
+        _, order_id, user_id, page = cid.split(":")
+        order_id, user_id, page = int(order_id), int(user_id), int(page)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Cette pagination n'est pas la tienne.", ephemeral=True)
+            return
+        new_page = page + (1 if direction == "next" else -1)
+        order = db.get_order(order_id)
+        salons = self._salon_tuples(order_id, interaction.guild)
+        path = _tmp("salons")
+        path, total_pages = generate_salons_ordre_image(order["name"], salons, new_page, path)
+        clamped = max(1, min(new_page, total_pages))
+        view = SalonPageView(order_id, user_id, clamped, total_pages)
+        await interaction.response.edit_message(
+            attachments=[discord.File(path, filename="salons.png")], view=view)
+        _rm(path)
+
+    async def handle_salon_action(self, interaction, cid):
+        _, order_id, user_id = cid.split(":")
+        order_id = int(order_id)
+        if not self._is_chief(order_id, interaction.user.id):
+            await interaction.response.send_message("Seul le chef de l'ordre peut faire ça.", ephemeral=True)
+            return
+        value = (interaction.data.get("values") or [None])[0]
+        if value not in ("revendre", "louer"):
+            await interaction.response.send_message("Action inconnue.", ephemeral=True)
+            return
         if not self._acquire(interaction.user.id):
             await interaction.response.send_message(
                 "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True)
             return
         try:
-            await interaction.response.send_message("🏘️ Gestion des salons…", ephemeral=True)
+            await interaction.response.defer()
             channel = interaction.channel
-            pages = self._salon_pages(db.get_order_salons(order_id), channel.guild)
-            view = SalonListView(interaction.user.id, pages)
-            await channel.send(embed=view.embed(), view=view)
-            await view.wait()
-            if view.result == "revendre":
+            if value == "revendre":
                 await self._salon_resell(channel, interaction.user, order_id)
-            elif view.result == "louer":
+            else:
                 await self._salon_rent(channel, interaction.user, order_id)
         finally:
             self._release(interaction.user.id)

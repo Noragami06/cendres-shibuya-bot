@@ -1775,3 +1775,121 @@ def generate_tresorerie_ordre_image(order_name, solde, nb_salons, taxe_par_salon
 
     img.save(out_path)
     return out_path
+
+
+SALORD_BG = (13, 13, 17, 255)
+SALORD_CARD = (20, 20, 26, 255)
+SALORD_TEXT = (235, 235, 240, 255)
+SALORD_SUB = (150, 150, 160, 255)
+SALORD_ACCENT = (255, 165, 60, 255)
+SALORD_STATUS_COLORS = {
+    "Acheté": (100, 220, 150),
+    "Louée": (90, 150, 240),
+    "Location": (200, 140, 240),
+}
+SALORD_STATUS_ORDER = ["Acheté", "Louée", "Location"]
+SALORD_CARD_W = 220
+SALORD_CARD_H = 46
+SALORD_GAP_X = 14
+SALORD_GAP_Y = 12
+SALORD_PER_PAGE = 24
+
+def generate_salons_ordre_image(order_name: str, salons: list, page: int, out_path: str):
+    """
+    salons : liste de tuples (nom_salon, statut) — statut parmi "Acheté", "Louée", "Location"
+    page : page à générer (1-indexée)
+    Retourne (chemin_fichier, total_pages)
+    """
+    W = 1200
+    cols = 4
+    header_h = 34
+    x0 = 40
+    y_start = 96
+
+    grouped = {status: [n for n, s in salons if s == status] for status in SALORD_STATUS_ORDER}
+    flat_items = []
+    for status in SALORD_STATUS_ORDER:
+        names = grouped[status]
+        if not names:
+            continue
+        flat_items.append(("header", status, len(names)))
+        for n in names:
+            flat_items.append(("card", n, status))
+
+    pages = []
+    current = []
+    card_count = 0
+    for item in flat_items:
+        if item[0] == "card" and card_count >= SALORD_PER_PAGE:
+            pages.append(current)
+            current = []
+            card_count = 0
+        current.append(item)
+        if item[0] == "card":
+            card_count += 1
+    if current:
+        pages.append(current)
+
+    total_pages = max(1, len(pages))
+    page = max(1, min(page, total_pages))
+    page_items = pages[page - 1] if pages else []
+
+    def layout_pass(items):
+        positions = []
+        x, y = x0, y_start
+        col_i = 0
+        for item in items:
+            if item[0] == "header":
+                if col_i != 0:
+                    y += SALORD_CARD_H + SALORD_GAP_Y
+                x, col_i = x0, 0
+                positions.append(("header", item[1], item[2], x, y))
+                y += header_h
+            else:
+                if col_i >= cols:
+                    col_i = 0
+                    x = x0
+                    y += SALORD_CARD_H + SALORD_GAP_Y
+                positions.append(("card", item[1], item[2], x, y))
+                x += SALORD_CARD_W + SALORD_GAP_X
+                col_i += 1
+        final_y = y + SALORD_CARD_H + 40
+        return positions, final_y
+
+    positions, H = layout_pass(page_items)
+
+    img = Image.new("RGBA", (W, H), SALORD_BG)
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, W, H), outline=SALORD_ACCENT, width=2)
+    d.text((40, 30), f"Salons — {order_name}", font=font(22, True), fill=SALORD_ACCENT)
+    if total_pages > 1:
+        page_txt = f"Page {page} / {total_pages}"
+        pw = text_w(d, page_txt, font(12))
+        d.text((W - 40 - pw, 36), page_txt, font=font(12), fill=SALORD_SUB)
+    d.line((40, 74, W - 40, 74), fill=(40, 40, 48, 255), width=1)
+
+    if not page_items:
+        d.text((40, 96), "Aucun salon pour l'instant.", font=font(13), fill=SALORD_SUB)
+
+    f_header = font(13, True)
+    f_card = font(12, True)
+    for kind, a, b, x, y in positions:
+        if kind == "header":
+            status, count = a, b
+            color = SALORD_STATUS_COLORS.get(status, (150, 150, 160))
+            d.text((x, y), f"{status.upper()}  ({count})", font=f_header, fill=color)
+        else:
+            name, status = a, b
+            color = SALORD_STATUS_COLORS.get(status, (150, 150, 160))
+            d.rounded_rectangle((x, y, x + SALORD_CARD_W, y + SALORD_CARD_H), radius=8, fill=SALORD_CARD)
+            d.rectangle((x, y, x + 4, y + SALORD_CARD_H), fill=color)
+            display = f"#{name}"
+            max_text_w = SALORD_CARD_W - 24
+            if text_w(d, display, f_card) > max_text_w:
+                while text_w(d, display + "...", f_card) > max_text_w and len(display) > 1:
+                    display = display[:-1]
+                display = display + "..."
+            d.text((x + 14, y + 14), display, font=f_card, fill=SALORD_TEXT)
+
+    img.save(out_path)
+    return out_path, total_pages
