@@ -2910,8 +2910,9 @@ def delete_character_cascade(character_id):
 # DÉPART D'UN JOUEUR DU SERVEUR (nettoyage automatique)
 # =====================================================================
 async def handle_player_departure(bot, user_id: int, guild):
-    """Traite un joueur ayant quitté le serveur comme s'il avait supprimé tous ses personnages, y
-    compris la dissolution de tout ordre dont il aurait été chef (variante « départ », sans ban)."""
+    """Traite un joueur ayant quitté le serveur comme s'il avait supprimé ses personnages NON chefs
+    d'ordre. Les personnages chefs d'ordre sont laissés intacts ici : leur ordre (et eux mêmes) ne sont
+    dissous/supprimés que par la vérification programmée check_chief_presence (voir cogs/ordre.py)."""
     with db.get_connection() as conn:
         characters = conn.execute(
             "SELECT id, slot_number FROM validated_characters WHERE user_id = ? AND guild_id = ?",
@@ -2920,27 +2921,24 @@ async def handle_player_departure(bot, user_id: int, guild):
     if not characters:
         return
 
-    ordre_cog = bot.get_cog("Ordre")
     for char in characters:
         char_id = char["id"]
-        # Si ce personnage est CHEF d'un ordre : dissolution AVANT la cascade classique (pour que la
-        # libération croisée des salons/contrats se fasse pendant que les données existent encore).
+        # Un personnage chef d'ordre n'est JAMAIS traité instantanément au départ du joueur.
+        # La dissolution de son ordre passe uniquement par la vérification programmée 4x/jour (voir
+        # check_chief_presence), pour laisser un vrai délai avant une action aussi impactante pour les
+        # autres membres.
         with db.get_connection() as conn:
-            order = conn.execute(
-                "SELECT id, name FROM orders WHERE chef_character_id = ?", (char_id,)
+            is_chief = conn.execute(
+                "SELECT 1 FROM orders WHERE chef_character_id = ?", (char_id,)
             ).fetchone()
-        if order is not None and ordre_cog is not None:
-            try:
-                await ordre_cog.dissolve_order_member_left(order["id"], guild)
-            except Exception as e:
-                print(f"[départ] échec dissolution ordre {order['id']} : {e}")
+        if is_chief:
+            continue
 
         # Cascade classique (banque, inventaire, relations, order_members, order_salaries,
         # order_disciple_assignments, etc.), puis retrait définitif du personnage.
         delete_character_cascade(char_id)
         with db.get_connection() as conn:
             conn.execute("DELETE FROM validated_characters WHERE id = ?", (char_id,))
-    # On supprime TOUS les personnages du joueur : aucune renumérotation de slot n'est nécessaire.
 
 
 async def retroactive_departure_check(bot):

@@ -5,7 +5,8 @@
 import asyncio
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
 from discord import app_commands
@@ -54,6 +55,17 @@ ROLE_COLORS = {
 # Rôles attribuables à un membre (le chef n'en fait pas partie : c'est le propriétaire de l'ordre).
 ASSIGNABLE_ROLES = ["Sous-chef", "Formateur", "Chef d'équipe", "Membre d'équipe", "Corps administratif"]
 FR_DAYS = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
+
+# Vérification de présence des chefs d'ordre : 4x/jour, à l'heure de Paris (DST géré par zoneinfo).
+# Sous Windows, zoneinfo a besoin du paquet `tzdata` (pip install tzdata) : en son absence, on retombe
+# sur un UTC+1 fixe (sans bascule été/hiver) plutôt que de faire planter le chargement du cog.
+try:
+    PARIS_TZ = ZoneInfo("Europe/Paris")
+except ZoneInfoNotFoundError:
+    print("[ordre] tzdata introuvable : bascule sur UTC+1 fixe pour l'heure de Paris "
+          "(installe `tzdata` pour la gestion DST).")
+    PARIS_TZ = timezone(timedelta(hours=1))
+CHECK_HOURS = [0, 6, 12, 18]
 
 ORDRE_IMG_DIR = os.path.join(os.path.dirname(__file__), "..", "temp", "ordre_images")
 
@@ -449,9 +461,13 @@ class Ordre(commands.Cog):
         # La tâche quotidienne des salaires (paiements le lundi + suivi des verrous/échéances).
         if not self.salary_loop.is_running():
             self.salary_loop.start()
+        # La vérification de présence des chefs d'ordre (4x/jour, heure de Paris).
+        if not self.check_chief_presence.is_running():
+            self.check_chief_presence.start()
 
     async def cog_unload(self):
         self.salary_loop.cancel()
+        self.check_chief_presence.cancel()
 
     # ---------- verrou de flux ----------
     def _acquire(self, user_id) -> bool:
@@ -1786,6 +1802,42 @@ class Ordre(commands.Cog):
     async def _before_salary_loop(self):
         await self.bot.wait_until_ready()
 
+    @tasks.loop(minutes=15)
+    async def check_chief_presence(self):
+        """4x/jour (heure de Paris), vérifie que le chef de chaque ordre est toujours sur le serveur.
+        S'il a quitté, lance la dissolution différée de son ordre (la dissolution d'un ordre est trop
+        impactante pour les autres membres pour être déclenchée instantanément au départ du joueur)."""
+        now_paris = datetime.now(PARIS_TZ)
+        if now_paris.hour not in CHECK_HOURS or now_paris.minute >= 15:
+            return  # ne s'exécute qu'une fois dans le quart d'heure suivant chaque heure de vérification
+        await self._dissolve_absent_chiefs()
+
+    async def _dissolve_absent_chiefs(self):
+        """Parcourt tous les ordres et dissout ceux dont le chef a quitté le serveur (logique isolée de
+        la porte temporelle de check_chief_presence pour être testable et réutilisable)."""
+        for guild in self.bot.guilds:
+            for order in db.get_orders_in_guild_full(guild.id):
+                owner_user_id = order["owner_user_id"]
+                member = guild.get_member(owner_user_id)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(owner_user_id)
+                    except discord.NotFound:
+                        member = None
+                    except discord.HTTPException:
+                        continue  # erreur réseau temporaire : on retentera au prochain passage
+                if member is None:
+                    print(f"🔍 [chef-absent] Le chef de l'ordre {order['name']} (id {order['id']}) a "
+                          "quitté le serveur, procédure de dissolution lancée.")
+                    try:
+                        await self.dissolve_order_chief_departed(order["id"], guild)
+                    except Exception as e:  # un ordre en erreur ne doit pas bloquer les autres
+                        print(f"[check_chief_presence] échec dissolution ordre {order['id']} : {e}")
+
+    @check_chief_presence.before_loop
+    async def _before_check_chief_presence(self):
+        await self.bot.wait_until_ready()
+
     def _guild_of_order(self, order):
         chef = get_character(order["chef_character_id"])
         gid = chef["guild_id"] if chef else None
@@ -1897,21 +1949,24 @@ class Ordre(commands.Cog):
                        "pendant 2 mois. En tant que chef, tu ne reçois pas d'indemnité, et tu ne pourras "
                        "pas créer de nouvel ordre avant 2 mois."))
 
-    async def dissolve_order_member_left(self, order_id, guild):
-        """Dissolution suite au départ du chef du serveur : indemnité de 1 mois (montant x4) aux membres
-        salariés, et AUCUN bannissement (le chef n'a rien fait de répréhensible)."""
+    async def dissolve_order_chief_departed(self, order_id, guild):
+        """Dissolution suite au départ CONFIRMÉ du chef du serveur (détecté par la vérification
+        programmée check_chief_presence). Indemnité de 1 mois (montant x4), annonce à tous les membres
+        AVANT toute suppression, suppression du personnage du chef lui même (sautée au moment du départ),
+        et AUCUN bannissement (le chef est parti, il n'est pas fautif)."""
         await self._dissolve_common(
             order_id, guild, indemnity_weeks=4, ban_chief=False,
             tx_label="Indemnité de dissolution d'ordre (départ du chef)",
-            member_text=("⚠️ L'ordre **{name}** a été dissous suite au départ de son chef du serveur. "
-                         "Tu n'en fais plus partie."),
-            chef_text=None)  # le chef a quitté le serveur : inutile de le notifier
+            member_text=("📢 L'ordre **{name}** a été dissous suite au départ de son chef du serveur. "
+                         "Tu as été exclu de l'ordre."),
+            chef_text=None,               # le chef a quitté le serveur : injoignable
+            delete_chief_character=True)  # on supprime enfin son personnage (sauté à son départ)
 
     async def _dissolve_common(self, order_id, guild, *, indemnity_weeks, ban_chief,
-                               tx_label, member_text, chef_text):
+                               tx_label, member_text, chef_text, delete_chief_character=False):
         """Logique commune de dissolution. IMPORTANT : les libérations croisées (salons/contrats liés à
-        d'AUTRES ordres) et les résolutions de noms se font AVANT la suppression finale, pendant que les
-        données existent encore."""
+        d'AUTRES ordres), les résolutions de noms, les indemnités et les annonces se font AVANT toute
+        suppression, pendant que les données existent encore."""
         order = db.get_order(order_id)
         if order is None:
             return
@@ -1949,8 +2004,20 @@ class Ordre(commands.Cog):
         # 5) Clôture + notification des contrats (défensif : no-op tant que la table n'existe pas).
         await self._end_order_contracts(order_id, order_name, guild)
 
-        # 6) Suppression finale de l'ordre et de ses données propres.
+        # 6) Suppression finale de l'ordre et de ses données propres. On la fait AVANT la suppression du
+        # personnage du chef : ainsi delete_character_cascade ne voit plus d'ordre rattaché au chef et
+        # n'émet pas son log trompeur « ordre pas supprimé automatiquement, à traiter manuellement ».
+        # (Les indemnités et annonces des étapes 1-5 ont déjà eu lieu : rien n'est supprimé « avant »
+        # d'avoir prévenu les membres.)
         db.delete_order_cascade(order_id)
+
+        # 7) Suppression du personnage du chef (uniquement au départ du serveur : sautée à son départ
+        # pour laisser le délai de la vérification programmée, effectuée seulement maintenant).
+        if delete_chief_character:
+            from cogs.depart import delete_character_cascade  # import local : évite tout cycle au chargement
+            delete_character_cascade(chef_cid)
+            with db.get_connection() as conn:
+                conn.execute("DELETE FROM validated_characters WHERE id = ?", (chef_cid,))
 
     async def _release_linked_salons(self, order_id, order_name, guild):
         """Pour chaque salon de l'ordre lié à un autre ordre (Louée/Location) : supprime l'entrée miroir

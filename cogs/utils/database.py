@@ -1360,6 +1360,18 @@ def transfer_salon(channel_id: int, from_order_id: int, to_order_id: int):
         )
 
 
+def get_orders_in_guild_full(guild_id: int):
+    """Ordres du serveur avec l'id du chef ET le compte Discord propriétaire du chef (le guild est
+    déterminé via le personnage chef). Sert à la vérification de présence des chefs."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT o.id, o.chef_character_id, o.name, v.user_id AS owner_user_id FROM orders o "
+            "JOIN validated_characters v ON v.id = o.chef_character_id "
+            "WHERE v.guild_id = ? ORDER BY o.id ASC",
+            (guild_id,),
+        ).fetchall()
+
+
 def get_orders_in_guild(guild_id: int, exclude_order_id=None):
     """Ordres du serveur (le guild est déterminé via le personnage chef) :
     [(order_id, name, chef_name), ...]."""
