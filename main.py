@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import os
 
 from cogs.clans import build_clans_report
+from cogs.depart import retroactive_departure_check
 from cogs.utils.database import init_db
 
 load_dotenv()
@@ -35,6 +36,9 @@ async def setup_hook():
 @bot.event
 async def on_ready():
     await bot.tree.sync()
+    # Rattrapage des joueurs partis avant l'ajout du listener on_member_remove (sans risque de
+    # le relancer à chaque démarrage : ne touche que les joueurs encore présents en base).
+    await retroactive_departure_check(bot)
     if not status_loop.is_running():
         status_loop.start()
 

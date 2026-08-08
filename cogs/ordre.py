@@ -9,13 +9,14 @@ from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from cogs.utils import database as db
 from cogs.utils.image_gen import (
     generate_ordre_image, generate_ordre_educatif_image, generate_contrats_educatifs_image,
     generate_staff_image, generate_contrats_direct_image,
     generate_pin_image, generate_tresorerie_ordre_image, generate_salons_ordre_image,
+    STAFF_ROLE_ORDER,
 )
 # Helpers bancaires déjà existants (personnages / comptes / couleur). apply_debit est une MÉTHODE
 # du cog Banque (protection découvert + compte à rebours) : on la récupère via get_cog("Banque").
@@ -24,6 +25,7 @@ from cogs.utils.image_gen import (
 from cogs.banque import (
     get_characters, get_character, get_account, PHOENIX_COLOR,
     generate_unique_iban, generate_pin_code, _pin_values, _within_1h, _fmt_date, OWNER_ID,
+    credit_account, add_transaction,
 )
 # Méthode standard du projet : rôle appliqué à un PERSONNAGE (réel slot 1 / virtuel slot 2-3).
 from cogs.profil import character_has_role
@@ -81,6 +83,20 @@ def _parse_int(raw: str):
     if c.lstrip("-").isdigit():
         return int(c)
     return None
+
+
+def _plus_months(iso: str, months: int) -> str:
+    """Ajoute `months` mois (approximés à 30 jours) à une date ISO. Utilisé pour les échéances de
+    verrou (grâce 2 mois), les avertissements (1 mois) et les bans (2 mois)."""
+    try:
+        base = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        base = datetime.utcnow()
+    return (base + timedelta(days=30 * months)).isoformat()
+
+
+# Rang hiérarchique d'un rôle (0 = plus haut gradé). Réutilise l'ordre déjà défini pour la pillow staff.
+ORDER_HIERARCHY_RANK = {role: i for i, role in enumerate(STAFF_ROLE_ORDER)}
 
 
 # =====================================================================
@@ -387,7 +403,34 @@ class TresorerieView(discord.ui.View):
             custom_id=f"ordre_virement:{order_id}:{user_id}"))
         self.add_item(discord.ui.Button(
             label="Salaire", emoji="💰", style=discord.ButtonStyle.secondary,
-            custom_id=f"ordre_salaire:{order_id}"))
+            custom_id=f"ordre_salaire:{order_id}:{user_id}"))
+
+
+class SalaireView(discord.ui.View):
+    """Sous la trésorerie (déjà authentifiée), chef uniquement : ajouter ou retirer des salaires."""
+
+    def __init__(self, order_id, user_id):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Ajouter", emoji="➕", style=discord.ButtonStyle.success,
+            custom_id=f"ordre_sal_add:{order_id}:{user_id}"))
+        self.add_item(discord.ui.Button(
+            label="Retirer", emoji="➖", style=discord.ButtonStyle.danger,
+            custom_id=f"ordre_sal_remove:{order_id}:{user_id}"))
+
+
+class LockRecoveryView(discord.ui.View):
+    """DM au chef quand la trésorerie remonte au dessus de 0 alors que le verrou est actif : garder le
+    verrou (protection, désactivation auto dans 2 mois) ou le désactiver tout de suite."""
+
+    def __init__(self, order_id, user_id):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Garder actif", emoji="🔒", style=discord.ButtonStyle.primary,
+            custom_id=f"ordre_lockkeep:{order_id}:{user_id}"))
+        self.add_item(discord.ui.Button(
+            label="Désactiver maintenant", emoji="🔓", style=discord.ButtonStyle.danger,
+            custom_id=f"ordre_lockoff:{order_id}:{user_id}"))
 
 
 # =====================================================================
@@ -399,6 +442,16 @@ class Ordre(commands.Cog):
         self._active_users = set()   # isolation des flux textuels par joueur
         self._creating = set()       # anti double-clic sur la création (par character_id)
         self._pin_buffers = {}       # saisie du code de la banque d'ordre, clé (user_id, order_id)
+        self._grace_prompt_pending = set()  # ordres à qui le DM de choix de verrou a déjà été envoyé
+                                            # (évite de le renvoyer chaque jour tant que le chef n'a pas répondu)
+
+    async def cog_load(self):
+        # La tâche quotidienne des salaires (paiements le lundi + suivi des verrous/échéances).
+        if not self.salary_loop.is_running():
+            self.salary_loop.start()
+
+    async def cog_unload(self):
+        self.salary_loop.cancel()
 
     # ---------- verrou de flux ----------
     def _acquire(self, user_id) -> bool:
@@ -636,8 +689,16 @@ class Ordre(commands.Cog):
             await self.handle_iban(interaction, cid)
         elif cid.startswith("ordre_virement:"):
             await self.handle_virement(interaction, cid)
+        elif cid.startswith("ordre_sal_add:"):
+            await self.handle_salaire_add(interaction, cid)
+        elif cid.startswith("ordre_sal_remove:"):
+            await self.handle_salaire_remove(interaction, cid)
         elif cid.startswith("ordre_salaire:"):
-            await self.handle_placeholder(interaction, cid)
+            await self.handle_salaire(interaction, cid)
+        elif cid.startswith("ordre_lockkeep:"):
+            await self.handle_lock_keep(interaction, cid)
+        elif cid.startswith("ordre_lockoff:"):
+            await self.handle_lock_off(interaction, cid)
 
     # =================================================================
     # CRÉATION D'UN ORDRE
@@ -655,6 +716,14 @@ class Ordre(commands.Cog):
         character_id, user_id = int(character_id), int(user_id)
         if interaction.user.id != user_id:
             await interaction.response.send_message("Ce panneau ne t'appartient pas.", ephemeral=True)
+            return
+        # Bannissement de création après dissolution d'un précédent ordre pour trésorerie négative.
+        ban = db.get_chief_ban(user_id)
+        if ban and ban["banned_until"] and ban["banned_until"] > _now():
+            await interaction.response.edit_message(view=None)
+            await interaction.channel.send(
+                f"🚫 Tu ne peux pas créer de nouvel ordre avant le {_fmt_date(ban['banned_until'])}, "
+                "suite à la dissolution de ton précédent ordre pour trésorerie négative prolongée.")
             return
         await interaction.response.edit_message(view=None)  # anti double-clic : retire la confirmation
         await interaction.channel.send(embed=self._types_embed(), view=OrdreTypeView(character_id, user_id))
@@ -1103,6 +1172,12 @@ class Ordre(commands.Cog):
         if not self._is_chief(order_id, interaction.user.id):
             await interaction.response.send_message("Seul le chef de l'ordre peut faire ça.", ephemeral=True)
             return
+        # Verrou de sécurité : aucune dépense sortante tant que la trésorerie a été négative trop longtemps.
+        if db.get_order(order_id)["security_lock"]:
+            await interaction.response.send_message(
+                "🔒 Ce compte est verrouillé suite à une trésorerie négative prolongée, aucune dépense "
+                "n'est possible pour l'instant. Seuls les dépôts sont acceptés.", ephemeral=True)
+            return
         if not self._acquire(interaction.user.id):
             await interaction.response.send_message(
                 "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True)
@@ -1509,6 +1584,411 @@ class Ordre(commands.Cog):
             pass
 
     # =================================================================
+    # SALAIRES (Direct / Hybride)
+    # =================================================================
+    def rank_of(self, character_id, order_id) -> int:
+        """Rang hiérarchique d'un personnage dans un ordre (0 = plus haut gradé, 99 = inconnu / non
+        membre). Sert à prioriser les paiements quand le compte est déjà négatif."""
+        m = db.get_order_member(order_id, character_id)
+        role = m["role_label"] if m else None
+        return ORDER_HIERARCHY_RANK.get(role, 99)
+
+    def _next_monday_or_today(self) -> str:
+        """Date d'entrée en vigueur d'un salaire : aujourd'hui si lundi, sinon le prochain lundi
+        (format YYYY-MM-DD)."""
+        today = datetime.utcnow().date()
+        if today.weekday() == 0:  # lundi
+            return today.isoformat()
+        return (today + timedelta(days=7 - today.weekday())).isoformat()
+
+    async def handle_salaire(self, interaction, cid):
+        _, order_id, user_id = cid.split(":")
+        order_id, user_id = int(order_id), int(user_id)
+        if not self._is_chief(order_id, interaction.user.id):
+            await interaction.response.send_message("Seul le chef de l'ordre peut faire ça.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="💰 Salaires", description="Que veux tu faire ?", color=PHOENIX_COLOR),
+            view=SalaireView(order_id, user_id))
+
+    async def handle_salaire_add(self, interaction, cid):
+        _, order_id, user_id = cid.split(":")
+        order_id, user_id = int(order_id), int(user_id)
+        if interaction.user.id != user_id or not self._is_chief(order_id, interaction.user.id):
+            await interaction.response.send_message("Seul le chef de l'ordre peut faire ça.", ephemeral=True)
+            return
+        # 1) Verrou : impossible d'ajouter des salaires tant que le compte est verrouillé.
+        if db.get_order(order_id)["security_lock"]:
+            await interaction.response.send_message(
+                "🔒 Ce compte est verrouillé (trésorerie négative), impossible d'ajouter des salaires "
+                "pour l'instant.", ephemeral=True)
+            return
+        if not self._acquire(interaction.user.id):
+            await interaction.response.send_message(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True)
+            return
+        try:
+            await interaction.response.send_message("💰 Ajout de salaires…", ephemeral=True)
+            channel = interaction.channel
+            n = await self._ask_positive_int(
+                channel, interaction.user, "Combien de personnes veux tu ajouter ?")
+            if n is None:
+                return
+            parsed = await self._collect_salary_lines(channel, interaction.user, n, order_id)
+            if parsed is None:
+                return
+            eff = self._next_monday_or_today()
+            now = _now()
+            recap = []
+            for character_id, montant in parsed:
+                existing = db.get_salary(order_id, character_id)
+                db.upsert_salary(order_id, character_id, montant, eff, now)
+                recap.append((character_id, montant, existing is not None))
+            lines = []
+            for character_id, montant, updated in recap:
+                verbe = "mis à jour" if updated else "ajouté"
+                lines.append(f"• **{self._char_name(character_id)}** — {_fmt(montant)} ¥ ({verbe})")
+            await channel.send(embed=discord.Embed(
+                title="✅ Salaires enregistrés",
+                description="\n".join(lines) + f"\n\n📅 Entrée en vigueur : **{_fmt_date(eff)}**.",
+                color=PHOENIX_COLOR))
+        finally:
+            self._release(interaction.user.id)
+
+    async def _collect_salary_lines(self, channel, user, n, order_id):
+        """Collecte n lignes « IBAN montant », valide chaque IBAN (compte courant existant) et chaque
+        montant, et ne redemande QUE les lignes en erreur. Retourne [(character_id, montant), ...] ou
+        None si annulé."""
+        results = [None] * n
+        pending = list(range(n))  # indices encore à (re)saisir
+        first = True
+        while pending:
+            if first:
+                await channel.send(
+                    f"Colle **{n}** ligne(s) au format `IBAN montant` (une par ligne).")
+                first = False
+            else:
+                nums = ", ".join(str(i + 1) for i in pending)
+                await channel.send(
+                    f"Recolle uniquement la/les ligne(s) en erreur (ligne(s) {nums}), "
+                    f"soit **{len(pending)}** ligne(s), au format `IBAN montant`.")
+            m = await self.wait_message(channel, user)
+            if m is None:
+                await channel.send("⏳ Annulé.")
+                return None
+            raw_lines = [ln.strip() for ln in m.content.splitlines() if ln.strip()]
+            if len(raw_lines) != len(pending):
+                await channel.send(
+                    f"❌ Il faut exactement **{len(pending)}** ligne(s), tu en as fourni {len(raw_lines)}.")
+                continue
+            errors = []      # (numéro_ligne_affiché, raison)
+            still_pending = []
+            for slot, ln in zip(pending, raw_lines):
+                parts = ln.split()
+                if len(parts) != 2:
+                    errors.append((slot + 1, "format attendu : `IBAN montant`"))
+                    still_pending.append(slot)
+                    continue
+                iban_raw, montant_raw = parts[0].strip().upper(), parts[1]
+                acct = db.get_bank_account_by_courant_iban(iban_raw)
+                montant = _parse_int(montant_raw)
+                if acct is None:
+                    errors.append((slot + 1, f"IBAN `{iban_raw}` introuvable"))
+                    still_pending.append(slot)
+                    continue
+                if montant is None or montant <= 0:
+                    errors.append((slot + 1, "montant invalide (entier positif attendu)"))
+                    still_pending.append(slot)
+                    continue
+                results[slot] = (acct["character_id"], montant)
+            if errors:
+                detail = "\n".join(f"• Ligne {num} : {reason}" for num, reason in errors)
+                await channel.send(embed=discord.Embed(
+                    title="❌ Lignes en erreur", description=detail, color=discord.Color.red()))
+            pending = still_pending
+        return results
+
+    async def handle_salaire_remove(self, interaction, cid):
+        _, order_id, user_id = cid.split(":")
+        order_id, user_id = int(order_id), int(user_id)
+        if interaction.user.id != user_id or not self._is_chief(order_id, interaction.user.id):
+            await interaction.response.send_message("Seul le chef de l'ordre peut faire ça.", ephemeral=True)
+            return
+        if not self._acquire(interaction.user.id):
+            await interaction.response.send_message(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True)
+            return
+        try:
+            await interaction.response.send_message("💰 Retrait d'un salaire…", ephemeral=True)
+            channel = interaction.channel
+            while True:
+                await channel.send("Entre l'IBAN du salarié à retirer.")
+                m = await self.wait_message(channel, interaction.user)
+                if m is None:
+                    await channel.send("⏳ Annulé.")
+                    return
+                iban = m.content.strip().upper()
+                acct = db.get_bank_account_by_courant_iban(iban)
+                if acct is None:
+                    await channel.send("❌ Aucun compte trouvé avec cet IBAN. Réessaie.")
+                    continue
+                character_id = acct["character_id"]
+                if db.get_salary(order_id, character_id) is None:
+                    await channel.send(
+                        "❌ Ce personnage ne perçoit aucun salaire dans cet ordre. Réessaie.")
+                    continue
+                db.remove_salary(order_id, character_id)
+                await channel.send(embed=discord.Embed(
+                    description=f"✅ Salaire de **{self._char_name(character_id)}** retiré.",
+                    color=PHOENIX_COLOR))
+                return
+        finally:
+            self._release(interaction.user.id)
+
+    # ---------- boutons du DM de choix de verrou ----------
+    async def handle_lock_keep(self, interaction, cid):
+        _, order_id, user_id = cid.split(":")
+        order_id, user_id = int(order_id), int(user_id)
+        if interaction.user.id != user_id or not self._is_chief(order_id, interaction.user.id):
+            await interaction.response.send_message("Ce panneau ne t'appartient pas.", ephemeral=True)
+            return
+        db.set_order_lock_grace_until(order_id, _plus_months(_now(), 2))
+        self._grace_prompt_pending.discard(order_id)
+        await interaction.response.edit_message(
+            content="🔒 Verrou conservé. Il se désactivera automatiquement dans 2 mois.", view=None)
+
+    async def handle_lock_off(self, interaction, cid):
+        _, order_id, user_id = cid.split(":")
+        order_id, user_id = int(order_id), int(user_id)
+        if interaction.user.id != user_id or not self._is_chief(order_id, interaction.user.id):
+            await interaction.response.send_message("Ce panneau ne t'appartient pas.", ephemeral=True)
+            return
+        db.clear_order_lock(order_id)
+        self._grace_prompt_pending.discard(order_id)
+        await interaction.response.edit_message(
+            content="🔓 Verrou désactivé. Les dépenses de l'ordre sont de nouveau possibles.", view=None)
+
+    # =================================================================
+    # TÂCHE PLANIFIÉE : SALAIRES + VERROUS + ÉCHÉANCES
+    # =================================================================
+    @tasks.loop(hours=24)
+    async def salary_loop(self):
+        today = datetime.utcnow().date()
+        is_monday = today.weekday() == 0
+        for order in db.get_orders_of_types(("direct", "hybride")):
+            try:
+                await self._process_order_salary_cycle(order["id"], today, is_monday)
+            except Exception as e:  # un ordre en erreur ne doit pas bloquer les autres
+                print(f"[salary_loop] erreur sur l'ordre {order['id']} : {e}")
+
+    @salary_loop.before_loop
+    async def _before_salary_loop(self):
+        await self.bot.wait_until_ready()
+
+    def _guild_of_order(self, order):
+        chef = get_character(order["chef_character_id"])
+        gid = chef["guild_id"] if chef else None
+        return self.bot.get_guild(gid) if gid else None
+
+    async def _process_order_salary_cycle(self, order_id, today, is_monday):
+        order = db.get_order(order_id)
+        if order is None:
+            return
+        guild = self._guild_of_order(order)
+        # A) Le lundi : paiement des salaires.
+        if is_monday:
+            await self._pay_salaries(order_id, today, guild)
+        # B) Tous les jours : suivi des verrous et des échéances (peut dissoudre l'ordre).
+        await self._check_locks_and_deadlines(order_id, guild)
+
+    async def _pay_salaries(self, order_id, today, guild):
+        order = db.get_order(order_id)
+        if order is None or order["security_lock"]:
+            return  # verrouillé : personne n'est payé cette semaine
+        salaries = db.get_salaries_effective(order_id, today.isoformat())
+        if not salaries:
+            return
+        solde_start = order["solde_courant"]
+        if solde_start >= 0:
+            to_pay = list(salaries)  # tout le monde, quitte à passer sous zéro après coup
+        else:
+            # Déjà négatif AVANT de payer : seuls les 5 plus hauts gradés, puis verrouillage.
+            to_pay = sorted(salaries, key=lambda s: self.rank_of(s["character_id"], order_id))[:5]
+            db.set_order_security_lock(order_id, 1)
+            if order["negative_since"] is None:
+                db.set_order_negative_since(order_id, _now())
+        for s in to_pay:
+            montant, character_id = s["montant"], s["character_id"]
+            db.adjust_order_solde(order_id, -montant)
+            db.add_order_transaction(order_id, "Salaire hebdomadaire", -montant, _now())
+            credit_account(character_id, "courant", montant)
+            add_transaction(character_id, "Salaire hebdomadaire", montant)
+
+    async def _check_locks_and_deadlines(self, order_id, guild):
+        order = db.get_order(order_id)
+        if order is None or not order["security_lock"]:
+            return
+        now = _now()
+        if order["solde_courant"] >= 0:
+            # Compte remonté à l'équilibre.
+            if order["lock_grace_until"] is None:
+                if order_id not in self._grace_prompt_pending:
+                    self._grace_prompt_pending.add(order_id)
+                    await self._send_lock_recovery_prompt(order, guild)
+            elif now >= order["lock_grace_until"]:
+                db.clear_order_lock(order_id)
+                self._grace_prompt_pending.discard(order_id)
+                await self._dm_character_owner(
+                    guild, order["chef_character_id"],
+                    "🔓 Le verrou de sécurité s'est désactivé automatiquement après 2 mois.")
+        else:
+            # Toujours dans le négatif : le retour à l'équilibre n'a pas eu lieu, on repart à zéro
+            # côté prompt (au cas où il était remonté puis redescendu).
+            self._grace_prompt_pending.discard(order_id)
+            neg = order["negative_since"]
+            if not neg:
+                return
+            if now >= _plus_months(neg, 2):
+                await self.dissolve_order(order_id, guild)
+                return
+            if now >= _plus_months(neg, 1) and not order["warning_sent"]:
+                db.set_order_warning_sent(order_id, 1)
+                await self._dm_character_owner(
+                    guild, order["chef_character_id"],
+                    "⚠️ Ton ordre est dans le négatif depuis 1 mois. Il te reste 1 mois pour redresser "
+                    "la situation avant la suppression automatique de l'ordre.")
+
+    async def _send_lock_recovery_prompt(self, order, guild):
+        char = get_character(order["chef_character_id"])
+        if not char:
+            return
+        uid = char["user_id"]
+        member = guild.get_member(uid) if guild else None
+        if member is None:
+            try:
+                member = await self.bot.fetch_user(uid)
+            except discord.HTTPException:
+                return
+        try:
+            await member.send(
+                content=(
+                    "✅ Ton ordre est remonté à l'équilibre. Le verrou de sécurité empêche actuellement "
+                    "tout débit (dépenses, virements, salons, salaires). Veux tu :\n\n"
+                    "• Garder le verrou actif (protection contre un retour dans le négatif, il se "
+                    "désactivera automatiquement dans 2 mois)\n"
+                    "• Désactiver le verrou maintenant (risque de retomber dans le négatif)"),
+                view=LockRecoveryView(order["id"], uid))
+        except discord.HTTPException:
+            pass
+
+    # =================================================================
+    # DISSOLUTION D'UN ORDRE
+    # =================================================================
+    async def dissolve_order(self, order_id, guild):
+        """Dissolution pour trésorerie négative prolongée : indemnité de 2 mois (montant x8) aux membres
+        salariés, et bannissement de création d'ordre du chef pendant 2 mois."""
+        await self._dissolve_common(
+            order_id, guild, indemnity_weeks=8, ban_chief=True,
+            tx_label="Indemnité de dissolution d'ordre",
+            member_text=("⚠️ L'ordre **{name}** a été dissous suite à une trésorerie négative "
+                         "prolongée. Tu n'en fais plus partie."),
+            chef_text=("⚠️ Ton ordre **{name}** a été dissous suite à une trésorerie négative prolongée "
+                       "pendant 2 mois. En tant que chef, tu ne reçois pas d'indemnité, et tu ne pourras "
+                       "pas créer de nouvel ordre avant 2 mois."))
+
+    async def dissolve_order_member_left(self, order_id, guild):
+        """Dissolution suite au départ du chef du serveur : indemnité de 1 mois (montant x4) aux membres
+        salariés, et AUCUN bannissement (le chef n'a rien fait de répréhensible)."""
+        await self._dissolve_common(
+            order_id, guild, indemnity_weeks=4, ban_chief=False,
+            tx_label="Indemnité de dissolution d'ordre (départ du chef)",
+            member_text=("⚠️ L'ordre **{name}** a été dissous suite au départ de son chef du serveur. "
+                         "Tu n'en fais plus partie."),
+            chef_text=None)  # le chef a quitté le serveur : inutile de le notifier
+
+    async def _dissolve_common(self, order_id, guild, *, indemnity_weeks, ban_chief,
+                               tx_label, member_text, chef_text):
+        """Logique commune de dissolution. IMPORTANT : les libérations croisées (salons/contrats liés à
+        d'AUTRES ordres) et les résolutions de noms se font AVANT la suppression finale, pendant que les
+        données existent encore."""
+        order = db.get_order(order_id)
+        if order is None:
+            return
+        order_name = order["name"]
+        chef_cid = order["chef_character_id"]
+
+        # 1) Indemnités + notifications des membres (hors chef).
+        for m in db.get_order_members(order_id):
+            cid = m["character_id"]
+            if cid == chef_cid:
+                continue
+            sal = db.get_salary(order_id, cid)
+            indemnite = sal["montant"] * indemnity_weeks if sal else 0
+            if indemnite > 0:
+                credit_account(cid, "courant", indemnite)
+                add_transaction(cid, tx_label, indemnite)
+            txt = member_text.format(name=order_name)
+            if indemnite > 0:
+                txt += f"\n💰 Tu as reçu une indemnité de **{_fmt(indemnite)} ¥**."
+            await self._dm_character_owner(guild, cid, txt)
+
+        # 2) Notification du chef (sauf départ du serveur : chef_text=None).
+        if chef_text is not None:
+            await self._dm_character_owner(guild, chef_cid, chef_text.format(name=order_name))
+
+        # 3) Ban éventuel du chef.
+        if ban_chief:
+            chef = get_character(chef_cid)
+            if chef:
+                db.set_chief_ban(chef["user_id"], _plus_months(_now(), 2))
+
+        # 4) Libération des salons liés à d'autres ordres (miroirs chez la contrepartie).
+        await self._release_linked_salons(order_id, order_name, guild)
+
+        # 5) Clôture + notification des contrats (défensif : no-op tant que la table n'existe pas).
+        await self._end_order_contracts(order_id, order_name, guild)
+
+        # 6) Suppression finale de l'ordre et de ses données propres.
+        db.delete_order_cascade(order_id)
+
+    async def _release_linked_salons(self, order_id, order_name, guild):
+        """Pour chaque salon de l'ordre lié à un autre ordre (Louée/Location) : supprime l'entrée miroir
+        chez la contrepartie et prévient son chef que le salon est désormais libre."""
+        for s in db.get_linked_salons(order_id):
+            other_id = s["linked_order_id"]
+            if not other_id:
+                continue
+            ch = guild.get_channel(s["channel_id"]) if guild else None
+            salon_name = ch.name if ch else str(s["channel_id"])
+            db.remove_order_salon_any(other_id, s["channel_id"])
+            other = db.get_order(other_id)
+            if not other:
+                continue
+            # Notre statut sur ce salon détermine le rôle de la contrepartie :
+            #  - nous 'Location' (propriétaire qui louait) -> eux locataires -> ils « louaient »
+            #  - nous 'Louée' (locataire) -> eux propriétaires -> ils « avaient en location »
+            verbe = "louiez" if s["status"] == "Location" else "aviez en location avec eux"
+            await self._dm_character_owner(
+                guild, other["chef_character_id"],
+                f"⚠️ L'ordre **{order_name}** a été dissous. Le salon #{salon_name} que vous {verbe} "
+                "n'est plus lié à aucun contrat, il est maintenant libre de toute location de votre côté.")
+
+    async def _end_order_contracts(self, order_id, order_name, guild):
+        """Clôt (status='ended') les contrats actifs liés à l'ordre et prévient les deux parties.
+        Défensif : la table educator_contracts n'existe pas encore, donc no-op silencieux dans ce cas."""
+        try:
+            ended = db.end_order_contracts(order_id)  # [] si table absente
+        except Exception:
+            return
+        for disciple_cid, educator_cid in ended:
+            msg = (f"⚠️ Suite à la dissolution de l'ordre **{order_name}**, le contrat entre "
+                   f"{self._char_name(disciple_cid)} et {self._char_name(educator_cid)} a pris fin "
+                   "automatiquement.")
+            await self._dm_character_owner(guild, disciple_cid, msg)
+            await self._dm_character_owner(guild, educator_cid, msg)
+
+    # =================================================================
     # SALONS — ACQUISITION (section 8)
     # =================================================================
     async def handle_salons_buy(self, interaction, cid):
@@ -1519,6 +1999,12 @@ class Ordre(commands.Cog):
         if order["type"] not in ("direct", "hybride"):
             await interaction.response.send_message(
                 "Seuls les ordres Direct/Hybride peuvent posséder des salons.", ephemeral=True)
+            return
+        # Verrou de sécurité : achat de salons = dépense, bloqué tant que le compte est verrouillé.
+        if order["security_lock"]:
+            await interaction.response.send_message(
+                "🔒 Ce compte est verrouillé suite à une trésorerie négative prolongée, aucune dépense "
+                "n'est possible pour l'instant. Seuls les dépôts sont acceptés.", ephemeral=True)
             return
         if not self._acquire(interaction.user.id):
             await interaction.response.send_message(

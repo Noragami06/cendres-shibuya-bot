@@ -2900,6 +2900,74 @@ def delete_character_cascade(character_id):
             "WHERE disciple_character_id = ? OR educator_character_id = ?",
             (character_id, character_id),
         )
+        # Salaires perçus dans un ordre : le personnage supprimé n'est plus payé.
+        # TODO : le retrait automatique si le JOUEUR quitte le serveur Discord (sans forcément supprimer
+        # son personnage) est désormais géré par handle_player_departure / on_member_remove ci-dessous.
+        conn.execute("DELETE FROM order_salaries WHERE character_id = ?", (character_id,))
+
+
+# =====================================================================
+# DÉPART D'UN JOUEUR DU SERVEUR (nettoyage automatique)
+# =====================================================================
+async def handle_player_departure(bot, user_id: int, guild):
+    """Traite un joueur ayant quitté le serveur comme s'il avait supprimé tous ses personnages, y
+    compris la dissolution de tout ordre dont il aurait été chef (variante « départ », sans ban)."""
+    with db.get_connection() as conn:
+        characters = conn.execute(
+            "SELECT id, slot_number FROM validated_characters WHERE user_id = ? AND guild_id = ?",
+            (user_id, guild.id),
+        ).fetchall()
+    if not characters:
+        return
+
+    ordre_cog = bot.get_cog("Ordre")
+    for char in characters:
+        char_id = char["id"]
+        # Si ce personnage est CHEF d'un ordre : dissolution AVANT la cascade classique (pour que la
+        # libération croisée des salons/contrats se fasse pendant que les données existent encore).
+        with db.get_connection() as conn:
+            order = conn.execute(
+                "SELECT id, name FROM orders WHERE chef_character_id = ?", (char_id,)
+            ).fetchone()
+        if order is not None and ordre_cog is not None:
+            try:
+                await ordre_cog.dissolve_order_member_left(order["id"], guild)
+            except Exception as e:
+                print(f"[départ] échec dissolution ordre {order['id']} : {e}")
+
+        # Cascade classique (banque, inventaire, relations, order_members, order_salaries,
+        # order_disciple_assignments, etc.), puis retrait définitif du personnage.
+        delete_character_cascade(char_id)
+        with db.get_connection() as conn:
+            conn.execute("DELETE FROM validated_characters WHERE id = ?", (char_id,))
+    # On supprime TOUS les personnages du joueur : aucune renumérotation de slot n'est nécessaire.
+
+
+async def retroactive_departure_check(bot):
+    """Rattrapage des joueurs partis AVANT l'ajout du listener on_member_remove. Déclenché une fois au
+    démarrage. Ce rattrapage tourne à CHAQUE démarrage du bot, mais ne fait rien pour les joueurs déjà
+    nettoyés (leurs personnages n'existent plus en base), donc c'est sans risque de le laisser tourner
+    indéfiniment à chaque redémarrage."""
+    for guild in bot.guilds:
+        with db.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT user_id FROM validated_characters WHERE guild_id = ?", (guild.id,)
+            ).fetchall()
+        for row in rows:
+            user_id = row["user_id"]
+            member = guild.get_member(user_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(user_id)
+                except discord.NotFound:
+                    member = None
+                except discord.HTTPException:
+                    continue  # erreur réseau temporaire : on retentera au prochain redémarrage
+            if member is None:
+                print(f"🔍 [rattrapage] Joueur {user_id} a quitté le serveur avant cet ajout, "
+                      "nettoyage en cours...")
+                await handle_player_departure(bot, user_id, guild)
+            await asyncio.sleep(0.5)  # évite de spam l'API Discord sur un gros serveur
 
 
 class DeleteConfirmView(discord.ui.View):
@@ -2977,6 +3045,12 @@ class Depart(commands.Cog):
 
     async def cog_unload(self):
         self.fiche_expiry_loop.cancel()
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        # Un joueur quitte le serveur : on nettoie ses personnages (et dissout ses ordres) comme s'il
+        # les avait tous supprimés.
+        await handle_player_departure(self.bot, member.id, member.guild)
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
