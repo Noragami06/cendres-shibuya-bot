@@ -288,7 +288,25 @@ CREATE TABLE IF NOT EXISTS orders (
     solde_courant INTEGER DEFAULT 0,
     iban TEXT,                      -- unicité garantie par idx_orders_iban (créé dans init_db)
     pin_code TEXT,
+    security_lock INTEGER DEFAULT 0,-- 1 = compte verrouillé (trésorerie négative prolongée) : aucun débit
+    negative_since TEXT,            -- date ISO de bascule dans le négatif (NULL si à l'équilibre)
+    lock_grace_until TEXT,          -- fin des 2 mois de grâce si le chef choisit de garder le verrou
+    warning_sent INTEGER DEFAULT 0, -- 1 = avertissement « 1 mois de négatif » déjà envoyé
     created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS order_salaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER,
+    character_id INTEGER,
+    montant INTEGER,
+    effective_start_date TEXT,      -- date (YYYY-MM-DD) d'entrée en vigueur (prochain lundi)
+    added_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS order_chief_bans (
+    user_id INTEGER PRIMARY KEY,
+    banned_until TEXT               -- interdiction de créer un ordre jusqu'à cette date ISO
 );
 
 CREATE TABLE IF NOT EXISTS order_bank_sessions (
@@ -296,6 +314,13 @@ CREATE TABLE IF NOT EXISTS order_bank_sessions (
     order_id INTEGER,
     verified_at TEXT,
     PRIMARY KEY (user_id, order_id)
+);
+
+CREATE TABLE IF NOT EXISTS order_disciple_assignments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER,
+    disciple_character_id INTEGER,
+    educator_character_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS order_members (
@@ -473,6 +498,15 @@ def _ensure_order_columns(conn):
         conn.execute("ALTER TABLE orders ADD COLUMN iban TEXT")
     if "pin_code" not in cols:
         conn.execute("ALTER TABLE orders ADD COLUMN pin_code TEXT")
+    # Système de salaires + verrou de sécurité (trésorerie négative prolongée).
+    if "security_lock" not in cols:
+        conn.execute("ALTER TABLE orders ADD COLUMN security_lock INTEGER DEFAULT 0")
+    if "negative_since" not in cols:
+        conn.execute("ALTER TABLE orders ADD COLUMN negative_since TEXT")
+    if "lock_grace_until" not in cols:
+        conn.execute("ALTER TABLE orders ADD COLUMN lock_grace_until TEXT")
+    if "warning_sent" not in cols:
+        conn.execute("ALTER TABLE orders ADD COLUMN warning_sent INTEGER DEFAULT 0")
 
 
 def init_db():
@@ -1340,8 +1374,9 @@ def get_orders_in_guild(guild_id: int, exclude_order_id=None):
 
 
 # ---------- Banque des ordres ----------
-# NB : le jour où une suppression d'ordre sera implémentée, penser à nettoyer TOUTES les tables liées
-# à l'ordre : orders, order_members, order_salons, order_transactions ET order_bank_sessions.
+# NB : la suppression complète d'un ordre passe par delete_order_cascade() ci-dessous, qui nettoie
+# TOUTES les tables liées : orders, order_members, order_salons, order_transactions,
+# order_bank_sessions, order_disciple_assignments ET order_salaries.
 def get_order_by_iban(iban: str):
     with get_connection() as conn:
         return conn.execute("SELECT * FROM orders WHERE iban = ?", (iban,)).fetchone()
@@ -1381,6 +1416,281 @@ def count_order_salons(order_id: int, status: str) -> int:
         return conn.execute(
             "SELECT COUNT(*) AS n FROM order_salons WHERE order_id = ? AND status = ?", (order_id, status)
         ).fetchone()["n"]
+
+
+# ---------- Rattachement disciple ↔ éducateur (ordres éducatifs) ----------
+def get_order_members_by_role(order_id: int, role_label: str):
+    """Membres d'un ordre ayant un rôle précis, avec nom + user_id (ex : lister les formateurs)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT m.character_id, m.role_label, v.character_name, v.user_id "
+            "FROM order_members m LEFT JOIN validated_characters v ON v.id = m.character_id "
+            "WHERE m.order_id = ? AND m.role_label = ? ORDER BY m.id ASC",
+            (order_id, role_label),
+        ).fetchall()
+
+
+def add_disciple_assignment(order_id: int, disciple_character_id: int, educator_character_id: int):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO order_disciple_assignments (order_id, disciple_character_id, educator_character_id) "
+            "VALUES (?, ?, ?)",
+            (order_id, disciple_character_id, educator_character_id),
+        )
+
+
+def remove_disciple_assignment(order_id: int, disciple_character_id: int):
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM order_disciple_assignments WHERE order_id = ? AND disciple_character_id = ?",
+            (order_id, disciple_character_id),
+        )
+
+
+def orphan_disciples_of_educator(educator_character_id: int) -> int:
+    """Détache tous les disciples d'un formateur (educator_character_id -> NULL). Retourne le nombre
+    de disciples devenus orphelins (pour prévenir le staff)."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE order_disciple_assignments SET educator_character_id = NULL WHERE educator_character_id = ?",
+            (educator_character_id,),
+        )
+        return cur.rowcount
+
+
+def get_disciples_of_educator(order_id: int, educator_character_id: int):
+    """Assignations (id, disciple_character_id) des disciples rattachés à cet éducateur dans l'ordre."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT id, disciple_character_id FROM order_disciple_assignments "
+            "WHERE order_id = ? AND educator_character_id = ?",
+            (order_id, educator_character_id),
+        ).fetchall()
+
+
+def count_disciples_of_educator(order_id: int, educator_character_id: int) -> int:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM order_disciple_assignments "
+            "WHERE order_id = ? AND educator_character_id = ?",
+            (order_id, educator_character_id),
+        ).fetchone()["n"]
+
+
+def set_assignment_educator(assignment_id: int, educator_character_id):
+    """Fixe (ou détache si educator_character_id=None) l'éducateur d'une assignation précise (par id)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE order_disciple_assignments SET educator_character_id = ? WHERE id = ?",
+            (educator_character_id, assignment_id),
+        )
+
+
+def cleanup_educator_assignments(order_id: int, educator_character_id: int, keep_disciple_ids):
+    """Filet de sécurité : supprime les assignations encore rattachées à un éducateur retiré, hors
+    disciples déjà réassignés (keep_disciple_ids)."""
+    with get_connection() as conn:
+        if keep_disciple_ids:
+            placeholders = ",".join("?" * len(keep_disciple_ids))
+            conn.execute(
+                f"DELETE FROM order_disciple_assignments WHERE order_id = ? AND educator_character_id = ? "
+                f"AND disciple_character_id NOT IN ({placeholders})",
+                (order_id, educator_character_id, *keep_disciple_ids),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM order_disciple_assignments WHERE order_id = ? AND educator_character_id = ?",
+                (order_id, educator_character_id),
+            )
+
+
+def transfer_active_contracts_educator(disciple_character_id: int, old_educator_id: int, new_educator_id: int):
+    """Redirige les contrats ACTIFS d'un disciple de l'ancien vers le nouvel éducateur. Défensif : la
+    table educator_contracts n'existe pas encore (système de contrats/salaires à venir), donc on ne
+    fait rien tant qu'elle est absente — le jour où elle existera, ce transfert s'appliquera tout seul."""
+    with get_connection() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'educator_contracts'"
+        ).fetchone()
+        if not exists:
+            return
+        conn.execute(
+            "UPDATE educator_contracts SET educator_character_id = ? "
+            "WHERE disciple_character_id = ? AND educator_character_id = ? AND status = 'active'",
+            (new_educator_id, disciple_character_id, old_educator_id),
+        )
+
+
+# ---------- Salaires des ordres (Direct / Hybride) ----------
+def get_orders_of_types(types):
+    """Tous les ordres dont le type est dans `types` (ex : ('direct', 'hybride')). Sert à la tâche
+    planifiée des salaires."""
+    with get_connection() as conn:
+        placeholders = ",".join("?" * len(types))
+        return conn.execute(
+            f"SELECT * FROM orders WHERE type IN ({placeholders}) ORDER BY id ASC", tuple(types)
+        ).fetchall()
+
+
+def get_bank_account_by_courant_iban(iban: str):
+    """Compte bancaire personnel dont l'IBAN COURANT correspond (le salaire vise le compte courant),
+    ou None."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM bank_accounts WHERE iban_courant = ?", (iban,)
+        ).fetchone()
+
+
+def upsert_salary(order_id: int, character_id: int, montant: int, effective_start_date: str, added_at: str):
+    """Ajoute ou met à jour (montant + date d'effet) le salaire d'un personnage dans un ordre."""
+    with get_connection() as conn:
+        existing = conn.execute(
+            "SELECT id FROM order_salaries WHERE order_id = ? AND character_id = ?",
+            (order_id, character_id),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE order_salaries SET montant = ?, effective_start_date = ?, added_at = ? WHERE id = ?",
+                (montant, effective_start_date, added_at, existing["id"]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO order_salaries (order_id, character_id, montant, effective_start_date, added_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (order_id, character_id, montant, effective_start_date, added_at),
+            )
+
+
+def get_salary(order_id: int, character_id: int):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM order_salaries WHERE order_id = ? AND character_id = ?",
+            (order_id, character_id),
+        ).fetchone()
+
+
+def remove_salary(order_id: int, character_id: int):
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM order_salaries WHERE order_id = ? AND character_id = ?",
+            (order_id, character_id),
+        )
+
+
+def get_salaries_effective(order_id: int, today_iso: str):
+    """Salaires de l'ordre dont la date d'effet est atteinte (effective_start_date <= aujourd'hui)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM order_salaries WHERE order_id = ? AND effective_start_date <= ? ORDER BY id ASC",
+            (order_id, today_iso),
+        ).fetchall()
+
+
+# ---------- Verrou de sécurité / état de trésorerie d'un ordre ----------
+def set_order_security_lock(order_id: int, value: int):
+    with get_connection() as conn:
+        conn.execute("UPDATE orders SET security_lock = ? WHERE id = ?", (value, order_id))
+
+
+def set_order_negative_since(order_id: int, iso_or_none):
+    with get_connection() as conn:
+        conn.execute("UPDATE orders SET negative_since = ? WHERE id = ?", (iso_or_none, order_id))
+
+
+def set_order_lock_grace_until(order_id: int, iso_or_none):
+    with get_connection() as conn:
+        conn.execute("UPDATE orders SET lock_grace_until = ? WHERE id = ?", (iso_or_none, order_id))
+
+
+def set_order_warning_sent(order_id: int, value: int):
+    with get_connection() as conn:
+        conn.execute("UPDATE orders SET warning_sent = ? WHERE id = ?", (value, order_id))
+
+
+def clear_order_lock(order_id: int):
+    """Remet un ordre à l'état sain : verrou levé, plus de date de négatif, plus de grâce, avertissement
+    réinitialisé (prêt pour un futur cycle)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE orders SET security_lock = 0, negative_since = NULL, lock_grace_until = NULL, "
+            "warning_sent = 0 WHERE id = ?",
+            (order_id,),
+        )
+
+
+# ---------- Bannissement de création d'ordre (chef d'un ordre dissous) ----------
+def set_chief_ban(user_id: int, banned_until: str):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO order_chief_bans (user_id, banned_until) VALUES (?, ?)",
+            (user_id, banned_until),
+        )
+
+
+def get_chief_ban(user_id: int):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM order_chief_bans WHERE user_id = ?", (user_id,)
+        ).fetchone()
+
+
+# ---------- Suppression / nettoyage croisé lors de la dissolution ----------
+def get_linked_salons(order_id: int):
+    """Salons de l'ordre liés à un AUTRE ordre (loués ou en location), pour libérer la contrepartie
+    lors d'une dissolution."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT channel_id, status, linked_order_id FROM order_salons "
+            "WHERE order_id = ? AND status IN ('Louée', 'Location')",
+            (order_id,),
+        ).fetchall()
+
+
+def remove_order_salon_any(order_id: int, channel_id: int):
+    """Supprime la ligne salon d'un ordre pour un salon donné, quel que soit son statut (sert à retirer
+    l'entrée miroir chez l'ordre contrepartie)."""
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM order_salons WHERE order_id = ? AND channel_id = ?", (order_id, channel_id)
+        )
+
+
+def end_order_contracts(order_id: int):
+    """Passe à 'ended' les contrats actifs liés à l'ordre (employeur ou source) et retourne la liste
+    [(disciple_character_id, educator_character_id), ...] des contrats concernés pour notification.
+    Défensif : la table educator_contracts n'existe pas encore (système de contrats à venir) — on
+    retourne [] sans rien faire tant qu'elle est absente."""
+    with get_connection() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'educator_contracts'"
+        ).fetchone()
+        if not exists:
+            return []
+        rows = conn.execute(
+            "SELECT disciple_character_id, educator_character_id FROM educator_contracts "
+            "WHERE (employer_order_id = ? OR source_order_id = ?) AND status = 'active'",
+            (order_id, order_id),
+        ).fetchall()
+        conn.execute(
+            "UPDATE educator_contracts SET status = 'ended' "
+            "WHERE (employer_order_id = ? OR source_order_id = ?) AND status = 'active'",
+            (order_id, order_id),
+        )
+        return [(r["disciple_character_id"], r["educator_character_id"]) for r in rows]
+
+
+def delete_order_cascade(order_id: int):
+    """Supprime définitivement un ordre et toutes ses données propres. Les contrats (educator_contracts)
+    NE sont PAS supprimés ici : ils sont archivés en 'ended' par end_order_contracts() pour garder une
+    trace. Les bannissements de chef (order_chief_bans) sont indépendants de l'ordre et conservés."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM order_members WHERE order_id = ?", (order_id,))
+        conn.execute("DELETE FROM order_salons WHERE order_id = ?", (order_id,))
+        conn.execute("DELETE FROM order_salaries WHERE order_id = ?", (order_id,))
+        conn.execute("DELETE FROM order_disciple_assignments WHERE order_id = ?", (order_id,))
+        conn.execute("DELETE FROM order_transactions WHERE order_id = ?", (order_id,))
+        conn.execute("DELETE FROM order_bank_sessions WHERE order_id = ?", (order_id,))
+        conn.execute("DELETE FROM orders WHERE id = ?", (order_id,))
 
 
 def renumber_character_slots(user_id: int, guild_id: int):

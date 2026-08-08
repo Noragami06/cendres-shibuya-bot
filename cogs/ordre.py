@@ -487,6 +487,31 @@ class Ordre(commands.Cog):
         await view.wait()
         return view.result
 
+    async def _pick_educator(self, channel, user, order_id, guild):
+        """Sélection d'un éducateur (Formateur) de l'ordre pour rattacher un disciple. Retourne :
+        - "NO_EDUCATOR" s'il n'existe aucun formateur (l'appelant doit annuler l'ajout) ;
+        - un educator_character_id (int) si choisi ;
+        - None si annulé / délai dépassé."""
+        formateurs = db.get_order_members_by_role(order_id, "Formateur")
+        if not formateurs:
+            return "NO_EDUCATOR"
+        options, lines = [], []
+        for f in formateurs:
+            prenom = (f["character_name"] or "?").split()[0] if f["character_name"] else "?"
+            m = guild.get_member(f["user_id"]) if guild else None
+            mention = m.mention if m else f"<@{f['user_id']}>"
+            disp = m.display_name if m else str(f["user_id"])
+            options.append((f"{prenom} ({disp})", f["character_id"]))
+            lines.append(f"• **{prenom}** ({mention})")
+        view = SimpleSelectView("Choisis un éducateur...", options, user.id)
+        await channel.send(
+            embed=discord.Embed(
+                title="Chez quel éducateur veux tu envoyer ce disciple ?",
+                description="\n".join(lines), color=PHOENIX_COLOR),
+            view=view)
+        await view.wait()
+        return int(view.result) if view.result is not None else None
+
     # ---------- garde "chef uniquement" (à appliquer EN PREMIER dans chaque bouton) ----------
     def _is_chief(self, order_id, user_id) -> bool:
         order = db.get_order(order_id)
@@ -1203,10 +1228,30 @@ class Ordre(commands.Cog):
             if role is None:
                 await channel.send("⏳ Aucun rôle choisi, ajout annulé.")
                 return
+
+            # Ordre éducatif + rôle "Membre d'équipe" : un disciple DOIT être rattaché à un éducateur.
+            educator_cid = None
+            if order["type"] == "educatif" and role == "Membre d'équipe":
+                educator_cid = await self._pick_educator(channel, interaction.user, order_id, channel.guild)
+                if educator_cid == "NO_EDUCATOR":
+                    await channel.send(
+                        "Il n'y a aucun formateur dans cet ordre pour l'instant. Ajoute d'abord un "
+                        "formateur avant de pouvoir assigner un disciple.")
+                    return  # annulation totale : on n'insère PAS le membre (évite un disciple orphelin)
+                if educator_cid is None:
+                    await channel.send("⏳ Aucun éducateur choisi, ajout annulé.")
+                    return
+
             db.add_order_member(order_id, target_cid, role)
+            if educator_cid is not None:
+                db.add_disciple_assignment(order_id, target_cid, educator_cid)
             name = get_character(target_cid)["character_name"]
-            await channel.send(embed=discord.Embed(
-                description=f"✅ {name} ajouté à l'ordre comme **{role}**.", color=PHOENIX_COLOR))
+            desc = f"✅ {name} ajouté à l'ordre comme **{role}**."
+            if educator_cid is not None:
+                educ = get_character(educator_cid)
+                educ_prenom = (educ["character_name"] or "?").split()[0] if educ and educ["character_name"] else "?"
+                desc += f"\n🎓 Rattaché à l'éducateur **{educ_prenom}**."
+            await channel.send(embed=discord.Embed(description=desc, color=PHOENIX_COLOR))
             await self._send_staff(channel, order_id, interaction.user.id, 1)
         finally:
             self._release(interaction.user.id)
@@ -1242,9 +1287,42 @@ class Ordre(commands.Cog):
                     await channel.send("⏳ Annulé.")
                     return
             name = get_character(target_cid)["character_name"] if get_character(target_cid) else "?"
+            order = db.get_order(order_id)
+            order_name = order["name"] if order else "?"
+            # Rôle lu AVANT la suppression (pour savoir si c'était un formateur).
+            member_row = db.get_order_member(order_id, target_cid)
+            fired_role = member_row["role_label"] if member_row else None
+
+            reassignments, fallback_used, aucun_formateur_restant = [], False, False
+            if fired_role == "Formateur":
+                # Redistribution équilibrée des disciples AVANT de retirer le formateur.
+                reassignments, fallback_used, aucun_formateur_restant = \
+                    await self.redistribute_disciples(order_id, target_cid, channel.guild)
+                # Filet de sécurité : retire toute assignation résiduelle vers ce formateur
+                # (hors disciples déjà réassignés).
+                db.cleanup_educator_assignments(order_id, target_cid, [d for d, _ in reassignments])
+            else:
+                # Non-formateur : s'il était disciple, son rattachement n'a plus lieu d'être.
+                db.remove_disciple_assignment(order_id, target_cid)
+
             db.remove_order_member(order_id, target_cid)
-            await channel.send(embed=discord.Embed(
-                description=f"✅ {name} a été retiré de l'ordre.", color=PHOENIX_COLOR))
+
+            # Notifications (DM aux disciples / nouveaux éducateurs + récap à OWNER_ID).
+            if fired_role == "Formateur" and reassignments:
+                await self._notify_redistribution(
+                    channel.guild, order_name, name, reassignments, fallback_used, aucun_formateur_restant)
+
+            desc = f"✅ {name} a été retiré de l'ordre."
+            if fired_role == "Formateur" and reassignments:
+                nb_reassignes = sum(1 for _, e in reassignments if e is not None)
+                nb_orphelins = sum(1 for _, e in reassignments if e is None)
+                if nb_reassignes:
+                    desc += (f"\n🔁 {nb_reassignes} disciple(s) redistribué(s) parmi les autres formateurs"
+                             + (" (répartition forcée)." if fallback_used else "."))
+                if nb_orphelins:
+                    desc += (f"\n⚠️ {nb_orphelins} disciple(s) sans éducateur (aucun formateur restant), "
+                             "le staff doit s'en occuper.")
+            await channel.send(embed=discord.Embed(description=desc, color=PHOENIX_COLOR))
             await self._send_staff(channel, order_id, interaction.user.id, 1)
         finally:
             self._release(interaction.user.id)
@@ -1283,13 +1361,152 @@ class Ordre(commands.Cog):
             if role is None:
                 await channel.send("⏳ Aucun rôle choisi, mutation annulée.")
                 return
+
+            # Gestion du rattachement disciple selon le NOUVEAU rôle.
+            order = db.get_order(order_id)
+            educator_cid = None
+            if role == "Membre d'équipe" and order["type"] == "educatif":
+                # Devient disciple : on exige un éducateur avant de finaliser la mutation (comme à l'ajout).
+                educator_cid = await self._pick_educator(channel, interaction.user, order_id, channel.guild)
+                if educator_cid == "NO_EDUCATOR":
+                    await channel.send(
+                        "Il n'y a aucun formateur dans cet ordre pour l'instant. Ajoute d'abord un "
+                        "formateur avant de pouvoir assigner un disciple.")
+                    return  # mutation annulée
+                if educator_cid is None:
+                    await channel.send("⏳ Aucun éducateur choisi, mutation annulée.")
+                    return
+
             db.update_order_member_role(order_id, target_cid, role)
+            if role == "Membre d'équipe":
+                if educator_cid is not None:
+                    # Réassignation propre : on remplace un éventuel ancien rattachement par le nouveau.
+                    db.remove_disciple_assignment(order_id, target_cid)
+                    db.add_disciple_assignment(order_id, target_cid, educator_cid)
+            else:
+                # Promu / changé de poste : n'est plus un disciple, l'assignation n'a plus de sens.
+                db.remove_disciple_assignment(order_id, target_cid)
+
             name = get_character(target_cid)["character_name"] if get_character(target_cid) else "?"
-            await channel.send(embed=discord.Embed(
-                description=f"✅ {name} est désormais **{role}**.", color=PHOENIX_COLOR))
+            desc = f"✅ {name} est désormais **{role}**."
+            if educator_cid is not None:
+                educ = get_character(educator_cid)
+                educ_prenom = (educ["character_name"] or "?").split()[0] if educ and educ["character_name"] else "?"
+                desc += f"\n🎓 Rattaché à l'éducateur **{educ_prenom}**."
+            await channel.send(embed=discord.Embed(description=desc, color=PHOENIX_COLOR))
             await self._send_staff(channel, order_id, interaction.user.id, 1)
         finally:
             self._release(interaction.user.id)
+
+    # ---------- redistribution des disciples d'un formateur retiré ----------
+    def _char_name(self, character_id):
+        if character_id is None:
+            return "?"
+        c = get_character(character_id)
+        return c["character_name"] if c and c["character_name"] else "?"
+
+    async def _dm_character_owner(self, guild, character_id, content):
+        """Envoie un DM au propriétaire (compte Discord) d'un personnage. Silencieux en cas d'échec."""
+        char = get_character(character_id)
+        if not char:
+            return
+        uid = char["user_id"]
+        member = guild.get_member(uid) if guild else None
+        if member is None:
+            try:
+                member = await self.bot.fetch_user(uid)
+            except discord.HTTPException:
+                return
+        try:
+            await member.send(content)
+        except discord.HTTPException:
+            pass
+
+    async def redistribute_disciples(self, order_id, removed_educator_id, guild):
+        """Redistribue les disciples d'un éducateur supprimé vers les éducateurs restants ayant
+        STRICTEMENT MOINS de disciples que lui (équilibrage : chaque disciple va à celui qui en a le
+        moins parmi les éligibles). Si aucun n'est éligible mais qu'il reste des formateurs, on
+        redistribue quand même parmi tous (fallback). S'il ne reste aucun formateur, les disciples
+        restent orphelins. Retourne (reassignments, fallback_used, aucun_formateur_restant), où
+        reassignments = [(disciple_character_id, nouvel_educateur_id_ou_None), ...]."""
+        disciples = db.get_disciples_of_educator(order_id, removed_educator_id)
+        removed_count = len(disciples)
+        if removed_count == 0:
+            return [], False, False  # rien à redistribuer (contrat de retour uniformisé en 3-uple)
+
+        other_educators = [
+            f["character_id"] for f in db.get_order_members_by_role(order_id, "Formateur")
+            if f["character_id"] != removed_educator_id
+        ]
+        educator_counts = {
+            eid: db.count_disciples_of_educator(order_id, eid) for eid in other_educators
+        }
+
+        eligible = {eid: c for eid, c in educator_counts.items() if c < removed_count}
+        fallback_used = False
+        if not eligible and educator_counts:
+            eligible = dict(educator_counts)  # aucun n'a strictement moins : répartition forcée parmi tous
+            fallback_used = True
+
+        reassignments = []
+        if not eligible:
+            # Aucun formateur ne reste dans l'ordre : les disciples deviennent orphelins.
+            for row in disciples:
+                db.set_assignment_educator(row["id"], None)
+                reassignments.append((row["disciple_character_id"], None))
+            return reassignments, fallback_used, True
+
+        for row in disciples:
+            target = min(eligible, key=lambda k: eligible[k])
+            db.set_assignment_educator(row["id"], target)
+            # Redirige aussi les contrats actifs du disciple vers le nouvel éducateur.
+            # Le virement hebdomadaire (système de salaire, pas encore développé) devra toujours lire
+            # educator_character_id depuis educator_contracts au moment du paiement, jamais une valeur
+            # mise en cache, pour que ce transfert automatique de bénéficiaire reste correct.
+            db.transfer_active_contracts_educator(row["disciple_character_id"], removed_educator_id, target)
+            reassignments.append((row["disciple_character_id"], target))
+            eligible[target] += 1
+
+        return reassignments, fallback_used, False
+
+    async def _notify_redistribution(self, guild, order_name, old_educ_name, reassignments,
+                                     fallback_used, aucun_formateur_restant):
+        """DM à chaque disciple (et à son nouvel éducateur), puis récap complet à OWNER_ID."""
+        for disciple_cid, new_educ_cid in reassignments:
+            disc_name = self._char_name(disciple_cid)
+            if new_educ_cid is not None:
+                new_name = self._char_name(new_educ_cid)
+                await self._dm_character_owner(
+                    guild, disciple_cid,
+                    f"📋 Ton éducateur ({old_educ_name}) a quitté l'ordre {order_name}. Tu es maintenant "
+                    f"sous la responsabilité de {new_name}.")
+                await self._dm_character_owner(
+                    guild, new_educ_cid,
+                    f"📋 Tu as reçu un nouveau disciple suite au départ de {old_educ_name} : {disc_name}.")
+            else:
+                await self._dm_character_owner(
+                    guild, disciple_cid,
+                    f"⚠️ Ton éducateur ({old_educ_name}) a quitté l'ordre {order_name}, et il ne reste "
+                    "plus aucun formateur pour te reprendre. Un membre du staff doit s'en occuper.")
+
+        # Récap complet au propriétaire du bot pour vérification.
+        lines = []
+        for disciple_cid, new_educ_cid in reassignments:
+            target = self._char_name(new_educ_cid) if new_educ_cid is not None else "AUCUN (orphelin)"
+            lines.append(f"• {self._char_name(disciple_cid)} → {target}")
+        recap = (f"📋 Redistribution des disciples suite au retrait de **{old_educ_name}** dans l'ordre "
+                 f"**{order_name}** :\n" + "\n".join(lines))
+        if fallback_used:
+            recap += ("\n\n⚠️ fallback_used : aucun éducateur n'avait strictement moins de disciples, "
+                      "répartition forcée parmi tous les formateurs restants.")
+        if aucun_formateur_restant:
+            recap += ("\n\n⚠️ aucun_formateur_restant : plus aucun formateur dans l'ordre, disciples "
+                      "laissés orphelins (à réassigner manuellement).")
+        try:
+            owner_user = await self.bot.fetch_user(OWNER_ID)
+            await owner_user.send(recap)
+        except discord.HTTPException:
+            pass
 
     # =================================================================
     # SALONS — ACQUISITION (section 8)
