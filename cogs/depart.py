@@ -2904,6 +2904,13 @@ def delete_character_cascade(character_id):
         # TODO : le retrait automatique si le JOUEUR quitte le serveur Discord (sans forcément supprimer
         # son personnage) est désormais géré par handle_player_departure / on_member_remove ci-dessous.
         conn.execute("DELETE FROM order_salaries WHERE character_id = ?", (character_id,))
+        # Contrats éducateur ↔ employeur : le personnage disparaît qu'il soit disciple OU éducateur.
+        # (Les notifications de fin de contrat sont envoyées EN AMONT par handle_order_departure, appelé
+        # avant cette cascade dans tous les points de départ.)
+        conn.execute(
+            "DELETE FROM educator_contracts WHERE disciple_character_id = ? OR educator_character_id = ?",
+            (character_id, character_id),
+        )
 
 
 # =====================================================================
@@ -2921,6 +2928,7 @@ async def handle_player_departure(bot, user_id: int, guild):
     if not characters:
         return
 
+    ordre_cog = bot.get_cog("Ordre")
     for char in characters:
         char_id = char["id"]
         # Un personnage chef d'ordre n'est JAMAIS traité instantanément au départ du joueur.
@@ -2933,6 +2941,15 @@ async def handle_player_departure(bot, user_id: int, guild):
             ).fetchone()
         if is_chief:
             continue
+
+        # Conséquences côté ordre (redistribution des disciples si le perso était éducateur, clôture de
+        # son contrat s'il était disciple) via le point d'entrée UNIQUE de cogs/ordre.py, AVANT la
+        # cascade — les liens (order_members, order_disciple_assignments, contrats) doivent encore exister.
+        if ordre_cog is not None:
+            try:
+                await ordre_cog.handle_order_departure(char_id, guild)
+            except Exception as e:
+                print(f"[départ] conséquences ordre pour le perso {char_id} : {e}")
 
         # Cascade classique (banque, inventaire, relations, order_members, order_salaries,
         # order_disciple_assignments, etc.), puis retrait définitif du personnage.
@@ -3177,6 +3194,17 @@ class Depart(commands.Cog):
                 (target_uid, interaction.guild.id, slot),
             ).fetchone()
         character_id = row["id"] if row else None
+
+        # Conséquences côté ordre AVANT la cascade (mêmes règles que le départ du serveur / le clic
+        # « Virer ») : si le perso était éducateur, redistribue ses disciples ; s'il était disciple,
+        # clôt son contrat. Point d'entrée unique de cogs/ordre.py.
+        if character_id is not None:
+            ordre_cog = self.bot.get_cog("Ordre")
+            if ordre_cog is not None:
+                try:
+                    await ordre_cog.handle_order_departure(character_id, interaction.guild)
+                except Exception as e:
+                    print(f"[suppression] conséquences ordre pour le perso {character_id} : {e}")
 
         db.delete_validated_character(target_uid, interaction.guild.id, slot)
         if character_id is not None:

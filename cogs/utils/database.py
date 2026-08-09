@@ -346,6 +346,29 @@ CREATE TABLE IF NOT EXISTS order_transactions (
     amount INTEGER,
     date TEXT
 );
+
+CREATE TABLE IF NOT EXISTS bot_state (
+    key TEXT PRIMARY KEY,
+    value TEXT                       -- ex: 'last_weekly_orders_run:<guild_id>' -> date ISO du dernier lundi traité
+);
+
+CREATE TABLE IF NOT EXISTS educator_contracts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id TEXT,                   -- regroupe les contrats créés en une seule fois (validation groupée)
+    disciple_character_id INTEGER,
+    educator_character_id INTEGER,
+    source_order_id INTEGER,         -- ordre ÉDUCATIF d'origine (où l'éducateur exerce)
+    employer_order_id INTEGER,       -- ordre Direct/Hybride EMPLOYEUR (où le disciple travaille)
+    duree_type TEXT,                 -- 'determine' ou 'indetermine'
+    duree_value INTEGER,
+    duree_unit TEXT,                 -- 'jours' / 'semaines' / 'mois' / 'annees'
+    pct INTEGER,                     -- % reversé à l'éducateur (10 à 40), appliqué UNIQUEMENT sur salaire_fixe
+    salaire_fixe INTEGER,
+    status TEXT DEFAULT 'pending',   -- 'pending' / 'active' / 'refused' / 'ended'
+    start_date TEXT,
+    end_date TEXT,
+    created_at TEXT
+);
 """
 
 
@@ -1342,6 +1365,33 @@ def get_salon_owner(channel_id: int, status: str = "Acheté"):
         ).fetchone()
 
 
+def get_any_salon_owner(channel_id: int):
+    """Order_salon (n'importe quel ordre, n'importe quel statut : Acheté / Louée / Location) portant ce
+    salon, ou None. Sert à détecter les conflits d'achat au sens large (un salon déjà engagé nulle part
+    ne peut pas être acquis)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM order_salons WHERE channel_id = ? LIMIT 1", (channel_id,)
+        ).fetchone()
+
+
+def get_all_salon_rows(channel_id: int):
+    """TOUTES les lignes order_salons portant ce salon (une seule pour un 'Acheté', deux pour une
+    location : la 'Location' côté propriétaire et la 'Louée' côté locataire). Sert à la conquête d'un
+    salon à l'achat."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM order_salons WHERE channel_id = ?", (channel_id,)
+        ).fetchall()
+
+
+def delete_salon_everywhere(channel_id: int):
+    """Supprime toutes les lignes order_salons portant ce salon, quel que soit l'ordre ou le statut
+    (conquête : le salon est retiré à son ordre actuel avant d'être réattribué à l'acheteur)."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM order_salons WHERE channel_id = ?", (channel_id,))
+
+
 def remove_order_salon_by_channel(order_id: int, channel_id: int, status: str = "Acheté"):
     with get_connection() as conn:
         conn.execute(
@@ -1370,6 +1420,33 @@ def get_orders_in_guild_full(guild_id: int):
             "WHERE v.guild_id = ? ORDER BY o.id ASC",
             (guild_id,),
         ).fetchall()
+
+
+def get_orders_in_guild_of_types(guild_id: int, types):
+    """Ordres d'un serveur dont le type est dans `types` (le serveur est déterminé via le chef). Sert au
+    cycle hebdomadaire (taxe / salaires / verrous) par serveur."""
+    with get_connection() as conn:
+        placeholders = ",".join("?" * len(types))
+        return conn.execute(
+            f"SELECT o.* FROM orders o JOIN validated_characters v ON v.id = o.chef_character_id "
+            f"WHERE v.guild_id = ? AND o.type IN ({placeholders}) ORDER BY o.id ASC",
+            (guild_id, *types),
+        ).fetchall()
+
+
+# ---------- État global du bot (idempotence des tâches planifiées) ----------
+def get_bot_state(key: str):
+    """Valeur associée à une clé d'état (ou None)."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_bot_state(key: str, value: str):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)", (key, value)
+        )
 
 
 def get_orders_in_guild(guild_id: int, exclude_order_id=None):
@@ -1516,21 +1593,161 @@ def cleanup_educator_assignments(order_id: int, educator_character_id: int, keep
             )
 
 
+def find_educator_order(character_id: int):
+    """order_id du (premier) ordre où ce personnage est membre avec le rôle 'Formateur', ou None.
+    Sert au point d'entrée unique de départ d'un éducateur (redistribution de ses disciples)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT order_id FROM order_members WHERE character_id = ? AND role_label = 'Formateur' "
+            "ORDER BY order_id ASC LIMIT 1",
+            (character_id,),
+        ).fetchone()
+    return row["order_id"] if row else None
+
+
+def _educator_contracts_exists(conn) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'educator_contracts'"
+    ).fetchone() is not None
+
+
 def transfer_active_contracts_educator(disciple_character_id: int, old_educator_id: int, new_educator_id: int):
     """Redirige les contrats ACTIFS d'un disciple de l'ancien vers le nouvel éducateur. Défensif : la
     table educator_contracts n'existe pas encore (système de contrats/salaires à venir), donc on ne
     fait rien tant qu'elle est absente — le jour où elle existera, ce transfert s'appliquera tout seul."""
     with get_connection() as conn:
-        exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'educator_contracts'"
-        ).fetchone()
-        if not exists:
+        if not _educator_contracts_exists(conn):
             return
         conn.execute(
             "UPDATE educator_contracts SET educator_character_id = ? "
             "WHERE disciple_character_id = ? AND educator_character_id = ? AND status = 'active'",
             (new_educator_id, disciple_character_id, old_educator_id),
         )
+
+
+# --- Lecture/clôture des contrats pour les notifications de départ (tous DÉFENSIFS : la table
+# educator_contracts n'existe pas encore ; ces fonctions renvoient vide / ne font rien tant qu'elle
+# est absente, et deviendront actives automatiquement le jour où le système de contrats sera créé). ---
+def get_active_contracts_of_educator(educator_character_id: int):
+    """Contrats actifs dont cet éducateur est le référent : liste de lignes (id, disciple_character_id,
+    employer_order_id). [] si la table n'existe pas encore."""
+    with get_connection() as conn:
+        if not _educator_contracts_exists(conn):
+            return []
+        return conn.execute(
+            "SELECT id, disciple_character_id, employer_order_id FROM educator_contracts "
+            "WHERE educator_character_id = ? AND status = 'active'",
+            (educator_character_id,),
+        ).fetchall()
+
+
+def get_active_contract_of_disciple(disciple_character_id: int):
+    """Contrat actif d'un disciple (id, educator_character_id, employer_order_id), ou None (y compris si
+    la table n'existe pas encore)."""
+    with get_connection() as conn:
+        if not _educator_contracts_exists(conn):
+            return None
+        return conn.execute(
+            "SELECT id, educator_character_id, employer_order_id FROM educator_contracts "
+            "WHERE disciple_character_id = ? AND status = 'active'",
+            (disciple_character_id,),
+        ).fetchone()
+
+
+def end_contract(contract_id: int):
+    """Clôt un contrat (status='ended'). No-op si la table n'existe pas encore."""
+    with get_connection() as conn:
+        if not _educator_contracts_exists(conn):
+            return
+        conn.execute("UPDATE educator_contracts SET status = 'ended' WHERE id = ?", (contract_id,))
+
+
+# ---------- Création / cycle de vie des contrats éducateur ↔ employeur ----------
+def create_contract(batch_id, disciple_character_id, educator_character_id, source_order_id,
+                    employer_order_id, duree_type, duree_value, duree_unit, pct, salaire_fixe, created_at):
+    """Insère un contrat en attente (status='pending'). Retourne son id."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO educator_contracts (batch_id, disciple_character_id, educator_character_id, "
+            "source_order_id, employer_order_id, duree_type, duree_value, duree_unit, pct, salaire_fixe, "
+            "status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+            (batch_id, disciple_character_id, educator_character_id, source_order_id, employer_order_id,
+             duree_type, duree_value, duree_unit, pct, salaire_fixe, created_at),
+        )
+        return cur.lastrowid
+
+
+def get_contracts_by_batch(batch_id: str):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM educator_contracts WHERE batch_id = ? ORDER BY id ASC", (batch_id,)
+        ).fetchall()
+
+
+def set_batch_refused(batch_id: str):
+    """Passe tout un lot encore en attente à 'refused'."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE educator_contracts SET status = 'refused' WHERE batch_id = ? AND status = 'pending'",
+            (batch_id,),
+        )
+
+
+def set_batch_expired(batch_id: str):
+    """Passe tout un lot encore en attente à 'expired' (délai de réponse de l'éducateur dépassé)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE educator_contracts SET status = 'expired' WHERE batch_id = ? AND status = 'pending'",
+            (batch_id,),
+        )
+
+
+def get_active_contracts_of_disciple_in_source(disciple_character_id: int, source_order_id: int):
+    """Contrats ACTIFS d'un disciple issus d'un ordre éducatif SOURCE précis (quitter cet ordre éducatif
+    met fin à ces contrats, quel que soit l'ordre employeur)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM educator_contracts WHERE disciple_character_id = ? AND source_order_id = ? "
+            "AND status = 'active' ORDER BY id ASC",
+            (disciple_character_id, source_order_id),
+        ).fetchall()
+
+
+def activate_contract(contract_id: int, start_date: str, end_date):
+    """Active un contrat accepté (start_date, end_date=None si durée indéterminée)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE educator_contracts SET status = 'active', start_date = ?, end_date = ? WHERE id = ?",
+            (start_date, end_date, contract_id),
+        )
+
+
+def get_active_contracts_for_employer(employer_order_id: int):
+    """Contrats ACTIFS dont l'ordre employeur est celui donné (pillow côté Direct/Hybride)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM educator_contracts WHERE employer_order_id = ? AND status = 'active' ORDER BY id ASC",
+            (employer_order_id,),
+        ).fetchall()
+
+
+def get_active_contracts_for_source(source_order_id: int):
+    """Contrats ACTIFS dont l'ordre éducatif source est celui donné (pillow côté Éducatif)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM educator_contracts WHERE source_order_id = ? AND status = 'active' ORDER BY id ASC",
+            (source_order_id,),
+        ).fetchall()
+
+
+def get_expired_determinate_contracts(now_iso: str):
+    """Contrats à durée déterminée, actifs, dont l'échéance est atteinte (pour l'expiration planifiée)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM educator_contracts WHERE status = 'active' AND duree_type = 'determine' "
+            "AND end_date IS NOT NULL AND end_date <= ? ORDER BY id ASC",
+            (now_iso,),
+        ).fetchall()
 
 
 # ---------- Salaires des ordres (Direct / Hybride) ----------
@@ -1656,6 +1873,29 @@ def get_linked_salons(order_id: int):
             "WHERE order_id = ? AND status IN ('Louée', 'Location')",
             (order_id,),
         ).fetchall()
+
+
+def get_expired_locations(now_iso: str):
+    """Salons en cours de location (côté propriétaire, statut 'Location') dont l'échéance est atteinte.
+    Chaque ligne : id (de la ligne propriétaire), order_id (propriétaire), linked_order_id (locataire),
+    channel_id, location_expiry."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT id, order_id, linked_order_id, channel_id, location_expiry FROM order_salons "
+            "WHERE status = 'Location' AND location_expiry IS NOT NULL AND location_expiry <= ?",
+            (now_iso,),
+        ).fetchall()
+
+
+def revert_location_to_bought(salon_id: int):
+    """À l'expiration d'une location, le salon du propriétaire redevient un salon 'Acheté' normal
+    (relien locataire et échéance effacés). Il sera de nouveau taxé chaque semaine."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE order_salons SET status = 'Acheté', linked_order_id = NULL, location_expiry = NULL "
+            "WHERE id = ?",
+            (salon_id,),
+        )
 
 
 def remove_order_salon_any(order_id: int, channel_id: int):

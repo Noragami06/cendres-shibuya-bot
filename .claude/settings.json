@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile cogs/ordre.py cogs/utils/database.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python \"C:/Users/rehma/AppData/Local/Temp/claude/c--Users-rehma-Desktop-cendres-shibuya-bot/d573cc67-c66f-49cc-a2d0-f010c8c82de2/scratchpad/test_salons.py\")",
+      "Bash(PYTHONIOENCODING=utf-8 python \"C:/Users/rehma/AppData/Local/Temp/claude/c--Users-rehma-Desktop-cendres-shibuya-bot/d573cc67-c66f-49cc-a2d0-f010c8c82de2/scratchpad/test_conquest.py\")",
+      "Bash(PYTHONIOENCODING=utf-8 python \"C:/Users/rehma/AppData/Local/Temp/claude/c--Users-rehma-Desktop-cendres-shibuya-bot/d573cc67-c66f-49cc-a2d0-f010c8c82de2/scratchpad/test_educator.py\")",
+      "Bash(PYTHONIOENCODING=utf-8 python \"C:/Users/rehma/AppData/Local/Temp/claude/c--Users-rehma-Desktop-cendres-shibuya-bot/d573cc67-c66f-49cc-a2d0-f010c8c82de2/scratchpad/test_contracts.py\")"
+    ]
+  }
+}

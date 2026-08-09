@@ -56,6 +56,12 @@ ROLE_COLORS = {
 ASSIGNABLE_ROLES = ["Sous-chef", "Formateur", "Chef d'équipe", "Membre d'équipe", "Corps administratif"]
 FR_DAYS = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
 
+# Contrats éducateur ↔ employeur : unités de durée déterminée -> nombre de jours (semaines*7, mois*30,
+# années*365, comme spécifié).
+CONTRAT_UNITS = [("Jours", "jours"), ("Semaines", "semaines"), ("Mois", "mois"), ("Années", "annees")]
+CONTRAT_UNIT_DAYS = {"jours": 1, "semaines": 7, "mois": 30, "annees": 365}
+CONTRAT_UNIT_LABEL = {"jours": "jour(s)", "semaines": "semaine(s)", "mois": "mois", "annees": "année(s)"}
+
 # Vérification de présence des chefs d'ordre : 4x/jour, à l'heure de Paris (DST géré par zoneinfo).
 # Sous Windows, zoneinfo a besoin du paquet `tzdata` (pip install tzdata) : en son absence, on retombe
 # sur un UTC+1 fixe (sans bascule été/hiver) plutôt que de faire planter le chargement du cog.
@@ -197,6 +203,40 @@ class TwoChoiceView(discord.ui.View):
         return cb
 
 
+class ButtonChoiceView(discord.ui.View):
+    """N boutons renvoyant une valeur, avec anti double-clic (règle #6). Générique (ex : unité de durée
+    d'un contrat). En session : utilisé avec view.wait() dans un flux déjà verrouillé."""
+
+    def __init__(self, owner_id, choices):  # choices = [(label, value), ...]
+        super().__init__(timeout=WAIT_TIMEOUT)
+        self.owner_id = owner_id
+        self.result = None
+        self._done = False
+        for label, value in choices:
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
+            btn.callback = self._mk(value)
+            self.add_item(btn)
+
+    def _mk(self, value):
+        async def cb(interaction):
+            if interaction.user.id != self.owner_id:
+                await interaction.response.send_message("Ce choix ne t'appartient pas.", ephemeral=True)
+                return
+            if self._done:
+                try:
+                    await interaction.response.defer()
+                except discord.HTTPException:
+                    pass
+                return
+            self._done = True
+            self.result = value
+            for it in self.children:
+                it.disabled = True
+            await interaction.response.edit_message(view=self)
+            self.stop()
+        return cb
+
+
 class NegotiationView(discord.ui.View):
     """Proposition de revente en DM : Accepter / Refuser / Négocier (anti double-clic)."""
 
@@ -254,6 +294,7 @@ class SalonPageView(discord.ui.View):
             placeholder="Action sur les salons...", min_values=1, max_values=1,
             custom_id=f"ordre_salon_action:{order_id}:{user_id}",
             options=[
+                discord.SelectOption(label="🛒 Acheter", value="acheter"),
                 discord.SelectOption(label="💸 Revendre un salon", value="revendre"),
                 discord.SelectOption(label="🏠 Louer un salon", value="louer"),
             ], row=1))
@@ -329,16 +370,35 @@ class ContratsPageView(discord.ui.View):
 
 
 class ContratsDirectPageView(discord.ui.View):
-    """Pagination persistante sous la pillow des contrats côté ordre employeur (Direct/Hybride)."""
+    """Sous la pillow des contrats côté ordre employeur (Direct/Hybride) : pagination (si plusieurs pages)
+    + bouton « ➕ Créer un contrat » (toujours présent)."""
 
     def __init__(self, order_id, user_id, page, total_pages):
         super().__init__(timeout=None)
+        if total_pages > 1:
+            self.add_item(discord.ui.Button(
+                label="Page précédente", emoji="◀️", style=discord.ButtonStyle.secondary,
+                custom_id=f"ordre_cdir_prev:{order_id}:{user_id}:{page}", disabled=(page <= 1), row=0))
+            self.add_item(discord.ui.Button(
+                label="Page suivante", emoji="▶️", style=discord.ButtonStyle.secondary,
+                custom_id=f"ordre_cdir_next:{order_id}:{user_id}:{page}", disabled=(page >= total_pages), row=0))
         self.add_item(discord.ui.Button(
-            label="Page précédente", emoji="◀️", style=discord.ButtonStyle.secondary,
-            custom_id=f"ordre_cdir_prev:{order_id}:{user_id}:{page}", disabled=(page <= 1)))
+            label="Créer un contrat", emoji="➕", style=discord.ButtonStyle.success,
+            custom_id=f"ordre_contrat_create:{order_id}:{user_id}", row=1))
+
+
+class ContratOfferView(discord.ui.View):
+    """DM à l'éducateur : accepter ou refuser un LOT de contrats proposé par un ordre employeur.
+    Persistant (le batch_id suffit à tout retrouver)."""
+
+    def __init__(self, batch_id):
+        super().__init__(timeout=None)
         self.add_item(discord.ui.Button(
-            label="Page suivante", emoji="▶️", style=discord.ButtonStyle.secondary,
-            custom_id=f"ordre_cdir_next:{order_id}:{user_id}:{page}", disabled=(page >= total_pages)))
+            label="Accepter", emoji="✅", style=discord.ButtonStyle.success,
+            custom_id=f"ordre_contrat_accept:{batch_id}"))
+        self.add_item(discord.ui.Button(
+            label="Refuser", emoji="❌", style=discord.ButtonStyle.danger,
+            custom_id=f"ordre_contrat_refuse:{batch_id}"))
 
 
 class OrdreStaffView(discord.ui.View):
@@ -456,18 +516,17 @@ class Ordre(commands.Cog):
         self._pin_buffers = {}       # saisie du code de la banque d'ordre, clé (user_id, order_id)
         self._grace_prompt_pending = set()  # ordres à qui le DM de choix de verrou a déjà été envoyé
                                             # (évite de le renvoyer chaque jour tant que le chef n'a pas répondu)
+        self._contract_lock = set()  # anti double-clic sur l'acceptation/refus d'un lot de contrats (par batch_id)
+        self._contract_timeout_tasks = set()  # tâches de timeout (2 min) des propositions de contrat en attente
 
     async def cog_load(self):
-        # La tâche quotidienne des salaires (paiements le lundi + suivi des verrous/échéances).
-        if not self.salary_loop.is_running():
-            self.salary_loop.start()
-        # La vérification de présence des chefs d'ordre (4x/jour, heure de Paris).
-        if not self.check_chief_presence.is_running():
-            self.check_chief_presence.start()
+        # Tâche planifiée UNIQUE (présence des chefs + expiration des locations + cycle hebdomadaire
+        # taxe/salaires + verrous), déterministe et idempotente.
+        if not self.ordre_scheduler.is_running():
+            self.ordre_scheduler.start()
 
     async def cog_unload(self):
-        self.salary_loop.cancel()
-        self.check_chief_presence.cancel()
+        self.ordre_scheduler.cancel()
 
     # ---------- verrou de flux ----------
     def _acquire(self, user_id) -> bool:
@@ -685,6 +744,12 @@ class Ordre(commands.Cog):
             await self.handle_contrats_direct_page(interaction, cid, "prev")
         elif cid.startswith("ordre_cdir_next:"):
             await self.handle_contrats_direct_page(interaction, cid, "next")
+        elif cid.startswith("ordre_contrat_create:"):
+            await self.handle_contrat_create(interaction, cid)
+        elif cid.startswith("ordre_contrat_accept:"):
+            await self.handle_contrat_accept(interaction, cid)
+        elif cid.startswith("ordre_contrat_refuse:"):
+            await self.handle_contrat_refuse(interaction, cid)
         elif cid.startswith("ordre_contrat:"):
             await self.handle_contrats_direct(interaction, cid)
         elif cid.startswith("ordre_tresorerie:"):
@@ -857,8 +922,7 @@ class Ordre(commands.Cog):
         values, labels = self._week_profit(order_id)
 
         if order["type"] == "educatif":
-            # TODO : brancher sur la vraie table de contrats une fois créée
-            ca_total = 0  # SUM(revenu_hebdo) des contrats actifs — 0 par défaut tant que la table n'existe pas
+            ca_total = self._order_ca_total(order_id)  # somme des parts éducateur des contrats actifs
             path = _tmp("ordre")
             generate_ordre_educatif_image(order["name"], members, ca_total, values, labels, path)
             await channel.send(
@@ -894,16 +958,31 @@ class Ordre(commands.Cog):
     # CONTRATS ÉDUCATIFS (bouton "📄 Voir les contrats" des ordres éducatifs)
     # =================================================================
     def _educateurs_data(self, order_id):
-        """Liste (nom_educateur, [disciples...]) pour la pillow. Un Formateur SANS disciple apparaît
-        quand même (case vide), jamais filtré."""
+        """Pillow éducatif : (nom_educateur, [(nom_disciple, ordre_employeur, revenu_str), ...]) à partir
+        des contrats ACTIFS sourcés par cet ordre. Un Formateur SANS contrat apparaît quand même (vide)."""
+        by_educ = {}
+        for c in db.get_active_contracts_for_source(order_id):
+            by_educ.setdefault(c["educator_character_id"], []).append(c)
         result = []
         for m in db.get_order_members(order_id):
-            if m["role_label"] == "Formateur":
-                # TODO : brancher sur la vraie table de contrats une fois le système de négociation
-                # éducateur/joueur développé (point non abordé).
-                disciples = []
-                result.append((m["character_name"] or "?", disciples))
+            if m["role_label"] != "Formateur":
+                continue
+            disciples = []
+            for c in by_educ.get(m["character_id"], []):
+                employer = db.get_order(c["employer_order_id"])
+                emp_name = employer["name"] if employer else "?"
+                # Le % ne s'applique QUE sur salaire_fixe, jamais sur une prime/bonus, à respecter dans
+                # le futur système de versement des salaires.
+                montant_reverse = round(c["salaire_fixe"] * c["pct"] / 100)
+                disciples.append((self._char_name(c["disciple_character_id"]), emp_name,
+                                  f"{_fmt(montant_reverse)} ¥"))
+            result.append((m["character_name"] or "?", disciples))
         return result
+
+    def _order_ca_total(self, order_id):
+        """Somme des montants reversés (part éducateur) des contrats actifs sourcés par cet ordre éducatif."""
+        return sum(round(c["salaire_fixe"] * c["pct"] / 100)
+                   for c in db.get_active_contracts_for_source(order_id))
 
     async def _send_contrats(self, channel, order_id, user_id, page):
         order = db.get_order(order_id)
@@ -948,17 +1027,24 @@ class Ordre(commands.Cog):
     def _contrats_direct_data(self, order_id):
         """Contrats actifs côté ordre employeur :
         [(nom_disciple, ordre_origine, educateur, montant_str), ...]."""
-        # TODO : brancher sur la vraie table de contrats une fois le système de négociation
-        # éducateur/joueur développé (point non abordé).
-        return []
+        result = []
+        for c in db.get_active_contracts_for_employer(order_id):
+            source = db.get_order(c["source_order_id"])
+            src_name = source["name"] if source else "?"
+            # Le % ne s'applique QUE sur salaire_fixe, jamais sur une prime/bonus, à respecter dans le
+            # futur système de versement des salaires.
+            montant_reverse = round(c["salaire_fixe"] * c["pct"] / 100)
+            result.append((self._char_name(c["disciple_character_id"]), src_name,
+                           self._char_name(c["educator_character_id"]), f"{_fmt(montant_reverse)} ¥"))
+        return result
 
     async def _send_contrats_direct(self, channel, order_id, user_id, page):
         order = db.get_order(order_id)
         contrats = self._contrats_direct_data(order_id)
         path = _tmp("cdir")
         path, total_pages = generate_contrats_direct_image(order["name"], contrats, page, path)
-        view = ContratsDirectPageView(order_id, user_id, max(1, min(page, total_pages)), total_pages) \
-            if total_pages > 1 else None
+        # La View (bouton « ➕ Créer un contrat » + pagination si besoin) est TOUJOURS présente.
+        view = ContratsDirectPageView(order_id, user_id, max(1, min(page, total_pages)), total_pages)
         await channel.send(file=discord.File(path, filename="contrats.png"), view=view)
         _rm(path)
 
@@ -982,10 +1068,416 @@ class Ordre(commands.Cog):
         path = _tmp("cdir")
         path, total_pages = generate_contrats_direct_image(order["name"], contrats, new_page, path)
         clamped = max(1, min(new_page, total_pages))
-        view = ContratsDirectPageView(order_id, user_id, clamped, total_pages) if total_pages > 1 else None
+        view = ContratsDirectPageView(order_id, user_id, clamped, total_pages)
         await interaction.response.edit_message(
             attachments=[discord.File(path, filename="contrats.png")], view=view)
         _rm(path)
+
+    # =================================================================
+    # CRÉATION D'UN CONTRAT (bouton "➕ Créer un contrat", ordres Direct/Hybride)
+    # =================================================================
+    async def _ask_int_range(self, channel, user, prompt, lo, hi):
+        if prompt:
+            await channel.send(prompt)
+        while True:
+            m = await self.wait_message(channel, user)
+            if m is None:
+                await channel.send("⏳ Annulé.")
+                return None
+            v = _parse_int(m.content)
+            if v is None or v < lo or v > hi:
+                await channel.send(f"Entre un nombre entre {lo} et {hi}.")
+                continue
+            return v
+
+    async def _pick_from_list(self, channel, user, options, prompt, numbered=False):
+        """Choix dans une liste [(label, value_str), ...]. Menu déroulant si <10 éléments (sauf
+        `numbered=True` qui force la liste numérotée), sinon liste numérotée. Retourne la value (str)
+        choisie ou None."""
+        if not options:
+            return None
+        if not numbered and len(options) < 10:
+            view = SimpleSelectView("Fais ton choix...", options, user.id)
+            await channel.send(prompt, view=view)
+            await view.wait()
+            return view.result
+        lines = [f"**{i}.** {lbl}" for i, (lbl, _) in enumerate(options, 1)]
+        await channel.send(prompt + "\n" + "\n".join(lines) + "\n\nRéponds par le **numéro**.")
+        idx = await self._ask_int_range(channel, user, None, 1, len(options))
+        if idx is None:
+            return None
+        return options[idx - 1][1]
+
+    async def _pick_formateur_numbered(self, channel, user, guild, formateurs):
+        """Sélection numérotée d'un formateur : « 1. {prénom} ({mention}) ». Retourne son character_id."""
+        options, lines = [], []
+        for f in formateurs:
+            prenom = (f["character_name"] or "?").split()[0] if f["character_name"] else "?"
+            m = guild.get_member(f["user_id"]) if guild else None
+            mention = m.mention if m else f"<@{f['user_id']}>"
+            options.append((f"{prenom} ({mention})", str(f["character_id"])))
+            lines.append(None)
+        val = await self._pick_from_list(
+            channel, user, options, "Quel éducateur (formateur) de cet ordre éducatif ?", numbered=True)
+        return int(val) if val is not None else None
+
+    async def _ask_contract_params(self, channel, user):
+        """Demande durée (déterminée/indéterminée + unité), % (10-40) et salaire fixe pour UN contrat.
+        Retourne un dict ou None si annulé."""
+        # Durée déterminée / indéterminée.
+        dv = TwoChoiceView(user.id, "Déterminée", "determine", "Indéterminée", "indetermine",
+                           a_style=discord.ButtonStyle.primary, b_style=discord.ButtonStyle.secondary)
+        await channel.send("Durée du contrat : déterminée ou indéterminée ?", view=dv)
+        await dv.wait()
+        if dv.result is None:
+            await channel.send("⏳ Annulé.")
+            return None
+        duree_type, duree_value, duree_unit = dv.result, None, None
+        if duree_type == "determine":
+            duree_value = await self._ask_positive_int(channel, user, "Durée : combien ?")
+            if duree_value is None:
+                return None
+            uv = ButtonChoiceView(user.id, CONTRAT_UNITS)
+            await channel.send("Unité de la durée ?", view=uv)
+            await uv.wait()
+            if uv.result is None:
+                await channel.send("⏳ Annulé.")
+                return None
+            duree_unit = uv.result
+        # % reversé à l'éducateur (10 à 40 inclus).
+        pct = await self._ask_int_range(
+            channel, user, "% reversé à l'éducateur (entre 10 et 40 inclus) ?", 10, 40)
+        if pct is None:
+            return None
+        # Salaire fixe hebdomadaire.
+        salaire = await self._ask_positive_int(channel, user, "Salaire fixe hebdomadaire ?")
+        if salaire is None:
+            return None
+        return {"duree_type": duree_type, "duree_value": duree_value, "duree_unit": duree_unit,
+                "pct": pct, "salaire_fixe": salaire}
+
+    def _contract_duree_str(self, c):
+        if c["duree_type"] == "determine":
+            return f"{c['duree_value']} {CONTRAT_UNIT_LABEL.get(c['duree_unit'], c['duree_unit'])}"
+        return "indéterminée"
+
+    def _contract_recap_embed(self, employer_name, edu_order_name, educ_name, batch):
+        lines = []
+        for i, c in enumerate(batch, 1):
+            montant = round(c["salaire_fixe"] * c["pct"] / 100)
+            lines.append(
+                f"**{i}.** {self._char_name(c['disciple_cid'])} — durée : {self._contract_duree_str(c)} — "
+                f"{c['pct']}% — salaire {_fmt(c['salaire_fixe'])} ¥/sem "
+                f"(part éducateur ≈ {_fmt(montant)} ¥)")
+        return discord.Embed(
+            title="📄 Récapitulatif du/des contrat(s)",
+            description=(f"Éducateur : **{educ_name}** (ordre **{edu_order_name}**)\n"
+                         f"Employeur : **{employer_name}**\n\n" + "\n".join(lines)),
+            color=PHOENIX_COLOR)
+
+    async def _contract_recap_loop(self, channel, user, employer_name, edu_order_name, educ_name, batch):
+        """Affiche le récap, gère « ✅ Tout est bon » / « ✏️ Modifier » (anti double-clic via TwoChoiceView).
+        Retourne True si confirmé, False sinon."""
+        while True:
+            tv = TwoChoiceView(user.id, "✅ Tout est bon", "ok", "✏️ Modifier", "edit",
+                               a_style=discord.ButtonStyle.success, b_style=discord.ButtonStyle.secondary)
+            await channel.send(
+                embed=self._contract_recap_embed(employer_name, edu_order_name, educ_name, batch), view=tv)
+            await tv.wait()
+            if tv.result != "edit":
+                return tv.result == "ok"
+            # Modification d'une ligne.
+            line = await self._ask_int_range(
+                channel, user, f"Quelle ligne veux-tu modifier ? (1 à {len(batch)})", 1, len(batch))
+            if line is None:
+                continue
+            field = await self._await_choice(channel, user, ("duree", "pct", "salaire"))
+            if field is None:
+                continue
+            c = batch[line - 1]
+            if field == "duree":
+                dv = TwoChoiceView(user.id, "Déterminée", "determine", "Indéterminée", "indetermine",
+                                   a_style=discord.ButtonStyle.primary, b_style=discord.ButtonStyle.secondary)
+                await channel.send("Nouvelle durée : déterminée ou indéterminée ?", view=dv)
+                await dv.wait()
+                if dv.result is None:
+                    continue
+                if dv.result == "determine":
+                    val = await self._ask_positive_int(channel, user, "Durée : combien ?")
+                    if val is None:
+                        continue
+                    uv = ButtonChoiceView(user.id, CONTRAT_UNITS)
+                    await channel.send("Unité de la durée ?", view=uv)
+                    await uv.wait()
+                    if uv.result is None:
+                        continue
+                    c["duree_type"], c["duree_value"], c["duree_unit"] = "determine", val, uv.result
+                else:
+                    c["duree_type"], c["duree_value"], c["duree_unit"] = "indetermine", None, None
+            elif field == "pct":
+                v = await self._ask_int_range(channel, user, "Nouveau % (10 à 40) ?", 10, 40)
+                if v is None:
+                    continue
+                c["pct"] = v
+            elif field == "salaire":
+                v = await self._ask_positive_int(channel, user, "Nouveau salaire fixe hebdomadaire ?")
+                if v is None:
+                    continue
+                c["salaire_fixe"] = v
+
+    async def handle_contrat_create(self, interaction, cid):
+        _, order_id, user_id = cid.split(":")
+        order_id, user_id = int(order_id), int(user_id)
+        # Garde chef + verrou EN PREMIER (engager un futur salaire pendant l'insolvabilité n'a pas de sens).
+        if not self._is_chief(order_id, interaction.user.id):
+            await interaction.response.send_message("Seul le chef de l'ordre peut faire ça.", ephemeral=True)
+            return
+        order = db.get_order(order_id)
+        if order["type"] not in ("direct", "hybride"):
+            await interaction.response.send_message(
+                "Seuls les ordres Direct/Hybride emploient des disciples sous contrat.", ephemeral=True)
+            return
+        if order["security_lock"]:
+            await interaction.response.send_message(
+                "🔒 Ce compte est verrouillé suite à une trésorerie négative prolongée, impossible de "
+                "créer un contrat (futur salaire) pour l'instant.", ephemeral=True)
+            return
+        if not self._acquire(interaction.user.id):
+            await interaction.response.send_message(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True)
+            return
+        try:
+            await interaction.response.send_message("➕ Création de contrat(s)…", ephemeral=True)
+            channel, user, guild = interaction.channel, interaction.user, interaction.channel.guild
+
+            # 1) Ordre éducatif.
+            educatifs = db.get_orders_in_guild_of_types(guild.id, ("educatif",))
+            if not educatifs:
+                await channel.send("Aucun ordre éducatif n'existe sur le serveur.")
+                return
+            edu_val = await self._pick_from_list(
+                channel, user, [(o["name"], str(o["id"])) for o in educatifs],
+                "Avec quel ordre éducatif veux-tu contractualiser ?")
+            if edu_val is None:
+                await channel.send("⏳ Annulé.")
+                return
+            edu_order_id = int(edu_val)
+            edu_order = db.get_order(edu_order_id)
+
+            # 2) Éducateur (formateur), liste numérotée.
+            formateurs = db.get_order_members_by_role(edu_order_id, "Formateur")
+            if not formateurs:
+                await channel.send("Cet ordre éducatif n'a aucun formateur.")
+                return
+            educator_cid = await self._pick_formateur_numbered(channel, user, guild, formateurs)
+            if educator_cid is None:
+                await channel.send("⏳ Annulé.")
+                return
+
+            # 3) Nombre de disciples à contractualiser.
+            disciples = db.get_disciples_of_educator(edu_order_id, educator_cid)
+            if not disciples:
+                await channel.send("Cet éducateur n'a aucun disciple assigné.")
+                return
+            n = await self._ask_positive_int(
+                channel, user,
+                f"Combien de disciples de cet éducateur veux-tu mettre sous contrat ? (max {len(disciples)})",
+                maximum=len(disciples))
+            if n is None:
+                return
+
+            # 4-5) Choix des disciples (sans doublon) + paramètres de chaque contrat.
+            remaining = [(self._char_name(d["disciple_character_id"]), str(d["disciple_character_id"]))
+                         for d in disciples]
+            batch = []
+            for i in range(n):
+                disc_val = await self._pick_from_list(
+                    channel, user, remaining, f"Disciple {i + 1}/{n} — lequel mettre sous contrat ?")
+                if disc_val is None:
+                    await channel.send("⏳ Annulé.")
+                    return
+                remaining = [(lbl, v) for lbl, v in remaining if v != disc_val]
+                params = await self._ask_contract_params(channel, user)
+                if params is None:
+                    return
+                batch.append({"disciple_cid": int(disc_val), **params})
+
+            # 6) Récapitulatif + validation.
+            educ_name = self._char_name(educator_cid)
+            confirmed = await self._contract_recap_loop(
+                channel, user, order["name"], edu_order["name"], educ_name, batch)
+            if not confirmed:
+                await channel.send("Création annulée.")
+                return
+
+            # 7) INSERT du lot (status='pending').
+            batch_id = uuid.uuid4().hex
+            now = _now()
+            for c in batch:
+                db.create_contract(batch_id, c["disciple_cid"], educator_cid, edu_order_id, order_id,
+                                   c["duree_type"], c["duree_value"], c["duree_unit"], c["pct"],
+                                   c["salaire_fixe"], now)
+
+            # 8) DM à l'éducateur avec accepter / refuser.
+            await self._send_contract_offer(guild, batch_id, order["name"], edu_order["name"],
+                                            educator_cid, batch)
+            await channel.send(embed=discord.Embed(
+                description="✅ Contrat(s) envoyé(s) à l'éducateur pour validation (en attente de sa réponse).",
+                color=PHOENIX_COLOR))
+        finally:
+            self._release(interaction.user.id)
+
+    async def _send_contract_offer(self, guild, batch_id, employer_name, edu_order_name, educator_cid, batch):
+        """DM à l'éducateur : récap du lot + boutons Accepter / Refuser, PUIS lance un timer de 2 min qui
+        expire la proposition si l'éducateur n'a pas répondu."""
+        educ = get_character(educator_cid)
+        if not educ:
+            return
+        embed = self._contract_recap_embed(employer_name, edu_order_name, self._char_name(educator_cid), batch)
+        embed.title = "📄 Proposition de contrat(s)"
+        embed.description = (f"L'ordre **{employer_name}** te propose le(s) contrat(s) suivant(s). "
+                             "Acceptes-tu ? (⏱️ tu as **2 minutes** pour répondre)\n\n" + embed.description)
+        uid = educ["user_id"]
+        member = guild.get_member(uid) if guild else None
+        if member is None:
+            try:
+                member = await self.bot.fetch_user(uid)
+            except discord.HTTPException:
+                return
+        dm_message = None
+        try:
+            dm_message = await member.send(embed=embed, view=ContratOfferView(batch_id))
+        except discord.HTTPException:
+            pass
+        # Timer de 2 minutes : tâche différée (référence conservée pour éviter le ramasse-miettes).
+        # TODO : si le bot redémarre pendant la fenêtre de 2 minutes, ce contrat resterait bloqué en
+        # 'pending' indéfiniment sans jamais expirer. Pas critique (rien n'est débité tant que pending),
+        # mais à améliorer plus tard avec une vérification au démarrage ou dans ordre_scheduler si besoin.
+        task = asyncio.create_task(self._contract_offer_timeout(batch_id, dm_message))
+        self._contract_timeout_tasks.add(task)
+        task.add_done_callback(self._contract_timeout_tasks.discard)
+
+    async def _contract_offer_timeout(self, batch_id, dm_message):
+        """Après 2 minutes : si le lot est TOUJOURS 'pending' (statut relu en base, jamais mis en cache),
+        l'expire, prévient les deux parties et retire les boutons du DM. Si l'éducateur a déjà répondu
+        (active / refused) entre-temps, ne fait rien."""
+        await asyncio.sleep(120)
+        # Ne pas écraser un traitement Accepter/Refuser en cours.
+        if batch_id in self._contract_lock:
+            return
+        contracts = db.get_contracts_by_batch(batch_id)
+        if not contracts or contracts[0]["status"] != "pending":
+            return  # déjà accepté / refusé / expiré : rien à faire
+        db.set_batch_expired(batch_id)
+        educator_cid = contracts[0]["educator_character_id"]
+        employer = db.get_order(contracts[0]["employer_order_id"])
+        # Retire les boutons du DM d'origine et signale l'expiration dans le message même.
+        if dm_message is not None:
+            try:
+                await dm_message.edit(content="⏱️ Cette proposition a expiré.", view=None)
+            except discord.HTTPException:
+                pass
+        # DM à l'éducateur (nouveau message, en plus de l'édition ci-dessus).
+        await self._dm_character_owner(
+            None, educator_cid,
+            "⏱️ Le temps pour répondre à la proposition de contrat est écoulé, elle a été annulée.")
+        # DM au chef employeur.
+        if employer:
+            await self._dm_character_owner(
+                None, employer["chef_character_id"],
+                "⏱️ L'éducateur n'a pas répondu à temps (2 minutes), la proposition de contrat a expiré. "
+                "Tu peux recommencer si besoin.")
+
+    async def handle_contrat_refuse(self, interaction, cid):
+        batch_id = cid.split(":", 1)[1]
+        contracts = db.get_contracts_by_batch(batch_id)
+        if not contracts:
+            await interaction.response.send_message("Ce lot de contrats est introuvable.", ephemeral=True)
+            return
+        educ = get_character(contracts[0]["educator_character_id"])
+        if not educ or educ["user_id"] != interaction.user.id:
+            await interaction.response.send_message("Ce contrat ne t'est pas destiné.", ephemeral=True)
+            return
+        if contracts[0]["status"] != "pending":
+            await interaction.response.send_message("Ce lot a déjà été traité.", ephemeral=True)
+            return
+        if batch_id in self._contract_lock:
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException:
+                pass
+            return
+        self._contract_lock.add(batch_id)
+        try:
+            db.set_batch_refused(batch_id)
+            await interaction.response.edit_message(
+                content="❌ Tu as refusé ce(s) contrat(s).", embed=None, view=None)
+            employer = db.get_order(contracts[0]["employer_order_id"])
+            if employer:
+                # DM en dehors d'un contexte serveur (le clic vient d'un MP) : guild=None -> fetch_user.
+                await self._dm_character_owner(
+                    None, employer["chef_character_id"],
+                    f"❌ L'éducateur {self._char_name(contracts[0]['educator_character_id'])} a REFUSÉ "
+                    "le(s) contrat(s) que tu lui as proposé(s).")
+        finally:
+            self._contract_lock.discard(batch_id)
+
+    async def handle_contrat_accept(self, interaction, cid):
+        batch_id = cid.split(":", 1)[1]
+        contracts = db.get_contracts_by_batch(batch_id)
+        if not contracts:
+            await interaction.response.send_message("Ce lot de contrats est introuvable.", ephemeral=True)
+            return
+        educ = get_character(contracts[0]["educator_character_id"])
+        if not educ or educ["user_id"] != interaction.user.id:
+            await interaction.response.send_message("Ce contrat ne t'est pas destiné.", ephemeral=True)
+            return
+        if contracts[0]["status"] != "pending":
+            await interaction.response.send_message("Ce lot a déjà été traité.", ephemeral=True)
+            return
+        if batch_id in self._contract_lock:
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException:
+                pass
+            return
+        self._contract_lock.add(batch_id)
+        try:
+            now = _now()
+            for c in contracts:
+                end_date = None
+                if c["duree_type"] == "determine":
+                    days = (c["duree_value"] or 0) * CONTRAT_UNIT_DAYS.get(c["duree_unit"], 1)
+                    end_date = (datetime.fromisoformat(now) + timedelta(days=days)).isoformat()
+                db.activate_contract(c["id"], now, end_date)
+            await interaction.response.edit_message(
+                content="✅ Tu as accepté ce(s) contrat(s). Ils sont désormais actifs.", embed=None, view=None)
+            # DM aux deux parties (l'éducateur qui vient d'accepter + le chef de l'ordre employeur).
+            educ_name = self._char_name(contracts[0]["educator_character_id"])
+            employer = db.get_order(contracts[0]["employer_order_id"])
+            if employer:
+                await self._dm_character_owner(
+                    None, employer["chef_character_id"],
+                    f"✅ L'éducateur {educ_name} a ACCEPTÉ le(s) contrat(s). Ils sont désormais actifs.")
+            await self._dm_character_owner(
+                None, contracts[0]["educator_character_id"],
+                f"✅ Contrat(s) accepté(s) et actif(s). Tu percevras la part convenue tant qu'ils courent.")
+        finally:
+            self._contract_lock.discard(batch_id)
+
+    async def _expire_contracts(self, guild):
+        """Clôt (status='ended') les contrats à durée déterminée du serveur arrivés à échéance et
+        prévient les deux parties. Filtré au serveur via l'ordre employeur (comme _expire_locations)."""
+        for c in db.get_expired_determinate_contracts(_now()):
+            ref = db.get_order(c["employer_order_id"]) or db.get_order(c["source_order_id"])
+            chef = get_character(ref["chef_character_id"]) if ref else None
+            if not chef or chef["guild_id"] != guild.id:
+                continue  # autre serveur : traité lors de son itération
+            db.end_contract(c["id"])
+            disc, educ = self._char_name(c["disciple_character_id"]), self._char_name(c["educator_character_id"])
+            msg = f"📋 Le contrat entre {disc} et {educ} est arrivé à son terme et a pris fin."
+            await self._dm_character_owner(guild, c["disciple_character_id"], msg)
+            await self._dm_character_owner(guild, c["educator_character_id"], msg)
 
     # =================================================================
     # BANQUE DE L'ORDRE (bouton "💰 Trésorerie" : compte + code PIN + virement)
@@ -1378,33 +1870,35 @@ class Ordre(commands.Cog):
                     await channel.send("⏳ Annulé.")
                     return
             name = get_character(target_cid)["character_name"] if get_character(target_cid) else "?"
-            order = db.get_order(order_id)
-            order_name = order["name"] if order else "?"
-            # Rôle lu AVANT la suppression (pour savoir si c'était un formateur).
+            # Rôle lu AVANT le retrait (pour savoir si c'était un disciple « Membre d'équipe »).
             member_row = db.get_order_member(order_id, target_cid)
             fired_role = member_row["role_label"] if member_row else None
-
+            # Conséquences côté ordre via le POINT D'ENTRÉE UNIQUE (redistribution + notifications), AVANT
+            # de retirer le membre (les liens doivent encore exister). La détection « est-ce un formateur »
+            # est faite à l'intérieur (via order_id_hint).
             reassignments, fallback_used, aucun_formateur_restant = [], False, False
-            if fired_role == "Formateur":
-                # Redistribution équilibrée des disciples AVANT de retirer le formateur.
-                reassignments, fallback_used, aucun_formateur_restant = \
-                    await self.redistribute_disciples(order_id, target_cid, channel.guild)
-                # Filet de sécurité : retire toute assignation résiduelle vers ce formateur
-                # (hors disciples déjà réassignés).
-                db.cleanup_educator_assignments(order_id, target_cid, [d for d, _ in reassignments])
+            edu_result = await self.handle_educator_departure_if_applicable(
+                target_cid, channel.guild, order_id_hint=order_id)
+            if edu_result is not None:
+                _, reassignments, fallback_used, aucun_formateur_restant = edu_result
             else:
-                # Non-formateur : s'il était disciple, son rattachement n'a plus lieu d'être.
+                # Non-formateur : détache son rattachement de disciple.
                 db.remove_disciple_assignment(order_id, target_cid)
+                fired_order = db.get_order(order_id)
+                if fired_order and fired_order["type"] == "educatif":
+                    # Disciple (« Membre d'équipe ») viré de son ordre éducatif d'origine : ses contrats
+                    # sourcés ici prennent fin (DM disciple + éducateur + chef employeur).
+                    if fired_role == "Membre d'équipe":
+                        await self._end_disciple_source_contracts(
+                            target_cid, order_id, fired_order["name"], channel.guild)
+                else:
+                    # Ordre employeur (Direct/Hybride) : clôture générique du contrat où il travaillait.
+                    await self.handle_disciple_departure_if_applicable(target_cid, channel.guild)
 
             db.remove_order_member(order_id, target_cid)
 
-            # Notifications (DM aux disciples / nouveaux éducateurs + récap à OWNER_ID).
-            if fired_role == "Formateur" and reassignments:
-                await self._notify_redistribution(
-                    channel.guild, order_name, name, reassignments, fallback_used, aucun_formateur_restant)
-
             desc = f"✅ {name} a été retiré de l'ordre."
-            if fired_role == "Formateur" and reassignments:
+            if edu_result is not None and reassignments:
                 nb_reassignes = sum(1 for _, e in reassignments if e is not None)
                 nb_orphelins = sum(1 for _, e in reassignments if e is None)
                 if nb_reassignes:
@@ -1455,6 +1949,9 @@ class Ordre(commands.Cog):
 
             # Gestion du rattachement disciple selon le NOUVEAU rôle.
             order = db.get_order(order_id)
+            # Ancien rôle lu AVANT la mutation (pour détecter un départ DEPUIS « Membre d'équipe »).
+            old_row = db.get_order_member(order_id, target_cid)
+            was_disciple = old_row is not None and old_row["role_label"] == "Membre d'équipe"
             educator_cid = None
             if role == "Membre d'équipe" and order["type"] == "educatif":
                 # Devient disciple : on exige un éducateur avant de finaliser la mutation (comme à l'ajout).
@@ -1477,6 +1974,12 @@ class Ordre(commands.Cog):
             else:
                 # Promu / changé de poste : n'est plus un disciple, l'assignation n'a plus de sens.
                 db.remove_disciple_assignment(order_id, target_cid)
+                # Passer DEPUIS « Membre d'équipe » VERS un autre rôle dans un ordre éducatif = quitter son
+                # statut de disciple : ses contrats sourcés par cet ordre prennent fin (DM disciple +
+                # éducateur + chef employeur).
+                if order["type"] == "educatif" and was_disciple:
+                    await self._end_disciple_source_contracts(
+                        target_cid, order_id, order["name"], channel.guild)
 
             name = get_character(target_cid)["character_name"] if get_character(target_cid) else "?"
             desc = f"✅ {name} est désormais **{role}**."
@@ -1598,6 +2101,143 @@ class Ordre(commands.Cog):
             await owner_user.send(recap)
         except discord.HTTPException:
             pass
+
+    # =================================================================
+    # DÉPART D'UN PERSONNAGE — CONSÉQUENCES CÔTÉ ORDRE (point d'entrée UNIQUE)
+    # =================================================================
+    # Ces méthodes centralisent TOUT ce qui doit arriver côté ordre quand un personnage part, quel que
+    # soit le contexte (clic « ➖ Virer », départ du joueur du serveur, suppression manuelle via /depart).
+    # Elles doivent être appelées AVANT la suppression effective du personnage, pendant que ses liens
+    # (order_members, order_disciple_assignments, contrats) existent encore.
+    def _mention_of_character(self, guild, character_id):
+        """Mention Discord (<@id>) du propriétaire d'un personnage, sinon son nom."""
+        if character_id is None:
+            return "aucun (à réassigner)"
+        c = get_character(character_id)
+        if not c:
+            return self._char_name(character_id)
+        return f"<@{c['user_id']}>"
+
+    async def handle_educator_departure_if_applicable(self, character_id, guild, order_id_hint=None):
+        """POINT D'ENTRÉE UNIQUE du départ d'un ÉDUCATEUR. Si `character_id` est Formateur dans un ordre,
+        redistribue ses disciples (algorithme équilibré déjà en place) et envoie toutes les notifications
+        (redistribution + transfert/notif des contrats + DM au chef de l'ordre éducatif). Ne fait rien et
+        retourne None si le personnage n'est pas formateur. Sinon retourne
+        (order_id, reassignments, fallback_used, aucun_formateur_restant) pour l'appelant (ex : le recap
+        du bouton Virer)."""
+        order_id = None
+        if order_id_hint is not None:
+            row = db.get_order_member(order_id_hint, character_id)
+            if row and row["role_label"] == "Formateur":
+                order_id = order_id_hint
+        if order_id is None:
+            order_id = db.find_educator_order(character_id)
+        if order_id is None:
+            return None  # pas un formateur : rien à faire
+
+        order = db.get_order(order_id)
+        order_name = order["name"] if order else "?"
+        old_name = self._char_name(character_id)
+        # Contrats actifs de l'éducateur AVANT redistribution (défensif : [] tant que la table n'existe pas).
+        contracts = db.get_active_contracts_of_educator(character_id)
+
+        # Redistribution équilibrée des disciples (redirige aussi les contrats vers le nouvel éducateur).
+        reassignments, fallback_used, aucun_formateur_restant = \
+            await self.redistribute_disciples(order_id, character_id, guild)
+        db.cleanup_educator_assignments(order_id, character_id, [d for d, _ in reassignments])
+
+        # Notifications de redistribution (disciples + nouveaux éducateurs + récap OWNER_ID).
+        if reassignments:
+            await self._notify_redistribution(
+                guild, order_name, old_name, reassignments, fallback_used, aucun_formateur_restant)
+        # Notifications spécifiques aux CONTRATS (chef employeur + disciple), défensives.
+        await self._notify_educator_contract_transfer(
+            guild, order_name, old_name, reassignments, contracts)
+        # Confirmation explicite au chef de l'ordre ÉDUCATIF (celui qui employait l'éducateur parti).
+        if order:
+            await self._dm_character_owner(
+                guild, order["chef_character_id"],
+                f"📋 L'éducateur {old_name} a quitté votre ordre {order_name}. Ses disciples ont été "
+                "redistribués automatiquement.")
+        return order_id, reassignments, fallback_used, aucun_formateur_restant
+
+    async def _notify_educator_contract_transfer(self, guild, order_name, old_name, reassignments, contracts):
+        """Pour chaque contrat actif de l'éducateur parti : prévient le chef de l'ordre employeur ET le
+        disciple du nouveau référent (déterminé par la redistribution). Le transfert du champ
+        educator_character_id est déjà fait par redistribute_disciples ; ici on ne fait QUE les DM.
+        Défensif : `contracts` est vide tant que la table educator_contracts n'existe pas → no-op."""
+        if not contracts:
+            return
+        new_by_disciple = {d: e for d, e in reassignments}
+        for c in contracts:
+            disciple_cid = c["disciple_character_id"]
+            new_educ = new_by_disciple.get(disciple_cid)
+            new_mention = self._mention_of_character(guild, new_educ)
+            employer = db.get_order(c["employer_order_id"])
+            if employer:
+                await self._dm_character_owner(
+                    guild, employer["chef_character_id"],
+                    f"📋 L'éducateur {old_name} n'est plus dans l'ordre {order_name}. Le nouveau référent "
+                    f"pour {self._char_name(disciple_cid)} est maintenant {new_mention}.")
+            await self._dm_character_owner(
+                guild, disciple_cid,
+                f"📋 L'éducateur {old_name} n'est plus dans l'ordre {order_name}. Ton nouveau référent "
+                f"est maintenant {new_mention}.")
+
+    async def handle_disciple_departure_if_applicable(self, character_id, guild):
+        """Départ d'un DISCIPLE sous contrat actif : prévient l'éducateur et le chef de l'ordre employeur,
+        puis clôt le contrat (status='ended'). Défensif : no-op tant que la table educator_contracts
+        n'existe pas."""
+        contract = db.get_active_contract_of_disciple(character_id)
+        if not contract:
+            return
+        disc_name = self._char_name(character_id)
+        educ_cid = contract["educator_character_id"]
+        # DM à l'éducateur.
+        await self._dm_character_owner(
+            guild, educ_cid,
+            f"📋 {disc_name} n'est plus disponible (a quitté / été renvoyé / personnage supprimé), le "
+            "contrat qui vous liait a pris fin.")
+        # DM au chef de l'ordre EMPLOYEUR.
+        employer = db.get_order(contract["employer_order_id"])
+        if employer:
+            await self._dm_character_owner(
+                guild, employer["chef_character_id"],
+                f"📋 {disc_name} n'est plus dans votre ordre, son contrat avec {self._char_name(educ_cid)} "
+                "a pris fin.")
+        db.end_contract(contract["id"])
+
+    async def _end_disciple_source_contracts(self, disciple_cid, source_order_id, source_order_name, guild):
+        """Un disciple quitte son ordre éducatif d'ORIGINE (Virer / Muter hors « Membre d'équipe ») : TOUS
+        ses contrats actifs sourcés par cet ordre prennent fin. DM au disciple, à l'éducateur, et au chef
+        de l'ordre EMPLOYEUR (potentiellement différent de l'ordre éducatif)."""
+        disc_name = self._char_name(disciple_cid)
+        for c in db.get_active_contracts_of_disciple_in_source(disciple_cid, source_order_id):
+            db.end_contract(c["id"])
+            educ_cid = c["educator_character_id"]
+            educ_name = self._char_name(educ_cid)
+            await self._dm_character_owner(
+                guild, disciple_cid,
+                f"📋 Tu as quitté l'ordre éducatif {source_order_name}, ton contrat avec {educ_name} a "
+                "pris fin. Tu es libre de rejoindre un autre ordre.")
+            await self._dm_character_owner(
+                guild, educ_cid,
+                f"📋 {disc_name} a quitté l'ordre {source_order_name}, le contrat qui vous liait a pris fin.")
+            employer = db.get_order(c["employer_order_id"])
+            if employer:
+                await self._dm_character_owner(
+                    guild, employer["chef_character_id"],
+                    f"📋 {disc_name} n'est plus disciple de l'ordre éducatif {source_order_name}, son "
+                    f"contrat avec {educ_name} a pris fin. Il peut rester dans votre ordre normalement, "
+                    "mais sans contrat actif avec cet éducateur.")
+
+    async def handle_order_departure(self, character_id, guild, order_id_hint=None):
+        """Regroupe les conséquences côté ordre du départ d'un personnage (éducateur ET disciple), pour
+        les points d'entrée qui n'ont pas besoin de la valeur de retour (départ du serveur, suppression
+        manuelle). Le bouton Virer, lui, appelle handle_educator_departure_if_applicable directement pour
+        récupérer le détail de la redistribution et l'afficher."""
+        await self.handle_educator_departure_if_applicable(character_id, guild, order_id_hint)
+        await self.handle_disciple_departure_if_applicable(character_id, guild)
 
     # =================================================================
     # SALAIRES (Direct / Hybride)
@@ -1786,75 +2426,171 @@ class Ordre(commands.Cog):
             content="🔓 Verrou désactivé. Les dépenses de l'ordre sont de nouveau possibles.", view=None)
 
     # =================================================================
-    # TÂCHE PLANIFIÉE : SALAIRES + VERROUS + ÉCHÉANCES
+    # TÂCHE PLANIFIÉE UNIQUE : présence des chefs + expiration + cycle hebdo + verrous
     # =================================================================
-    @tasks.loop(hours=24)
-    async def salary_loop(self):
-        today = datetime.utcnow().date()
-        is_monday = today.weekday() == 0
-        for order in db.get_orders_of_types(("direct", "hybride")):
-            try:
-                await self._process_order_salary_cycle(order["id"], today, is_monday)
-            except Exception as e:  # un ordre en erreur ne doit pas bloquer les autres
-                print(f"[salary_loop] erreur sur l'ordre {order['id']} : {e}")
-
-    @salary_loop.before_loop
-    async def _before_salary_loop(self):
-        await self.bot.wait_until_ready()
-
     @tasks.loop(minutes=15)
-    async def check_chief_presence(self):
-        """4x/jour (heure de Paris), vérifie que le chef de chaque ordre est toujours sur le serveur.
-        S'il a quitté, lance la dissolution différée de son ordre (la dissolution d'un ordre est trop
-        impactante pour les autres membres pour être déclenchée instantanément au départ du joueur)."""
+    async def ordre_scheduler(self):
+        """Tâche unique remplaçant les deux anciennes boucles (salary_loop + check_chief_presence),
+        déterministe et idempotente. Ne fait rien hors des 4 créneaux (0/6/12/18 h, heure de Paris) et
+        du premier quart d'heure suivant chaque créneau :
+        - à chaque créneau : dissolution des ordres dont le chef a quitté le serveur ;
+        - à minuit uniquement : expiration des locations, puis (le lundi, une seule fois grâce à
+          bot_state) taxe + salaires, puis vérification des verrous/échéances."""
         now_paris = datetime.now(PARIS_TZ)
         if now_paris.hour not in CHECK_HOURS or now_paris.minute >= 15:
-            return  # ne s'exécute qu'une fois dans le quart d'heure suivant chaque heure de vérification
-        await self._dissolve_absent_chiefs()
+            return
 
-    async def _dissolve_absent_chiefs(self):
-        """Parcourt tous les ordres et dissout ceux dont le chef a quitté le serveur (logique isolée de
-        la porte temporelle de check_chief_presence pour être testable et réutilisable)."""
         for guild in self.bot.guilds:
-            for order in db.get_orders_in_guild_full(guild.id):
-                owner_user_id = order["owner_user_id"]
-                member = guild.get_member(owner_user_id)
-                if member is None:
-                    try:
-                        member = await guild.fetch_member(owner_user_id)
-                    except discord.NotFound:
-                        member = None
-                    except discord.HTTPException:
-                        continue  # erreur réseau temporaire : on retentera au prochain passage
-                if member is None:
-                    print(f"🔍 [chef-absent] Le chef de l'ordre {order['name']} (id {order['id']}) a "
-                          "quitté le serveur, procédure de dissolution lancée.")
-                    try:
-                        await self.dissolve_order_chief_departed(order["id"], guild)
-                    except Exception as e:  # un ordre en erreur ne doit pas bloquer les autres
-                        print(f"[check_chief_presence] échec dissolution ordre {order['id']} : {e}")
+            # Dissolution des ordres dont le chef a quitté (à chacun des 4 créneaux, comme avant).
+            await self._dissolve_absent_chiefs(guild)
 
-    @check_chief_presence.before_loop
-    async def _before_check_chief_presence(self):
+            # Bloc de minuit uniquement.
+            if now_paris.hour == 0:
+                # 1) Expiration des locations D'ABORD (avant tout calcul de taxe/loyer) : un salon dont la
+                #    location expire ce jour redevient 'Acheté' et sera donc taxé plutôt que loué.
+                await self._expire_locations(guild)
+
+                # 2) Le lundi, une SEULE fois par lundi : cycle hebdomadaire (taxe + salaires).
+                #    Idempotence garantie par bot_state : un redémarrage le même lundi ne rejoue rien.
+                #    Clé PAR SERVEUR (une clé globale sauterait les serveurs suivants une fois le premier
+                #    traité, puisque ce bloc est dans la boucle des serveurs).
+                if now_paris.weekday() == 0:
+                    today_str = now_paris.date().isoformat()
+                    state_key = f"last_weekly_orders_run:{guild.id}"
+                    if db.get_bot_state(state_key) != today_str:
+                        await self._charge_weekly_taxes(guild)
+                        await self._pay_salaries(guild)
+                        db.set_bot_state(state_key, today_str)
+
+                # 3) Vérification quotidienne des verrous/échéances (peut dissoudre un ordre).
+                await self._check_locks_and_deadlines(guild)
+
+                # 4) Expiration des contrats à durée déterminée arrivés à échéance.
+                await self._expire_contracts(guild)
+
+    @ordre_scheduler.before_loop
+    async def _before_ordre_scheduler(self):
         await self.bot.wait_until_ready()
 
-    def _guild_of_order(self, order):
-        chef = get_character(order["chef_character_id"])
-        gid = chef["guild_id"] if chef else None
-        return self.bot.get_guild(gid) if gid else None
+    # ---------- Sous-étapes du planificateur (toutes PAR SERVEUR) ----------
+    async def _dissolve_absent_chiefs(self, guild):
+        """Dissout les ordres du serveur dont le chef a quitté le serveur Discord."""
+        for order in db.get_orders_in_guild_full(guild.id):
+            owner_user_id = order["owner_user_id"]
+            member = guild.get_member(owner_user_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(owner_user_id)
+                except discord.NotFound:
+                    member = None
+                except discord.HTTPException:
+                    continue  # erreur réseau temporaire : on retentera au prochain passage
+            if member is None:
+                print(f"🔍 [chef-absent] Le chef de l'ordre {order['name']} (id {order['id']}) a "
+                      "quitté le serveur, procédure de dissolution lancée.")
+                try:
+                    await self.dissolve_order_chief_departed(order["id"], guild)
+                except Exception as e:  # un ordre en erreur ne doit pas bloquer les autres
+                    print(f"[ordre_scheduler] échec dissolution ordre {order['id']} : {e}")
 
-    async def _process_order_salary_cycle(self, order_id, today, is_monday):
+    async def _expire_locations(self, guild):
+        """Résilie les locations DU SERVEUR arrivées à terme : le salon redevient 'Acheté' chez le
+        propriétaire (de nouveau taxé), la ligne miroir disparaît chez le locataire, les deux chefs sont
+        prévenus. Comparé à _now() (UTC, base de location_expiry) : on capture tout ce qui a expiré depuis
+        le dernier passage quotidien."""
+        for row in db.get_expired_locations(_now()):
+            owner_order = db.get_order(row["order_id"])  # 'Location' = côté propriétaire
+            if owner_order is None:
+                continue
+            chef = get_character(owner_order["chef_character_id"])
+            if not chef or chef["guild_id"] != guild.id:
+                continue  # appartient à un autre serveur : traité lors de l'itération de CE serveur
+            tenant_id = row["linked_order_id"]  # côté locataire ('Louée')
+            ch = guild.get_channel(row["channel_id"])
+            name = ch.name if ch else str(row["channel_id"])
+
+            # Le propriétaire récupère son salon en 'Acheté' ; le locataire perd sa ligne miroir.
+            # IMPORTANT : le retour d'un salon à son propriétaire après expiration de location ne coûte
+            # RIEN et ne génère AUCUNE transaction. Le propriétaire n'a jamais cessé de posséder ce salon,
+            # il était juste temporairement loué. Aucun débit, aucun crédit, aucun INSERT dans
+            # order_transactions à cet endroit.
+            db.revert_location_to_bought(row["id"])
+            if tenant_id:
+                db.remove_order_salon_any(tenant_id, row["channel_id"])
+                tenant_order = db.get_order(tenant_id)
+                if tenant_order:
+                    await self._dm_character_owner(
+                        guild, tenant_order["chef_character_id"],
+                        f"📋 La location du salon #{name} est arrivée à son terme, vous n'y avez plus accès.")
+            await self._dm_character_owner(
+                guild, owner_order["chef_character_id"],
+                f"📋 La location du salon #{name} est arrivée à son terme, il redevient un salon "
+                "'Acheté' normal chez vous et sera de nouveau taxé chaque semaine.")
+
+    async def _charge_weekly_taxes(self, guild):
+        """Taxe hebdomadaire + débit des loyers, pour tous les ordres Direct/Hybride du serveur."""
+        for order in db.get_orders_in_guild_of_types(guild.id, ("direct", "hybride")):
+            try:
+                await self._charge_weekly_taxes_one(order["id"], guild)
+            except Exception as e:  # un ordre en erreur ne doit pas bloquer les autres
+                print(f"[ordre_scheduler] taxe ordre {order['id']} : {e}")
+
+    async def _pay_salaries(self, guild):
+        """Paie les salaires de tous les ordres Direct/Hybride du serveur. Date de référence = date de
+        Paris (cohérente avec le créneau de minuit lundi qui déclenche le cycle ; utiliser utcnow() ici
+        donnerait le dimanche, car à minuit à Paris on est encore la veille en UTC)."""
+        today = datetime.now(PARIS_TZ).date()
+        for order in db.get_orders_in_guild_of_types(guild.id, ("direct", "hybride")):
+            try:
+                await self._pay_salaries_one(order["id"], today, guild)
+            except Exception as e:
+                print(f"[ordre_scheduler] salaires ordre {order['id']} : {e}")
+
+    async def _check_locks_and_deadlines(self, guild):
+        """Vérifie les verrous et échéances de tous les ordres Direct/Hybride du serveur."""
+        for order in db.get_orders_in_guild_of_types(guild.id, ("direct", "hybride")):
+            try:
+                await self._check_locks_and_deadlines_one(order["id"], guild)
+            except Exception as e:
+                print(f"[ordre_scheduler] verrous ordre {order['id']} : {e}")
+
+    async def _charge_weekly_taxes_one(self, order_id, guild):
+        """Le lundi : taxe des salons possédés ('Acheté' uniquement — les salons prêtés à un autre ordre
+        en sont exemptés) + débit des loyers pour les salons que CET ordre loue à un autre.
+
+        NB modèle de données : dans ce projet, le statut 'Location' est porté par le PROPRIÉTAIRE (salon
+        loué À un autre ordre) et 'Louée' par le LOCATAIRE (salon loué DEPUIS un autre ordre). Le loyer
+        est donc prélevé sur les lignes 'Louée' de cet ordre (locataire), crédité au propriétaire lié —
+        l'inverse du schéma supposé dans l'instruction, adapté au modèle réel pour ne pas facturer à
+        l'envers."""
         order = db.get_order(order_id)
-        if order is None:
-            return
-        guild = self._guild_of_order(order)
-        # A) Le lundi : paiement des salaires.
-        if is_monday:
-            await self._pay_salaries(order_id, today, guild)
-        # B) Tous les jours : suivi des verrous et des échéances (peut dissoudre l'ordre).
-        await self._check_locks_and_deadlines(order_id, guild)
+        if order is None or order["security_lock"]:
+            return  # verrouillé : aucune taxe ni loyer prélevés cette semaine (cohérent avec le blocage)
 
-    async def _pay_salaries(self, order_id, today, guild):
+        # 2) Taxe des salons 'Acheté'.
+        nb = db.count_order_salons(order_id, "Acheté")
+        taxe = nb * TAXE_SALON
+        if taxe > 0:
+            db.adjust_order_solde(order_id, -taxe)
+            db.add_order_transaction(order_id, f"Taxe hebdomadaire — {nb} salon(s)", -taxe, _now())
+
+        # 3) Loyers : pour chaque salon que CET ordre loue (statut 'Louée'), il paie le propriétaire lié.
+        # TODO : si l'ordre locataire est verrouillé, il est entièrement ignoré ci-dessus et ne paie pas
+        # son loyer cette semaine ; le retard de loyer côté propriétaire n'est pas encore géré (à traiter
+        # plus tard : accumulation de la dette, relance, ou résiliation automatique).
+        for s in db.get_order_salons(order_id):
+            if s["status"] != "Louée" or not s["linked_order_id"]:
+                continue
+            owner_id = s["linked_order_id"]
+            ch = guild.get_channel(s["channel_id"]) if guild else None
+            name = ch.name if ch else str(s["channel_id"])
+            db.adjust_order_solde(order_id, -TAXE_SALON)
+            db.add_order_transaction(order_id, f"Paiement location salon #{name}", -TAXE_SALON, _now())
+            # Loyer reçu par le propriétaire (un dépôt entrant reste autorisé même s'il est verrouillé).
+            db.adjust_order_solde(owner_id, TAXE_SALON)
+            db.add_order_transaction(owner_id, f"Loyer reçu salon #{name}", TAXE_SALON, _now())
+
+    async def _pay_salaries_one(self, order_id, today, guild):
         order = db.get_order(order_id)
         if order is None or order["security_lock"]:
             return  # verrouillé : personne n'est payé cette semaine
@@ -1877,7 +2613,7 @@ class Ordre(commands.Cog):
             credit_account(character_id, "courant", montant)
             add_transaction(character_id, "Salaire hebdomadaire", montant)
 
-    async def _check_locks_and_deadlines(self, order_id, guild):
+    async def _check_locks_and_deadlines_one(self, order_id, guild):
         order = db.get_order(order_id)
         if order is None or not order["security_lock"]:
             return
@@ -1950,8 +2686,8 @@ class Ordre(commands.Cog):
                        "pas créer de nouvel ordre avant 2 mois."))
 
     async def dissolve_order_chief_departed(self, order_id, guild):
-        """Dissolution suite au départ CONFIRMÉ du chef du serveur (détecté par la vérification
-        programmée check_chief_presence). Indemnité de 1 mois (montant x4), annonce à tous les membres
+        """Dissolution suite au départ CONFIRMÉ du chef du serveur (détecté par la tâche planifiée
+        ordre_scheduler). Indemnité de 1 mois (montant x4), annonce à tous les membres
         AVANT toute suppression, suppression du personnage du chef lui même (sautée au moment du départ),
         et AUCUN bannissement (le chef est parti, il n'est pas fautif)."""
         await self._dissolve_common(
@@ -2042,10 +2778,12 @@ class Ordre(commands.Cog):
                 "n'est plus lié à aucun contrat, il est maintenant libre de toute location de votre côté.")
 
     async def _end_order_contracts(self, order_id, order_name, guild):
-        """Clôt (status='ended') les contrats actifs liés à l'ordre et prévient les deux parties.
-        Défensif : la table educator_contracts n'existe pas encore, donc no-op silencieux dans ce cas."""
+        """Clôt (status='ended') les contrats actifs liés à l'ordre (employeur OU source) et prévient les
+        deux parties (disciple + éducateur). Utilisé par les 3 chemins de dissolution via _dissolve_common.
+        Colonnes réelles : disciple_character_id, educator_character_id, employer_order_id, source_order_id,
+        status (cf. end_order_contracts en base)."""
         try:
-            ended = db.end_order_contracts(order_id)  # [] si table absente
+            ended = db.end_order_contracts(order_id)
         except Exception:
             return
         for disciple_cid, educator_cid in ended:
@@ -2056,108 +2794,191 @@ class Ordre(commands.Cog):
             await self._dm_character_owner(guild, educator_cid, msg)
 
     # =================================================================
-    # SALONS — ACQUISITION (section 8)
+    # SALONS — ACHAT (bouton "🏠 Avoir des salons" ET option "🛒 Acheter" du menu Salon)
     # =================================================================
     async def handle_salons_buy(self, interaction, cid):
+        """Point d'entrée « 🏠 Avoir des salons » du dashboard : délègue au flux d'achat partagé (même
+        aperçu de coût + confirmation + avertissement de découvert que l'option « 🛒 Acheter »)."""
         order_id = int(cid.split(":")[1])
         if not await self._require_chief(interaction, order_id):
-            return
-        order = db.get_order(order_id)
-        if order["type"] not in ("direct", "hybride"):
-            await interaction.response.send_message(
-                "Seuls les ordres Direct/Hybride peuvent posséder des salons.", ephemeral=True)
-            return
-        # Verrou de sécurité : achat de salons = dépense, bloqué tant que le compte est verrouillé.
-        if order["security_lock"]:
-            await interaction.response.send_message(
-                "🔒 Ce compte est verrouillé suite à une trésorerie négative prolongée, aucune dépense "
-                "n'est possible pour l'instant. Seuls les dépôts sont acceptés.", ephemeral=True)
             return
         if not self._acquire(interaction.user.id):
             await interaction.response.send_message(
                 "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True)
             return
         try:
-            await interaction.response.send_message("🏠 Acquisition de salons…", ephemeral=True)
-            channel = interaction.channel
-            n = await self._ask_positive_int(
-                channel, interaction.user,
-                f"Combien de salons veux tu acquérir ? (taxe de {_fmt(TAXE_SALON)} ¥ par salon et par semaine)")
-            if n is None:
-                return
-            channels = await self._collect_new_salons(channel, interaction.user, n, order_id)
-            if channels is None:
-                return
-            if not channels:
-                await channel.send("Aucun salon valide à acquérir.")
-                return
-            acquired = []
-            for ch in channels:
-                fresh = db.get_order(order_id)
-                if fresh["solde_courant"] < TAXE_SALON:  # revérif temps réel du solde de l'ordre
-                    await channel.send(
-                        f"⚠️ Solde de l'ordre insuffisant, achat interrompu. "
-                        f"{len(acquired)}/{len(channels)} salon(s) acquis.")
-                    break
-                db.adjust_order_solde(order_id, -TAXE_SALON)
-                db.add_order_salon(order_id, ch.id, "Acheté")
-                db.add_order_transaction(order_id, f"Achat salon #{ch.name}", -TAXE_SALON, _now())
-                acquired.append(ch)
-            recap = ", ".join(f"#{c.name}" for c in acquired) if acquired else "aucun"
-            await channel.send(embed=discord.Embed(
-                description=f"✅ Salons acquis : {recap}.", color=PHOENIX_COLOR))
-            # TODO : tâche @tasks.loop hebdomadaire pour débiter automatiquement 15k par salon Acheté,
-            # pas encore implémentée.
-            await self._send_dashboard(channel, db.get_order(order_id), interaction.user.id)
+            await interaction.response.send_message("🏠 Achat de salons…", ephemeral=True)
+            await self._purchase_salons_flow(interaction.channel, interaction.user, order_id)
         finally:
             self._release(interaction.user.id)
 
-    async def _collect_new_salons(self, channel, user, n, order_id):
-        """Collecte n salons NON possédés, en gérant les conflits (Annuler / Changer). Retourne la
-        liste finale de channels (peut être plus courte si annulation partielle), ou None si annulé."""
+    async def _purchase_salons_flow(self, channel, user, order_id):
+        """Flux d'achat partagé : aperçu du coût, confirmation, avertissement de découvert (l'achat reste
+        possible à découvert, cf. verrou de sécurité), collecte des salons avec gestion des conflits,
+        puis débit du prix d'achat (15k/salon) — la taxe hebdomadaire ne démarrera qu'au prochain lundi.
+        Suppose que le chef est déjà vérifié et le verrou de flux déjà acquis par l'appelant."""
+        order = db.get_order(order_id)
+        if order is None or order["type"] not in ("direct", "hybride"):
+            await channel.send("Seuls les ordres Direct/Hybride peuvent posséder des salons.")
+            return
+        # Verrou de sécurité : achat = dépense, bloqué tant que le compte est verrouillé.
+        if order["security_lock"]:
+            await channel.send(
+                "🔒 Ce compte est verrouillé suite à une trésorerie négative prolongée, aucune dépense "
+                "n'est possible pour l'instant. Seuls les dépôts sont acceptés.")
+            return
+
+        # 1) Nombre de salons.
+        n = await self._ask_positive_int(channel, user, "Combien de salons veux tu acheter ?")
+        if n is None:
+            return
+        # 2-3) Aperçu du coût + confirmation.
+        prix_achat = n * TAXE_SALON
+        taxe_mensuelle = n * TAXE_SALON * 4
+        confirm = TwoChoiceView(
+            user.id, "✅ Confirmer", "confirm", "❌ Annuler", "cancel",
+            a_style=discord.ButtonStyle.success, b_style=discord.ButtonStyle.danger)
+        await channel.send(
+            embed=discord.Embed(
+                title="🛒 Récapitulatif de l'achat",
+                description=(
+                    f"Pour **{n}** salon(s) : **{_fmt(prix_achat)} ¥** d'achat immédiat, puis environ "
+                    f"**{_fmt(taxe_mensuelle)} ¥/mois** de taxe ({_fmt(TAXE_SALON)} ¥/semaine/salon)."),
+                color=PHOENIX_COLOR),
+            view=confirm)
+        await confirm.wait()
+        if confirm.result != "confirm":
+            await channel.send("Achat annulé.")
+            return
+        # 5a) Avertissement de découvert (revérif temps réel du solde).
+        fresh = db.get_order(order_id)
+        if fresh["solde_courant"] < prix_achat:
+            warn = TwoChoiceView(
+                user.id, "✅ Continuer", "continue", "❌ Annuler", "cancel",
+                a_style=discord.ButtonStyle.danger, b_style=discord.ButtonStyle.secondary)
+            await channel.send(
+                embed=discord.Embed(
+                    title="⚠️ Solde insuffisant",
+                    description=(
+                        f"Ton solde actuel ({_fmt(fresh['solde_courant'])} ¥) ne couvre pas entièrement "
+                        f"cet achat ({_fmt(prix_achat)} ¥). L'achat reste possible, mais ta trésorerie "
+                        "passera en négatif — tu auras alors 2 mois pour redresser la situation avant "
+                        "blocage puis dissolution de l'ordre (voir le système de verrou déjà en place). "
+                        "Continuer quand même ?"),
+                    color=discord.Color.orange()),
+                view=warn)
+            await warn.wait()
+            if warn.result != "continue":
+                await channel.send("Achat annulé.")
+                return
+        # 5b-c) Collecte des salons avec système de conquête (avertissement par salon déjà possédé).
+        channels = await self._collect_salons_conquest(channel, user, n, order_id)
+        if channels is None:
+            return
+        if not channels:
+            await channel.send("Aucun salon retenu.")
+            return
+        # 5d) Débit du prix d'achat + enregistrement (découvert autorisé : on ne s'interrompt plus).
+        # Les salons conquis ont déjà été retirés de leur ancien ordre dans _collect_salons_conquest.
+        for ch in channels:
+            db.adjust_order_solde(order_id, -TAXE_SALON)
+            db.add_order_salon(order_id, ch.id, "Acheté")
+            db.add_order_transaction(order_id, f"Achat salon #{ch.name}", -TAXE_SALON, _now())
+        # 5e) Récapitulatif final.
+        recap = ", ".join(f"#{c.name}" for c in channels)
+        await channel.send(embed=discord.Embed(
+            description=f"✅ Salons achetés : {recap}.", color=PHOENIX_COLOR))
+        await self._send_dashboard(channel, db.get_order(order_id), user.id)
+
+    async def _collect_salons_conquest(self, channel, user, n, order_id):
+        """Collecte n salons pour l'achat avec SYSTÈME DE CONQUÊTE (par salon, pas de blocage global) :
+        - salon libre → retenu directement pour l'achat ;
+        - salon déjà possédé (par cet ordre ou un autre, tout statut) → avertissement dédié à CE salon
+          avec « ✅ Conquérir » / « ❌ Ignorer ce salon ». « Ignorer » le retire du lot, les autres
+          continuent ; « Conquérir » le retire de son ordre actuel (nettoyage croisé des locations + DM
+          aux chefs concernés) puis le retient pour l'achat.
+        Retourne la liste des channels retenus (peut être vide), ou None si annulé (délai / mentions)."""
         await channel.send(f"Mentionne les {n} salons en une seule fois (ex : #salon1 #salon2 ...).")
-        final = []
-        seen = set()
-        need = n
-        while need > 0:
+        while True:
             m = await self.wait_message(channel, user)
             if m is None:
                 await channel.send("⏳ Annulé.")
                 return None
             mentions = m.channel_mentions
-            if len(mentions) < need:
+            if len(mentions) < n:
                 await channel.send(
-                    f"Il faut mentionner {need} salon(s), tu en as mentionné {len(mentions)}. Réessaie.")
+                    f"Il faut mentionner {n} salon(s), tu en as mentionné {len(mentions)}. Réessaie.")
                 continue
-            batch = mentions[:need]
-            conflicts = []
-            for ch in batch:
-                if ch.id in seen or db.get_salon_owner(ch.id, "Acheté") is not None:
-                    conflicts.append(ch)
-                else:
-                    final.append(ch)
-                    seen.add(ch.id)
-                    need -= 1
-            if not conflicts:
-                break
-            names = ", ".join(f"#{c.name}" for c in conflicts)
+            break
+        # Dédoublonnage en conservant l'ordre de mention.
+        batch, seen = [], set()
+        for ch in mentions[:n]:
+            if ch.id not in seen:
+                seen.add(ch.id)
+                batch.append(ch)
+
+        buyer_order = db.get_order(order_id)
+        buyer_name = buyer_order["name"] if buyer_order else "?"
+        final = []
+        for ch in batch:
+            rows = db.get_all_salon_rows(ch.id)
+            if not rows:
+                final.append(ch)  # salon libre : achat direct, aucun avertissement
+                continue
+            # Possesseur affiché : la ligne de propriété ('Acheté' ou 'Location'), sinon la 1re trouvée.
+            owner_row = next((r for r in rows if r["status"] in ("Acheté", "Location")), rows[0])
+            owner_order = db.get_order(owner_row["order_id"])
+            owner_name = owner_order["name"] if owner_order else "un autre ordre"
             view = TwoChoiceView(
-                user.id, "❌ Annuler ces salons", "cancel", "🔄 Changer", "change",
-                a_style=discord.ButtonStyle.danger, b_style=discord.ButtonStyle.primary)
+                user.id, "✅ Conquérir", "conquer", "❌ Ignorer ce salon", "ignore",
+                a_style=discord.ButtonStyle.danger, b_style=discord.ButtonStyle.secondary)
             await channel.send(
                 embed=discord.Embed(
-                    title="Salons en conflit",
-                    description=f"Déjà possédés (ou en double) : {names}.\n\n"
-                                "« Annuler ces salons » les retire et garde les autres. "
-                                "« Changer » te laisse en mentionner de nouveaux à la place.",
-                    color=PHOENIX_COLOR),
+                    title="⚠️ Salon déjà possédé",
+                    description=(
+                        f"Le salon #{ch.name} appartient déjà à l'ordre **{owner_name}** "
+                        f"(statut : {owner_row['status']}). L'acheter quand même le conquerra et le "
+                        "retirera de cet ordre. Continuer ?"),
+                    color=discord.Color.orange()),
                 view=view)
             await view.wait()
-            if view.result == "change":
-                await channel.send(f"Mentionne {len(conflicts)} nouveau(x) salon(s).")
-                continue  # need == nombre de conflits restants
-            break  # cancel ou timeout : on finalise avec les salons déjà valides
+            if view.result != "conquer":
+                await channel.send(f"Salon #{ch.name} ignoré.")
+                continue
+            await self._conquer_salon(ch, rows, owner_row, order_id, buyer_name)
+            final.append(ch)
         return final
+
+    async def _conquer_salon(self, ch, rows, owner_row, buyer_order_id, buyer_name):
+        """Retire un salon à son ordre actuel avant de le réattribuer à l'acheteur : DM au possesseur
+        (perte de propriété) et, si le salon était en location, à la contrepartie liée (fin de location,
+        même nettoyage croisé que dissolve_order()), puis suppression de TOUTES ses lignes."""
+        guild = getattr(ch, "guild", None)
+        dmed = set()
+        # 1) Possesseur actuel : perte de propriété (sauf si c'est déjà l'acheteur).
+        owner_oid = owner_row["order_id"]
+        if owner_oid and owner_oid != buyer_order_id:
+            owner_order = db.get_order(owner_oid)
+            if owner_order:
+                await self._dm_character_owner(
+                    guild, owner_order["chef_character_id"],
+                    f"⚠️ Le salon #{ch.name} de votre ordre a été conquis par l'ordre **{buyer_name}**.")
+                dmed.add(owner_oid)
+        # 2) Contreparties de location (fin de location) : pour chaque ligne liée à un autre ordre.
+        for r in rows:
+            linked_id = r["linked_order_id"]
+            if r["status"] in ("Location", "Louée") and linked_id \
+                    and linked_id not in dmed and linked_id != buyer_order_id:
+                linked = db.get_order(linked_id)
+                if linked:
+                    verbe = "louiez" if r["status"] == "Location" else "aviez en location"
+                    await self._dm_character_owner(
+                        guild, linked["chef_character_id"],
+                        f"⚠️ Le salon #{ch.name} que vous {verbe} a été conquis par un autre ordre, "
+                        "cette location a pris fin.")
+                    dmed.add(linked_id)
+        # 3) Suppression de toutes les lignes du salon (chez tous les ordres concernés).
+        db.delete_salon_everywhere(ch.id)
 
     # =================================================================
     # SALONS — GESTION (section 9)
@@ -2215,7 +3036,7 @@ class Ordre(commands.Cog):
             await interaction.response.send_message("Seul le chef de l'ordre peut faire ça.", ephemeral=True)
             return
         value = (interaction.data.get("values") or [None])[0]
-        if value not in ("revendre", "louer"):
+        if value not in ("acheter", "revendre", "louer"):
             await interaction.response.send_message("Action inconnue.", ephemeral=True)
             return
         if not self._acquire(interaction.user.id):
@@ -2225,7 +3046,9 @@ class Ordre(commands.Cog):
         try:
             await interaction.response.defer()
             channel = interaction.channel
-            if value == "revendre":
+            if value == "acheter":
+                await self._purchase_salons_flow(channel, interaction.user, order_id)
+            elif value == "revendre":
                 await self._salon_resell(channel, interaction.user, order_id)
             else:
                 await self._salon_rent(channel, interaction.user, order_id)
@@ -2421,8 +3244,8 @@ class Ordre(commands.Cog):
             db.add_order_salon(order_id, ch.id, "Location", linked_order_id=tenant_order_id, location_expiry=expiry)
             # Entrée miroir côté locataire : 'Louée' (loué depuis l'ordre propriétaire).
             db.add_order_salon(tenant_order_id, ch.id, "Louée", linked_order_id=order_id, location_expiry=expiry)
-        # TODO : tâche @tasks.loop pour gérer les débits de location et l'expiration automatique,
-        # pas encore implémentée.
+        # Débit hebdomadaire du loyer : _charge_weekly_taxes (chaque lundi). Expiration automatique :
+        # _expire_locations (chaque jour à minuit heure de Paris).
         await channel.send(embed=discord.Embed(
             description=f"✅ {len(channels)} salon(s) mis en location pour {weeks} semaine(s).",
             color=PHOENIX_COLOR))
