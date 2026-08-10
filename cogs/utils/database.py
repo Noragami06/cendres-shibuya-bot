@@ -301,7 +301,9 @@ CREATE TABLE IF NOT EXISTS order_salaries (
     character_id INTEGER,
     montant INTEGER,
     effective_start_date TEXT,      -- date (YYYY-MM-DD) d'entrée en vigueur (prochain lundi)
-    added_at TEXT
+    added_at TEXT,
+    is_external INTEGER DEFAULT 0,  -- 1 = IBAN hors des membres de l'ordre (salaire temporaire)
+    expiry_date TEXT                -- date ISO d'expiration d'un salaire externe (NULL pour un membre)
 );
 
 CREATE TABLE IF NOT EXISTS order_chief_bans (
@@ -532,6 +534,18 @@ def _ensure_order_columns(conn):
         conn.execute("ALTER TABLE orders ADD COLUMN warning_sent INTEGER DEFAULT 0")
 
 
+def _ensure_salary_columns(conn):
+    """Ajoute is_external / expiry_date à une table order_salaries préexistante (salaires temporaires
+    pour un IBAN externe à l'ordre)."""
+    cols = _column_names(conn, "order_salaries")
+    if not cols:
+        return
+    if "is_external" not in cols:
+        conn.execute("ALTER TABLE order_salaries ADD COLUMN is_external INTEGER DEFAULT 0")
+    if "expiry_date" not in cols:
+        conn.execute("ALTER TABLE order_salaries ADD COLUMN expiry_date TEXT")
+
+
 def init_db():
     """Crée les tables manquantes et applique les migrations légères. N'efface jamais de données."""
     with get_connection() as conn:
@@ -543,6 +557,7 @@ def init_db():
         _ensure_validated_columns(conn)
         _ensure_bank_columns(conn)
         _ensure_order_columns(conn)
+        _ensure_salary_columns(conn)
         # Unicité de l'IBAN d'ordre (fonctionne aussi sur une base migrée ; NULL multiples autorisés).
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_iban ON orders(iban)")
         _migrate_item_categorie_id(conn)
@@ -1385,6 +1400,27 @@ def get_all_salon_rows(channel_id: int):
         ).fetchall()
 
 
+def resolve_salon_true_owner(channel_id: int):
+    """Le VRAI propriétaire d'un salon est TOUJOURS la ligne avec status IN ('Acheté', 'Location').
+    Une ligne 'Louée' n'est jamais autoritaire : c'est juste le miroir chez l'emprunteur. Retourne la
+    ligne propriétaire, ou None si aucun ordre ne le possède réellement (salon libre)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM order_salons WHERE channel_id = ? AND status IN ('Acheté', 'Location') LIMIT 1",
+            (channel_id,),
+        ).fetchone()
+
+
+def get_salon_louee_mirror(channel_id: int, tenant_order_id: int):
+    """Ligne miroir 'Louée' d'un salon chez l'ordre locataire (contrepartie d'une 'Location'). None si
+    absente."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM order_salons WHERE channel_id = ? AND order_id = ? AND status = 'Louée' LIMIT 1",
+            (channel_id, tenant_order_id),
+        ).fetchone()
+
+
 def delete_salon_everywhere(channel_id: int):
     """Supprime toutes les lignes order_salons portant ce salon, quel que soit l'ordre ou le statut
     (conquête : le salon est retiré à son ordre actuel avant d'être réattribué à l'acheteur)."""
@@ -1831,6 +1867,28 @@ def get_active_contract_full_of_disciple(disciple_character_id: int):
         ).fetchone()
 
 
+def get_all_active_contracts():
+    """Tous les contrats ACTIFS (vérification périodique de présence des disciples). [] si la table
+    n'existe pas encore."""
+    with get_connection() as conn:
+        if not _educator_contracts_exists(conn):
+            return []
+        return conn.execute(
+            "SELECT * FROM educator_contracts WHERE status = 'active' ORDER BY id ASC"
+        ).fetchall()
+
+
+def get_all_pending_contracts():
+    """Tous les contrats ENCORE 'pending' (reprise des minuteries de proposition au démarrage). [] si la
+    table n'existe pas encore."""
+    with get_connection() as conn:
+        if not _educator_contracts_exists(conn):
+            return []
+        return conn.execute(
+            "SELECT * FROM educator_contracts WHERE status = 'pending' ORDER BY batch_id, id"
+        ).fetchall()
+
+
 def activate_contract(contract_id: int, start_date: str, end_date):
     """Active un contrat accepté (start_date, end_date=None si durée indéterminée)."""
     with get_connection() as conn:
@@ -1888,8 +1946,10 @@ def get_bank_account_by_courant_iban(iban: str):
         ).fetchone()
 
 
-def upsert_salary(order_id: int, character_id: int, montant: int, effective_start_date: str, added_at: str):
-    """Ajoute ou met à jour (montant + date d'effet) le salaire d'un personnage dans un ordre."""
+def upsert_salary(order_id: int, character_id: int, montant: int, effective_start_date: str, added_at: str,
+                  is_external: int = 0, expiry_date=None):
+    """Ajoute ou met à jour (montant + date d'effet) le salaire d'un personnage dans un ordre.
+    is_external=1 + expiry_date pour un IBAN hors des membres (salaire temporaire)."""
     with get_connection() as conn:
         existing = conn.execute(
             "SELECT id FROM order_salaries WHERE order_id = ? AND character_id = ?",
@@ -1897,14 +1957,15 @@ def upsert_salary(order_id: int, character_id: int, montant: int, effective_star
         ).fetchone()
         if existing:
             conn.execute(
-                "UPDATE order_salaries SET montant = ?, effective_start_date = ?, added_at = ? WHERE id = ?",
-                (montant, effective_start_date, added_at, existing["id"]),
+                "UPDATE order_salaries SET montant = ?, effective_start_date = ?, added_at = ?, "
+                "is_external = ?, expiry_date = ? WHERE id = ?",
+                (montant, effective_start_date, added_at, is_external, expiry_date, existing["id"]),
             )
         else:
             conn.execute(
-                "INSERT INTO order_salaries (order_id, character_id, montant, effective_start_date, added_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (order_id, character_id, montant, effective_start_date, added_at),
+                "INSERT INTO order_salaries (order_id, character_id, montant, effective_start_date, "
+                "added_at, is_external, expiry_date) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (order_id, character_id, montant, effective_start_date, added_at, is_external, expiry_date),
             )
 
 
@@ -1914,6 +1975,33 @@ def get_salary(order_id: int, character_id: int):
             "SELECT * FROM order_salaries WHERE order_id = ? AND character_id = ?",
             (order_id, character_id),
         ).fetchone()
+
+
+def get_salary_by_id(salary_id: int):
+    with get_connection() as conn:
+        return conn.execute("SELECT * FROM order_salaries WHERE id = ?", (salary_id,)).fetchone()
+
+
+def update_salary_expiry(salary_id: int, expiry_date):
+    """Repousse la date d'expiration d'un salaire externe (renouvellement)."""
+    with get_connection() as conn:
+        conn.execute("UPDATE order_salaries SET expiry_date = ? WHERE id = ?", (expiry_date, salary_id))
+
+
+def delete_salary_by_id(salary_id: int):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM order_salaries WHERE id = ?", (salary_id,))
+
+
+def get_expired_external_salaries(now_iso: str):
+    """Salaires externes (is_external=1) dont la date d'expiration est atteinte. Sert au rappel quotidien
+    (DM au chef : Annuler / Renouveler)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM order_salaries WHERE is_external = 1 AND expiry_date IS NOT NULL "
+            "AND expiry_date <= ? ORDER BY id ASC",
+            (now_iso,),
+        ).fetchall()
 
 
 def remove_salary(order_id: int, character_id: int):

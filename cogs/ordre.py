@@ -429,6 +429,20 @@ class ContratOfferView(discord.ui.View):
             custom_id=f"ordre_contrat_refuse:{batch_id}"))
 
 
+class ExternalSalaryExpiryView(discord.ui.View):
+    """DM au chef quand un salaire externe arrive à terme : Annuler (retrait définitif) ou Renouveler
+    (nouvelle durée). Persistant : l'id de la ligne order_salaries suffit à tout retrouver."""
+
+    def __init__(self, salary_id):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Annuler", emoji="❌", style=discord.ButtonStyle.danger,
+            custom_id=f"ordre_salext_cancel:{salary_id}"))
+        self.add_item(discord.ui.Button(
+            label="Renouveler", emoji="🔄", style=discord.ButtonStyle.success,
+            custom_id=f"ordre_salext_renew:{salary_id}"))
+
+
 class OrdreStaffView(discord.ui.View):
     """Sous la pillow du staff : pagination (ligne 0, seulement si plusieurs pages, page encodée dans
     le custom_id) + actions Ajouter / Virer / Muter (ligne 1)."""
@@ -551,6 +565,8 @@ class Ordre(commands.Cog):
                                             # (évite de le renvoyer chaque jour tant que le chef n'a pas répondu)
         self._contract_lock = set()  # anti double-clic sur l'acceptation/refus d'un lot de contrats (par batch_id)
         self._contract_timeout_tasks = set()  # tâches de timeout (2 min) des propositions de contrat en attente
+        self._ext_salary_prompt_pending = set()  # salaires externes déjà notifiés au chef (évite le rappel quotidien)
+        self._contracts_resumed = False  # garde : reprise des minuteries de contrat une seule fois au démarrage
 
     async def cog_load(self):
         # Tâche planifiée UNIQUE (présence des chefs + expiration des locations + cycle hebdomadaire
@@ -560,6 +576,18 @@ class Ordre(commands.Cog):
 
     async def cog_unload(self):
         self.ordre_scheduler.cancel()
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        # Reprise UNE SEULE FOIS (on_ready peut se redéclencher lors des reconnexions) des minuteries de
+        # proposition de contrat encore en attente après un redémarrage.
+        if self._contracts_resumed:
+            return
+        self._contracts_resumed = True
+        try:
+            await self.resume_pending_contract_timeouts()
+        except Exception as e:
+            print(f"[ordre] resume_pending_contract_timeouts : {e}")
 
     # ---------- verrou de flux ----------
     def _acquire(self, user_id) -> bool:
@@ -815,6 +843,10 @@ class Ordre(commands.Cog):
             await self.handle_lock_keep(interaction, cid)
         elif cid.startswith("ordre_lockoff:"):
             await self.handle_lock_off(interaction, cid)
+        elif cid.startswith("ordre_salext_cancel:"):
+            await self.handle_salext_cancel(interaction, cid)
+        elif cid.startswith("ordre_salext_renew:"):
+            await self.handle_salext_renew(interaction, cid)
 
     # =================================================================
     # CRÉATION D'UN ORDRE
@@ -832,6 +864,14 @@ class Ordre(commands.Cog):
         character_id, user_id = int(character_id), int(user_id)
         if interaction.user.id != user_id:
             await interaction.response.send_message("Ce panneau ne t'appartient pas.", ephemeral=True)
+            return
+        # Un personnage ne peut diriger qu'un seul ordre à la fois (vérifié AVANT le ban de création).
+        existing_order = db.get_order_by_chief(character_id)
+        if existing_order:
+            await interaction.response.edit_message(view=None)
+            await interaction.channel.send(
+                f"❌ Ce personnage est déjà chef de l'ordre {existing_order['name']}. Un personnage ne "
+                "peut diriger qu'un seul ordre à la fois.")
             return
         # Bannissement de création après dissolution d'un précédent ordre pour trésorerie négative.
         ban = db.get_chief_ban(user_id)
@@ -1384,19 +1424,21 @@ class Ordre(commands.Cog):
             dm_message = await member.send(embed=embed, view=ContratOfferView(batch_id))
         except discord.HTTPException:
             pass
-        # Timer de 2 minutes : tâche différée (référence conservée pour éviter le ramasse-miettes).
-        # TODO : si le bot redémarre pendant la fenêtre de 2 minutes, ce contrat resterait bloqué en
-        # 'pending' indéfiniment sans jamais expirer. Pas critique (rien n'est débité tant que pending),
-        # mais à améliorer plus tard avec une vérification au démarrage ou dans ordre_scheduler si besoin.
+        # Timer de 2 minutes : tâche différée (référence conservée pour éviter le ramasse-miettes). Un
+        # redémarrage pendant la fenêtre est rattrapé par resume_pending_contract_timeouts() (au démarrage).
         task = asyncio.create_task(self._contract_offer_timeout(batch_id, dm_message))
         self._contract_timeout_tasks.add(task)
         task.add_done_callback(self._contract_timeout_tasks.discard)
 
-    async def _contract_offer_timeout(self, batch_id, dm_message):
-        """Après 2 minutes : si le lot est TOUJOURS 'pending' (statut relu en base, jamais mis en cache),
-        l'expire, prévient les deux parties et retire les boutons du DM. Si l'éducateur a déjà répondu
+    async def _contract_offer_timeout(self, batch_id, dm_message, delay=120):
+        """Attend `delay` secondes puis expire la proposition si elle est toujours en attente."""
+        await asyncio.sleep(delay)
+        await self._expire_contract_offer_if_pending(batch_id, dm_message)
+
+    async def _expire_contract_offer_if_pending(self, batch_id, dm_message):
+        """Si le lot est TOUJOURS 'pending' (statut relu en base, jamais mis en cache), l'expire, prévient
+        les deux parties et retire les boutons du DM (si retrouvable). Si l'éducateur a déjà répondu
         (active / refused) entre-temps, ne fait rien."""
-        await asyncio.sleep(120)
         # Ne pas écraser un traitement Accepter/Refuser en cours.
         if batch_id in self._contract_lock:
             return
@@ -1406,7 +1448,7 @@ class Ordre(commands.Cog):
         db.set_batch_expired(batch_id)
         educator_cid = contracts[0]["educator_character_id"]
         employer = db.get_order(contracts[0]["employer_order_id"])
-        # Retire les boutons du DM d'origine et signale l'expiration dans le message même.
+        # Retire les boutons du DM d'origine et signale l'expiration dans le message même (si retrouvable).
         if dm_message is not None:
             try:
                 await dm_message.edit(content="⏱️ Cette proposition a expiré.", view=None)
@@ -1422,6 +1464,29 @@ class Ordre(commands.Cog):
                 None, employer["chef_character_id"],
                 "⏱️ L'éducateur n'a pas répondu à temps (2 minutes), la proposition de contrat a expiré. "
                 "Tu peux recommencer si besoin.")
+
+    async def resume_pending_contract_timeouts(self):
+        """Au démarrage : rattrape les propositions encore 'pending' dont la minuterie de 2 min a été
+        perdue par un redémarrage. Regroupe par lot ; pour chaque lot, si 120 s se sont déjà écoulées
+        depuis le plus ancien created_at → expiration immédiate, sinon relance une tâche pour le temps
+        restant. Le DM d'origine n'étant pas retrouvable après redémarrage, l'édition du message est
+        simplement sautée (les DM d'expiration, eux, partent bien)."""
+        rows = db.get_all_pending_contracts()
+        by_batch = {}
+        for r in rows:
+            by_batch.setdefault(r["batch_id"], []).append(r)
+        now_dt = datetime.fromisoformat(_now())
+        for batch_id, crows in by_batch.items():
+            oldest = min(c["created_at"] for c in crows if c["created_at"]) if any(
+                c["created_at"] for c in crows) else None
+            elapsed = (now_dt - datetime.fromisoformat(oldest)).total_seconds() if oldest else 120
+            if elapsed >= 120:
+                await self._expire_contract_offer_if_pending(batch_id, None)
+            else:
+                task = asyncio.create_task(
+                    self._contract_offer_timeout(batch_id, None, delay=120 - elapsed))
+                self._contract_timeout_tasks.add(task)
+                task.add_done_callback(self._contract_timeout_tasks.discard)
 
     async def handle_contrat_refuse(self, interaction, cid):
         batch_id = cid.split(":", 1)[1]
@@ -2622,15 +2687,60 @@ class Ordre(commands.Cog):
                 return
             eff = self._next_monday_or_today()
             now = _now()
-            recap = []
+            recap = []  # dicts : {cid, montant, updated, state, days}
             for character_id, montant in parsed:
+                # 1) Appartenance de l'IBAN : le personnage est-il membre de l'ordre ?
+                if db.get_order_member(order_id, character_id) is not None:
+                    # 2) Membre : comportement inchangé (is_external=0, expiry=NULL).
+                    existing = db.get_salary(order_id, character_id)
+                    db.upsert_salary(order_id, character_id, montant, eff, now)
+                    recap.append({"cid": character_id, "montant": montant,
+                                  "updated": existing is not None, "state": "member", "days": None})
+                    continue
+                # 3) Externe : confirmation explicite (embed + boutons), puis durée 7-30 j si confirmé.
+                char = get_character(character_id)
+                name = char["character_name"] if char and char["character_name"] else "?"
+                mention = f"<@{char['user_id']}>" if char else "?"
+                acct = get_account(character_id)
+                iban = acct["iban_courant"] if acct else "?"
+                confirm = TwoChoiceView(
+                    interaction.user.id, "✅ Confirmer", "yes", "❌ Refuser", "no",
+                    a_style=discord.ButtonStyle.success, b_style=discord.ButtonStyle.danger)
+                await channel.send(
+                    embed=discord.Embed(
+                        description=(f"⚠️ L'IBAN {iban} n'appartient pas à un membre de cet ordre "
+                                     f"({name} — {mention}). Confirmer quand même ?"),
+                        color=discord.Color.orange()),
+                    view=confirm)
+                await confirm.wait()
+                if confirm.result != "yes":
+                    # Refusé (ou délai) : cet IBAN est retiré du lot, les autres continuent.
+                    recap.append({"cid": character_id, "montant": montant,
+                                  "updated": None, "state": "refused", "days": None})
+                    continue
+                days = await self._ask_int_range(
+                    channel, interaction.user, "Pour combien de jours ? (minimum 7, maximum 30)", 7, 30)
+                if days is None:
+                    recap.append({"cid": character_id, "montant": montant,
+                                  "updated": None, "state": "refused", "days": None})
+                    continue
+                expiry = (datetime.fromisoformat(now) + timedelta(days=days)).isoformat()
                 existing = db.get_salary(order_id, character_id)
-                db.upsert_salary(order_id, character_id, montant, eff, now)
-                recap.append((character_id, montant, existing is not None))
+                db.upsert_salary(order_id, character_id, montant, eff, now, is_external=1, expiry_date=expiry)
+                recap.append({"cid": character_id, "montant": montant,
+                              "updated": existing is not None, "state": "external", "days": days})
+
             lines = []
-            for character_id, montant, updated in recap:
-                verbe = "mis à jour" if updated else "ajouté"
-                lines.append(f"• **{self._char_name(character_id)}** — {_fmt(montant)} ¥ ({verbe})")
+            for r in recap:
+                nom = self._char_name(r["cid"])
+                if r["state"] == "refused":
+                    lines.append(f"• **{nom}** — ignoré (IBAN externe non confirmé)")
+                    continue
+                verbe = "mis à jour" if r["updated"] else "ajouté"
+                if r["state"] == "external":
+                    lines.append(f"• **{nom}** — {_fmt(r['montant'])} ¥ ({verbe}, ⚠️ externe {r['days']} j)")
+                else:
+                    lines.append(f"• **{nom}** — {_fmt(r['montant'])} ¥ ({verbe})")
             await channel.send(embed=discord.Embed(
                 title="✅ Salaires enregistrés",
                 description="\n".join(lines) + f"\n\n📅 Entrée en vigueur : **{_fmt_date(eff)}**.",
@@ -2751,6 +2861,54 @@ class Ordre(commands.Cog):
         await interaction.response.edit_message(
             content="🔓 Verrou désactivé. Les dépenses de l'ordre sont de nouveau possibles.", view=None)
 
+    # ---------- boutons du DM d'expiration d'un salaire externe ----------
+    async def handle_salext_cancel(self, interaction, cid):
+        salary_id = int(cid.split(":")[1])
+        row = db.get_salary_by_id(salary_id)
+        if row is None:
+            await interaction.response.edit_message(
+                content="Ce salaire externe n'existe plus.", view=None)
+            return
+        if not self._is_chief(row["order_id"], interaction.user.id):
+            await interaction.response.send_message("Ce panneau ne t'appartient pas.", ephemeral=True)
+            return
+        db.delete_salary_by_id(salary_id)
+        self._ext_salary_prompt_pending.discard(salary_id)
+        await interaction.response.edit_message(
+            content=f"❌ Salaire externe de **{self._char_name(row['character_id'])}** retiré "
+                    "définitivement. Tu devras le remettre manuellement si tu le souhaites.", view=None)
+
+    async def handle_salext_renew(self, interaction, cid):
+        salary_id = int(cid.split(":")[1])
+        row = db.get_salary_by_id(salary_id)
+        if row is None:
+            await interaction.response.edit_message(
+                content="Ce salaire externe n'existe plus.", view=None)
+            return
+        if not self._is_chief(row["order_id"], interaction.user.id):
+            await interaction.response.send_message("Ce panneau ne t'appartient pas.", ephemeral=True)
+            return
+        if not self._acquire(interaction.user.id):
+            await interaction.response.send_message(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True)
+            return
+        try:
+            await interaction.response.edit_message(content="🔄 Renouvellement du salaire externe…", view=None)
+            channel = interaction.channel  # DM : wait_message filtre déjà par auteur + salon
+            days = await self._ask_int_range(
+                channel, interaction.user, "Pour combien de jours ? (minimum 7, maximum 30)", 7, 30)
+            if days is None:
+                await channel.send("⏳ Renouvellement annulé.")
+                return
+            new_expiry = (datetime.fromisoformat(_now()) + timedelta(days=days)).isoformat()
+            db.update_salary_expiry(salary_id, new_expiry)
+            self._ext_salary_prompt_pending.discard(salary_id)
+            await channel.send(embed=discord.Embed(
+                description=f"✅ Salaire externe de **{self._char_name(row['character_id'])}** renouvelé "
+                            f"pour **{days} jour(s)**.", color=PHOENIX_COLOR))
+        finally:
+            self._release(interaction.user.id)
+
     # =================================================================
     # TÂCHE PLANIFIÉE UNIQUE : présence des chefs + expiration + cycle hebdo + verrous
     # =================================================================
@@ -2769,12 +2927,17 @@ class Ordre(commands.Cog):
         for guild in self.bot.guilds:
             # Dissolution des ordres dont le chef a quitté (à chacun des 4 créneaux, comme avant).
             await self._dissolve_absent_chiefs(guild)
+            # Présence des disciples sous contrat : à CHAQUE créneau (4-5x/jour), pas seulement à minuit.
+            await self._check_contract_disciples_presence(guild)
 
             # Bloc de minuit uniquement.
             if now_paris.hour == 0:
                 # 1) Expiration des locations D'ABORD (avant tout calcul de taxe/loyer) : un salon dont la
                 #    location expire ce jour redevient 'Acheté' et sera donc taxé plutôt que loué.
                 await self._expire_locations(guild)
+
+                # 1bis) Salaires externes arrivés à terme : DM au chef (Annuler / Renouveler).
+                await self._expire_external_salaries(guild)
 
                 # 2) Le lundi, une SEULE fois par lundi : cycle hebdomadaire (taxe + salaires).
                 #    Idempotence garantie par bot_state : un redémarrage le même lundi ne rejoue rien.
@@ -2818,6 +2981,72 @@ class Ordre(commands.Cog):
                     await self.dissolve_order_chief_departed(order["id"], guild)
                 except Exception as e:  # un ordre en erreur ne doit pas bloquer les autres
                     print(f"[ordre_scheduler] échec dissolution ordre {order['id']} : {e}")
+
+    async def _check_contract_disciples_presence(self, guild):
+        """Filet de sécurité (4-5x/jour) : clôt les contrats actifs dont le disciple n'est plus présent
+        dans son ordre (viré/parti sans passer par les flux déjà gérés).
+
+        NB DÉVIATION vs libellé de la consigne : dans ce projet, un disciple sous contrat n'est JAMAIS
+        ajouté à order_members de l'ordre EMPLOYEUR (il reste « Membre d'équipe » de son ordre ÉDUCATIF
+        d'origine = source_order_id ; l'acceptation d'un contrat n'insère aucun membre côté employeur).
+        Vérifier l'appartenance à l'employeur clôturerait donc TOUS les contrats. On vérifie l'appartenance
+        à l'ordre source (là où le disciple existe réellement) ; les DM référencent cet ordre."""
+        for c in db.get_all_active_contracts():
+            # Filtrage par serveur via l'ordre employeur (comme _expire_contracts), fallback sur la source.
+            ref = db.get_order(c["employer_order_id"]) or db.get_order(c["source_order_id"])
+            chef = get_character(ref["chef_character_id"]) if ref else None
+            if not chef or chef["guild_id"] != guild.id:
+                continue  # autre serveur : traité lors de son itération
+            if db.get_order_member(c["source_order_id"], c["disciple_character_id"]) is not None:
+                continue  # toujours membre de son ordre d'origine : contrat maintenu
+            db.end_contract(c["id"])
+            source = db.get_order(c["source_order_id"])
+            source_name = source["name"] if source else "?"
+            disc_name = self._char_name(c["disciple_character_id"])
+            msg = (f"📋 Le contrat de {disc_name} a pris fin : il n'est plus membre de l'ordre "
+                   f"{source_name}.")
+            await self._dm_character_owner(guild, c["disciple_character_id"], msg)
+            await self._dm_character_owner(guild, c["educator_character_id"], msg)
+            employer = db.get_order(c["employer_order_id"])
+            if employer:
+                await self._dm_character_owner(guild, employer["chef_character_id"], msg)
+
+    async def _expire_external_salaries(self, guild):
+        """Salaires externes (is_external=1) arrivés à terme : DM au chef de l'ordre avec « ❌ Annuler » /
+        « 🔄 Renouveler ». Dédoublonnage en mémoire (_ext_salary_prompt_pending) pour ne pas re-notifier
+        chaque nuit tant que le chef n'a pas tranché (remis à zéro à la reprise ou après action)."""
+        for row in db.get_expired_external_salaries(_now()):
+            order = db.get_order(row["order_id"])
+            chef = get_character(order["chef_character_id"]) if order else None
+            if not chef or chef["guild_id"] != guild.id:
+                continue  # autre serveur
+            if row["id"] in self._ext_salary_prompt_pending:
+                continue  # déjà notifié, en attente de décision du chef
+            char = get_character(row["character_id"])
+            name = char["character_name"] if char and char["character_name"] else "?"
+            pseudo = f"<@{char['user_id']}>" if char else "?"
+            self._ext_salary_prompt_pending.add(row["id"])
+            await self._dm_character_owner_view(
+                guild, order["chef_character_id"],
+                f"📋 Le salaire externe de {name} ({pseudo}) arrive à terme.",
+                ExternalSalaryExpiryView(row["id"]))
+
+    async def _dm_character_owner_view(self, guild, character_id, content, view):
+        """Comme _dm_character_owner mais avec une View (boutons persistants). Silencieux en cas d'échec."""
+        char = get_character(character_id)
+        if not char:
+            return
+        uid = char["user_id"]
+        member = guild.get_member(uid) if guild else None
+        if member is None:
+            try:
+                member = await self.bot.fetch_user(uid)
+            except discord.HTTPException:
+                return
+        try:
+            await member.send(content, view=view)
+        except discord.HTTPException:
+            pass
 
     async def _expire_locations(self, guild):
         """Résilie les locations DU SERVEUR arrivées à terme : le salon redevient 'Acheté' chez le
@@ -3247,12 +3476,13 @@ class Ordre(commands.Cog):
         buyer_name = buyer_order["name"] if buyer_order else "?"
         final = []
         for ch in batch:
-            rows = db.get_all_salon_rows(ch.id)
-            if not rows:
-                final.append(ch)  # salon libre : achat direct, aucun avertissement
+            # Résolution SANS AMBIGUÏTÉ du vrai propriétaire : seule une ligne 'Acheté'/'Location' fait
+            # foi (une 'Louée' n'est qu'un miroir chez l'emprunteur, jamais autoritaire).
+            owner_row = db.resolve_salon_true_owner(ch.id)
+            if owner_row is None:
+                final.append(ch)  # aucun propriétaire réel : salon libre, achat direct sans avertissement
                 continue
-            # Possesseur affiché : la ligne de propriété ('Acheté' ou 'Location'), sinon la 1re trouvée.
-            owner_row = next((r for r in rows if r["status"] in ("Acheté", "Location")), rows[0])
+            rows = db.get_all_salon_rows(ch.id)  # toutes les lignes, pour le nettoyage croisé à la conquête
             owner_order = db.get_order(owner_row["order_id"])
             owner_name = owner_order["name"] if owner_order else "un autre ordre"
             view = TwoChoiceView(
@@ -3276,12 +3506,13 @@ class Ordre(commands.Cog):
         return final
 
     async def _conquer_salon(self, ch, rows, owner_row, buyer_order_id, buyer_name):
-        """Retire un salon à son ordre actuel avant de le réattribuer à l'acheteur : DM au possesseur
-        (perte de propriété) et, si le salon était en location, à la contrepartie liée (fin de location,
-        même nettoyage croisé que dissolve_order()), puis suppression de TOUTES ses lignes."""
+        """Retire un salon à son VRAI propriétaire (owner_row, résolu via resolve_salon_true_owner) avant
+        de le réattribuer à l'acheteur : DM au propriétaire (perte de propriété) et, si le salon était en
+        'Location' (prêté), rupture explicite du prêt (miroir 'Louée' supprimé + DM à l'emprunteur), puis
+        suppression de TOUTES ses lignes (nettoyage croisé identique à dissolve_order())."""
         guild = getattr(ch, "guild", None)
         dmed = set()
-        # 1) Possesseur actuel : perte de propriété (sauf si c'est déjà l'acheteur).
+        # 1) Vrai propriétaire : perte de propriété (sauf si c'est déjà l'acheteur).
         owner_oid = owner_row["order_id"]
         if owner_oid and owner_oid != buyer_order_id:
             owner_order = db.get_order(owner_oid)
@@ -3290,7 +3521,20 @@ class Ordre(commands.Cog):
                     guild, owner_order["chef_character_id"],
                     f"⚠️ Le salon #{ch.name} de votre ordre a été conquis par l'ordre **{buyer_name}**.")
                 dmed.add(owner_oid)
-        # 2) Contreparties de location (fin de location) : pour chaque ligne liée à un autre ordre.
+        # 2) Le vrai propriétaire prêtait ce salon ('Location') : le prêt est rompu par la conquête —
+        #    on supprime la ligne miroir 'Louée' chez l'emprunteur et on le prévient.
+        if owner_row["status"] == "Location" and owner_row["linked_order_id"]:
+            tenant_id = owner_row["linked_order_id"]
+            db.remove_order_salon_any(tenant_id, ch.id)  # supprime le miroir 'Louée'
+            if tenant_id not in dmed and tenant_id != buyer_order_id:
+                tenant = db.get_order(tenant_id)
+                if tenant:
+                    await self._dm_character_owner(
+                        guild, tenant["chef_character_id"],
+                        f"⚠️ Le salon #{ch.name} que vous aviez en location a été conquis par un autre "
+                        "ordre, cette location a pris fin immédiatement.")
+                    dmed.add(tenant_id)
+        # 3) Filet de sécurité : toute autre contrepartie liée encore présente est prévenue une seule fois.
         for r in rows:
             linked_id = r["linked_order_id"]
             if r["status"] in ("Location", "Louée") and linked_id \
@@ -3303,7 +3547,8 @@ class Ordre(commands.Cog):
                         f"⚠️ Le salon #{ch.name} que vous {verbe} a été conquis par un autre ordre, "
                         "cette location a pris fin.")
                     dmed.add(linked_id)
-        # 3) Suppression de toutes les lignes du salon (chez tous les ordres concernés).
+        # 4) Suppression de TOUTES les lignes du salon (chez tous les ordres concernés), y compris celle
+        #    du vrai propriétaire (Acheté ou Location).
         db.delete_salon_everywhere(ch.id)
 
     # =================================================================
