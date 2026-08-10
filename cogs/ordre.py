@@ -433,7 +433,7 @@ class OrdreStaffView(discord.ui.View):
     """Sous la pillow du staff : pagination (ligne 0, seulement si plusieurs pages, page encodée dans
     le custom_id) + actions Ajouter / Virer / Muter (ligne 1)."""
 
-    def __init__(self, order_id, user_id, page=1, total_pages=1):
+    def __init__(self, order_id, user_id, page=1, total_pages=1, is_educatif=False):
         super().__init__(timeout=None)
         if total_pages > 1:
             self.add_item(discord.ui.Button(
@@ -451,6 +451,11 @@ class OrdreStaffView(discord.ui.View):
         self.add_item(discord.ui.Button(
             label="Muter", emoji="🔄", style=discord.ButtonStyle.primary,
             custom_id=f"ordre_staff_mute:{order_id}:{user_id}", row=1))
+        # Gestion manuelle des disciples : réservée aux ordres éducatifs (le bouton n'apparaît qu'eux).
+        if is_educatif:
+            self.add_item(discord.ui.Button(
+                label="Gérer le staff", emoji="🎓", style=discord.ButtonStyle.secondary,
+                custom_id=f"ordre_staff_manage:{order_id}:{user_id}", row=2))
 
 
 # --- Banque de l'ordre (réutilise le principe du clavier PIN de /banque) ---
@@ -746,6 +751,8 @@ class Ordre(commands.Cog):
             await self.handle_staff_fire(interaction, cid)
         elif cid.startswith("ordre_staff_mute:"):
             await self.handle_staff_mute(interaction, cid)
+        elif cid.startswith("ordre_staff_manage:"):
+            await self.handle_staff_manage(interaction, cid)
         elif cid.startswith("ordre_staff_prev:"):
             await self.handle_staff_page(interaction, cid, "prev")
         elif cid.startswith("ordre_staff_next:"):
@@ -1811,7 +1818,8 @@ class Ordre(commands.Cog):
         path = _tmp("staff")
         path, total_pages = generate_staff_image(order["name"], members, page, path)
         # La View porte toujours les actions (Ajouter/Virer/Muter) ; la pagination n'apparaît que si >1 page.
-        view = OrdreStaffView(order_id, user_id, max(1, min(page, total_pages)), total_pages)
+        view = OrdreStaffView(order_id, user_id, max(1, min(page, total_pages)), total_pages,
+                              is_educatif=(order["type"] == "educatif"))
         await channel.send(file=discord.File(path, filename="staff.png"), view=view)
         _rm(path)
 
@@ -1834,7 +1842,8 @@ class Ordre(commands.Cog):
         path = _tmp("staff")
         path, total_pages = generate_staff_image(order["name"], members, new_page, path)
         clamped = max(1, min(new_page, total_pages))
-        view = OrdreStaffView(order_id, user_id, clamped, total_pages)
+        view = OrdreStaffView(order_id, user_id, clamped, total_pages,
+                              is_educatif=(order["type"] == "educatif"))
         await interaction.response.edit_message(
             attachments=[discord.File(path, filename="staff.png")], view=view)
         _rm(path)
@@ -2046,6 +2055,165 @@ class Ordre(commands.Cog):
             await self._send_staff(channel, order_id, interaction.user.id, 1)
         finally:
             self._release(interaction.user.id)
+
+    # =================================================================
+    # « 🎓 GÉRER LE STAFF » — gestion manuelle des disciples (ordres éducatifs)
+    # =================================================================
+    async def handle_staff_manage(self, interaction, cid):
+        _, order_id, user_id = cid.split(":")
+        order_id = int(order_id)
+        # Chef uniquement + ordre éducatif uniquement (le bouton n'apparaît qu'ici, mais on revérifie).
+        if not self._is_chief(order_id, interaction.user.id):
+            await interaction.response.send_message("Seul le chef de l'ordre peut faire ça.", ephemeral=True)
+            return
+        order = db.get_order(order_id)
+        if not order or order["type"] != "educatif":
+            await interaction.response.send_message(
+                "🎓 Ce menu n'existe que pour les ordres éducatifs.", ephemeral=True)
+            return
+        if not self._acquire(interaction.user.id):
+            await interaction.response.send_message(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True)
+            return
+        try:
+            await interaction.response.send_message("🎓 Gestion du staff…", ephemeral=True)
+            channel, user, guild = interaction.channel, interaction.user, interaction.channel.guild
+            # Menu principal NUMÉROTÉ (extensible : garder la structure même avec une seule option).
+            options = [("Gérer les disciples", "disciples")]
+            lines = [f"**{i}.** {lbl}" for i, (lbl, _) in enumerate(options, 1)]
+            await channel.send(embed=discord.Embed(
+                title="🎓 Gestion du staff",
+                description="Que veux-tu faire ?\n\n" + "\n".join(lines) + "\n\nRéponds par le **numéro**.",
+                color=PHOENIX_COLOR))
+            idx = await self._ask_int_range(channel, user, None, 1, len(options))
+            if idx is None:
+                await channel.send("⏳ Annulé.")
+                return
+            if options[idx - 1][1] == "disciples":
+                await self._manage_disciples_flow(channel, user, guild, order)
+        finally:
+            self._release(interaction.user.id)
+
+    async def _manage_disciples_flow(self, channel, user, guild, order):
+        """Option « Gérer les disciples » : choisir un disciple puis « 🔄 Changer d'éducateur » / « ❌ Virer »."""
+        order_id = order["id"]
+        disciples = db.get_disciples_of_order(order_id)
+        if not disciples:
+            await channel.send("Aucun disciple à gérer pour l'instant.")
+            return
+        options = [(self._char_name(d["disciple_character_id"]), str(d["disciple_character_id"]))
+                   for d in disciples]
+        # Menu déroulant si < 10, sinon liste numérotée (convention du cog, gérée par _pick_from_list).
+        disc_val = await self._pick_from_list(channel, user, options, "Quel disciple veux-tu gérer ?")
+        if disc_val is None:
+            await channel.send("⏳ Annulé.")
+            return
+        disciple_cid = int(disc_val)
+        disc_name = self._char_name(disciple_cid)
+
+        av = TwoChoiceView(user.id, "🔄 Changer d'éducateur", "change", "❌ Virer", "fire",
+                           a_style=discord.ButtonStyle.primary, b_style=discord.ButtonStyle.danger)
+        await channel.send(
+            embed=discord.Embed(description=f"Que veux-tu faire avec **{disc_name}** ?", color=PHOENIX_COLOR),
+            view=av)
+        await av.wait()
+        if av.result is None:
+            await channel.send("⏳ Annulé.")
+            return
+        if av.result == "fire":
+            # Réutilise EXACTEMENT la mécanique du clic « ➖ Virer » (via la fonction partagée).
+            await self._fire_disciple_from_educatif(order_id, disciple_cid, order["name"], guild)
+            await channel.send(embed=discord.Embed(
+                description=f"✅ {disc_name} a été retiré de l'ordre.", color=PHOENIX_COLOR))
+            await self._send_staff(channel, order_id, user.id, 1)
+        else:
+            await self._change_disciple_educator_flow(channel, user, guild, order, disciple_cid)
+
+    async def _change_disciple_educator_flow(self, channel, user, guild, order, disciple_cid):
+        """« 🔄 Changer d'éducateur » : liste des formateurs + le chef (« … (Chef) »), moins l'éducateur
+        actuel ; réassigne, transfère les contrats actifs, ré-oriente les propositions pending, notifie."""
+        order_id = order["id"]
+        disc_name = self._char_name(disciple_cid)
+        old_educ = db.get_disciple_educator(order_id, disciple_cid)
+
+        # Formateurs de l'ordre + le chef (référent possible), en retirant l'éducateur actuel.
+        candidates = []  # (label, character_id)
+        for f in db.get_order_members_by_role(order_id, "Formateur"):
+            prenom = (f["character_name"] or "?").split()[0] if f["character_name"] else "?"
+            candidates.append((prenom, f["character_id"]))
+        chef_cid = order["chef_character_id"]
+        chef_prenom = (self._char_name(chef_cid) or "?").split()[0]
+        candidates.append((f"{chef_prenom} (Chef)", chef_cid))
+        candidates = [(lbl, c) for lbl, c in candidates if c != old_educ]
+        if not candidates:
+            await channel.send("Aucun autre éducateur disponible vers qui réassigner ce disciple.")
+            return
+
+        options = [(lbl, str(c)) for lbl, c in candidates]
+        new_val = await self._pick_from_list(
+            channel, user, options, f"Vers quel éducateur veux-tu envoyer {disc_name} ?")
+        if new_val is None:
+            await channel.send("⏳ Annulé.")
+            return
+        new_educ = int(new_val)
+
+        # b) Réassignation. c) Contrats actifs -> nouvel éducateur (helper existant).
+        db.set_disciple_educator(order_id, disciple_cid, new_educ)
+        db.transfer_active_contracts_educator(disciple_cid, old_educ, new_educ)
+
+        # d) Propositions PENDING de ce disciple auprès de l'ancien éducateur : re-scindées vers le nouveau
+        #    (même principe que _reassign_pending_contract_offers, ciblé sur ce disciple et le choix manuel).
+        pending = db.get_pending_contracts_of_disciple_and_educator(disciple_cid, old_educ)
+        had_pending = bool(pending)
+        employer_ids = set()
+        by_batch = {}
+        for r in pending:
+            by_batch.setdefault(r["batch_id"], []).append(r)
+        for old_batch, rows in by_batch.items():
+            new_batch_id = uuid.uuid4().hex
+            db.rebatch_pending_contracts([r["id"] for r in rows], new_batch_id, new_educ)
+            employer = db.get_order(rows[0]["employer_order_id"])
+            edu_order = db.get_order(rows[0]["source_order_id"])
+            employer_name = employer["name"] if employer else "?"
+            edu_order_name = edu_order["name"] if edu_order else order["name"]
+            batch = [{"disciple_cid": r["disciple_character_id"], "duree_type": r["duree_type"],
+                      "duree_value": r["duree_value"], "duree_unit": r["duree_unit"],
+                      "pct": r["pct"], "salaire_fixe": r["salaire_fixe"]} for r in rows]
+            await self._send_contract_offer(guild, new_batch_id, employer_name, edu_order_name, new_educ, batch)
+            employer_ids.add(rows[0]["employer_order_id"])
+
+        # e) Notifications.
+        active = db.get_active_contract_full_of_disciple(disciple_cid)
+        if active:
+            employer_ids.add(active["employer_order_id"])
+        # Ancien éducateur.
+        if old_educ is not None:
+            await self._dm_character_owner(
+                guild, old_educ,
+                f"📋 Ton disciple {disc_name} a été réassigné à un autre éducateur par le chef de l'ordre.")
+        # Nouvel éducateur (+ détails du contrat s'il existe).
+        new_dm = f"📋 Tu as un nouveau disciple : {disc_name}."
+        if active:
+            new_dm += (f" Un contrat est actif : {active['pct']}% d'un salaire fixe de "
+                       f"{_fmt(active['salaire_fixe'])} ¥/sem (durée {self._contract_duree_str(active)}).")
+        elif had_pending:
+            new_dm += " Une proposition de contrat vient de t'être transmise (à accepter ou refuser)."
+        await self._dm_character_owner(guild, new_educ, new_dm)
+        # Chef(s) de l'ordre employeur si un contrat actif OU pending existe.
+        for emp_id in employer_ids:
+            employer = db.get_order(emp_id)
+            if employer:
+                await self._dm_character_owner(
+                    guild, employer["chef_character_id"],
+                    f"📋 Le tuteur référent de {disc_name} a changé : "
+                    f"{self._mention_of_character(guild, old_educ)} → "
+                    f"{self._mention_of_character(guild, new_educ)}.")
+
+        # f) Confirmation au chef.
+        await channel.send(embed=discord.Embed(
+            description=f"✅ {disc_name} est désormais rattaché à **{self._char_name(new_educ)}**.",
+            color=PHOENIX_COLOR))
+        await self._send_staff(channel, order_id, user.id, 1)
 
     # ---------- redistribution des disciples d'un formateur retiré ----------
     def _char_name(self, character_id):
@@ -2339,9 +2507,10 @@ class Ordre(commands.Cog):
         db.end_contract(contract["id"])
 
     async def _end_disciple_source_contracts(self, disciple_cid, source_order_id, source_order_name, guild):
-        """Un disciple quitte son ordre éducatif d'ORIGINE (Virer / Muter hors « Membre d'équipe ») : TOUS
-        ses contrats actifs sourcés par cet ordre prennent fin. DM au disciple, à l'éducateur, et au chef
-        de l'ordre EMPLOYEUR (potentiellement différent de l'ordre éducatif)."""
+        """Un disciple quitte son ordre éducatif d'ORIGINE (Virer / Muter hors « Membre d'équipe » /
+        « 🎓 Gérer le staff ») : TOUS ses contrats ACTIFS sourcés par cet ordre prennent fin ET ses
+        propositions ENCORE 'pending' sont annulées (elles n'ont plus lieu d'être). DM au disciple, à
+        l'éducateur, et au chef de l'ordre EMPLOYEUR (potentiellement différent de l'ordre éducatif)."""
         disc_name = self._char_name(disciple_cid)
         for c in db.get_active_contracts_of_disciple_in_source(disciple_cid, source_order_id):
             db.end_contract(c["id"])
@@ -2361,6 +2530,32 @@ class Ordre(commands.Cog):
                     f"📋 {disc_name} n'est plus disciple de l'ordre éducatif {source_order_name}, son "
                     f"contrat avec {educ_name} a pris fin. Il peut rester dans votre ordre normalement, "
                     "mais sans contrat actif avec cet éducateur.")
+        # Propositions encore en attente : annulées (le disciple quitte l'ordre source, l'offre est caduque).
+        for c in db.get_pending_contracts_of_disciple_in_source(disciple_cid, source_order_id):
+            db.cancel_contract(c["id"])
+            educ_cid = c["educator_character_id"]
+            await self._dm_character_owner(
+                guild, educ_cid,
+                f"📋 La proposition de contrat concernant {disc_name} est annulée : il a quitté l'ordre "
+                f"éducatif {source_order_name}.")
+            employer = db.get_order(c["employer_order_id"])
+            if employer:
+                await self._dm_character_owner(
+                    guild, employer["chef_character_id"],
+                    f"📋 La proposition de contrat pour {disc_name} est annulée : il a quitté l'ordre "
+                    f"éducatif {source_order_name}.")
+
+    async def _fire_disciple_from_educatif(self, order_id, disciple_cid, order_name, guild):
+        """Retrait COMPLET d'un disciple d'un ordre éducatif — logique partagée entre le clic « ➖ Virer »
+        classique et « 🎓 Gérer le staff » (pas de duplication : la clôture des contrats + notifications
+        vit dans _end_disciple_source_contracts). Nettoie order_disciple_assignments, clôt ses contrats
+        actifs ET pending sourcés par cet ordre, puis le retire de order_members s'il y figure comme
+        « Membre d'équipe »."""
+        db.remove_disciple_assignment(order_id, disciple_cid)
+        await self._end_disciple_source_contracts(disciple_cid, order_id, order_name, guild)
+        member_row = db.get_order_member(order_id, disciple_cid)
+        if member_row and member_row["role_label"] == "Membre d'équipe":
+            db.remove_order_member(order_id, disciple_cid)
 
     async def handle_order_departure(self, character_id, guild, order_id_hint=None):
         """Regroupe les conséquences côté ordre du départ d'un personnage (éducateur ET disciple), pour

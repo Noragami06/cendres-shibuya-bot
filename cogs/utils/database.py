@@ -1575,6 +1575,39 @@ def set_assignment_educator(assignment_id: int, educator_character_id):
         )
 
 
+def get_disciples_of_order(order_id: int):
+    """Tous les disciples rattachés à l'ordre : lignes (disciple_character_id, educator_character_id).
+    Sert à la gestion manuelle des disciples (« 🎓 Gérer le staff »)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT disciple_character_id, educator_character_id FROM order_disciple_assignments "
+            "WHERE order_id = ? ORDER BY disciple_character_id",
+            (order_id,),
+        ).fetchall()
+
+
+def get_disciple_educator(order_id: int, disciple_character_id: int):
+    """Éducateur actuel d'un disciple dans l'ordre (character_id) ou None (non assigné / inconnu)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT educator_character_id FROM order_disciple_assignments "
+            "WHERE order_id = ? AND disciple_character_id = ?",
+            (order_id, disciple_character_id),
+        ).fetchone()
+    return row["educator_character_id"] if row else None
+
+
+def set_disciple_educator(order_id: int, disciple_character_id: int, educator_character_id):
+    """Change l'éducateur d'un disciple, ciblé par (ordre, disciple) — pratique pour la réassignation
+    manuelle où l'on n'a pas l'id de l'assignation sous la main."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE order_disciple_assignments SET educator_character_id = ? "
+            "WHERE order_id = ? AND disciple_character_id = ?",
+            (educator_character_id, order_id, disciple_character_id),
+        )
+
+
 def cleanup_educator_assignments(order_id: int, educator_character_id: int, keep_disciple_ids):
     """Filet de sécurité : supprime les assignations encore rattachées à un éducateur retiré, hors
     disciples déjà réassignés (keep_disciple_ids)."""
@@ -1756,6 +1789,46 @@ def get_active_contracts_of_disciple_in_source(disciple_character_id: int, sourc
             "AND status = 'active' ORDER BY id ASC",
             (disciple_character_id, source_order_id),
         ).fetchall()
+
+
+def get_pending_contracts_of_disciple_in_source(disciple_character_id: int, source_order_id: int):
+    """Propositions ENCORE 'pending' d'un disciple issues d'un ordre éducatif SOURCE précis (quitter cet
+    ordre annule aussi ces propositions non encore acceptées)."""
+    with get_connection() as conn:
+        if not _educator_contracts_exists(conn):
+            return []
+        return conn.execute(
+            "SELECT * FROM educator_contracts WHERE disciple_character_id = ? AND source_order_id = ? "
+            "AND status = 'pending' ORDER BY id ASC",
+            (disciple_character_id, source_order_id),
+        ).fetchall()
+
+
+def get_pending_contracts_of_disciple_and_educator(disciple_character_id: int, educator_character_id):
+    """Propositions ENCORE 'pending' d'un disciple auprès d'un éducateur donné (réassignation manuelle :
+    ces propositions suivent le disciple vers le nouvel éducateur). [] si aucun éducateur (None)."""
+    if educator_character_id is None:
+        return []
+    with get_connection() as conn:
+        if not _educator_contracts_exists(conn):
+            return []
+        return conn.execute(
+            "SELECT * FROM educator_contracts WHERE disciple_character_id = ? AND educator_character_id = ? "
+            "AND status = 'pending' ORDER BY batch_id, id",
+            (disciple_character_id, educator_character_id),
+        ).fetchall()
+
+
+def get_active_contract_full_of_disciple(disciple_character_id: int):
+    """Ligne COMPLÈTE du contrat actif d'un disciple (pour afficher les détails), ou None."""
+    with get_connection() as conn:
+        if not _educator_contracts_exists(conn):
+            return None
+        return conn.execute(
+            "SELECT * FROM educator_contracts WHERE disciple_character_id = ? AND status = 'active' "
+            "ORDER BY id DESC LIMIT 1",
+            (disciple_character_id,),
+        ).fetchone()
 
 
 def activate_contract(contract_id: int, start_date: str, end_date):
