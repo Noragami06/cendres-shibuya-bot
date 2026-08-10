@@ -1702,6 +1702,51 @@ def set_batch_expired(batch_id: str):
         )
 
 
+def cancel_contract(contract_id: int):
+    """Annule UN contrat précis (status='cancelled'). Sert aux vérifications réactives faites au moment
+    du clic « ✅ Accepter » (ordre employeur dissous / disciple disparu entre-temps)."""
+    with get_connection() as conn:
+        conn.execute("UPDATE educator_contracts SET status = 'cancelled' WHERE id = ?", (contract_id,))
+
+
+def set_batch_cancelled(batch_id: str):
+    """Annule tout un lot ENCORE en attente (status='cancelled'), p.ex. quand l'ordre employeur a été
+    dissous avant que l'éducateur ne réponde."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE educator_contracts SET status = 'cancelled' WHERE batch_id = ? AND status = 'pending'",
+            (batch_id,),
+        )
+
+
+def get_pending_contracts_of_educator(educator_character_id: int):
+    """Contrats ENCORE 'pending' dont cet éducateur est le référent (lignes complètes, triées par lot),
+    pour re-proposer la même offre au nouvel éducateur quand l'éducateur initial quitte son ordre.
+    [] si la table n'existe pas encore."""
+    with get_connection() as conn:
+        if not _educator_contracts_exists(conn):
+            return []
+        return conn.execute(
+            "SELECT * FROM educator_contracts WHERE educator_character_id = ? AND status = 'pending' "
+            "ORDER BY batch_id, id",
+            (educator_character_id,),
+        ).fetchall()
+
+
+def rebatch_pending_contracts(contract_ids, new_batch_id: str, new_educator_id: int):
+    """Déplace des contrats ENCORE 'pending' vers un nouveau lot ET un nouvel éducateur (suite au départ
+    de l'éducateur initialement proposé). Ne touche que les lignes encore 'pending' (idempotent si un
+    Accepter/Refuser est passé entre-temps)."""
+    if not contract_ids:
+        return
+    with get_connection() as conn:
+        conn.executemany(
+            "UPDATE educator_contracts SET batch_id = ?, educator_character_id = ? "
+            "WHERE id = ? AND status = 'pending'",
+            [(new_batch_id, new_educator_id, cid) for cid in contract_ids],
+        )
+
+
 def get_active_contracts_of_disciple_in_source(disciple_character_id: int, source_order_id: int):
     """Contrats ACTIFS d'un disciple issus d'un ordre éducatif SOURCE précis (quitter cet ordre éducatif
     met fin à ces contrats, quel que soit l'ordre employeur)."""

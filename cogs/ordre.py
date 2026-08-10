@@ -169,9 +169,19 @@ class SimpleSelectView(discord.ui.View):
 
 
 class TwoChoiceView(discord.ui.View):
-    """2 boutons renvoyant une valeur, avec anti double-clic (règle #6)."""
+    """2 boutons renvoyant une valeur, avec anti double-clic (règle #6).
 
-    def __init__(self, owner_id, a_label, a_value, b_label, b_value, a_style=discord.ButtonStyle.danger, b_style=discord.ButtonStyle.primary):
+    Anti-bug « Unknown interaction » (404, code 10062) : une interaction ne peut recevoir qu'UNE SEULE
+    réponse initiale (interaction.response.*). Le callback n'appelle donc `interaction.response.edit_message`
+    qu'à UN seul endroit, et une seule fois. Si cette fenêtre de réponse n'est plus disponible (déjà
+    répondue, ou token expiré → 10062), on retombe sur `interaction.message.edit(...)`, qui édite le message
+    via l'API message normale (indépendante du token d'interaction). On ne rappelle JAMAIS
+    `interaction.response.send_message` une seconde fois. De plus, le résultat est figé et la View est
+    arrêtée AVANT tout appel réseau, pour que `view.wait()` du flux appelant se débloque même si l'édition
+    échoue (sinon le flux resterait bloqué jusqu'au timeout)."""
+
+    def __init__(self, owner_id, a_label, a_value, b_label, b_value,
+                 a_style=discord.ButtonStyle.danger, b_style=discord.ButtonStyle.primary):
         super().__init__(timeout=WAIT_TIMEOUT)
         self.owner_id = owner_id
         self.result = None
@@ -183,23 +193,41 @@ class TwoChoiceView(discord.ui.View):
         self.add_item(a)
         self.add_item(b)
 
+    async def _freeze_message(self, interaction):
+        """Grise les boutons (état figé). UNE seule réponse d'interaction : `edit_message` si la fenêtre
+        de réponse est encore ouverte, sinon `interaction.message.edit` (repli sans le token)."""
+        for it in self.children:
+            it.disabled = True
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(view=self)   # 1re (et unique) réponse d'interaction
+                return
+        except discord.HTTPException:
+            pass  # token expiré/inconnu (10062) ou déjà répondue : on bascule sur l'édition directe
+        try:
+            await interaction.message.edit(view=self)                # édition via l'API message normale
+        except discord.HTTPException:
+            pass
+
     def _mk(self, value):
         async def cb(interaction):
             if interaction.user.id != self.owner_id:
                 await interaction.response.send_message("Ce choix ne t'appartient pas.", ephemeral=True)
                 return
             if self._done:
+                # Clic surnuméraire : on accuse réception sans re-répondre au message (jamais send_message).
                 try:
-                    await interaction.response.defer()
+                    if not interaction.response.is_done():
+                        await interaction.response.defer()
                 except discord.HTTPException:
                     pass
                 return
+            # On fige le résultat et on arrête la View AVANT tout appel réseau : ainsi view.wait() se
+            # débloque même si l'édition du message échoue.
             self._done = True
             self.result = value
-            for it in self.children:
-                it.disabled = True
-            await interaction.response.edit_message(view=self)
             self.stop()
+            await self._freeze_message(interaction)
         return cb
 
 
@@ -1443,22 +1471,49 @@ class Ordre(commands.Cog):
             return
         self._contract_lock.add(batch_id)
         try:
+            # Vérifications RÉACTIVES au moment du clic (pas de nettoyage proactif à la dissolution pour les
+            # 'pending', c'est voulu). NB : plus de contrôle « éducateur toujours Formateur » — la
+            # réassignation automatique garantit que celui qui reçoit l'offre est déjà le bon.
+            #
+            # (2b) L'ordre employeur a été dissous entre-temps : tout le lot (même employeur) est annulé.
+            employer = db.get_order(contracts[0]["employer_order_id"])
+            if not employer:
+                db.set_batch_cancelled(batch_id)
+                await interaction.response.edit_message(
+                    content="❌ Ce contrat a été annulé : l'ordre employeur a été dissous entre temps, "
+                            "impossible d'accepter.",
+                    embed=None, view=None)
+                return
             now = _now()
+            activated, missing = [], []
             for c in contracts:
+                # (2c) Le disciple n'existe plus (parti / supprimé) : on annule ce contrat précis.
+                if get_character(c["disciple_character_id"]) is None:
+                    db.cancel_contract(c["id"])
+                    missing.append(c)
+                    continue
                 end_date = None
                 if c["duree_type"] == "determine":
                     days = (c["duree_value"] or 0) * CONTRAT_UNIT_DAYS.get(c["duree_unit"], 1)
                     end_date = (datetime.fromisoformat(now) + timedelta(days=days)).isoformat()
                 db.activate_contract(c["id"], now, end_date)
+                activated.append(c)
+
+            # Aucun contrat activable : tous les disciples ont disparu → lot entièrement annulé.
+            if not activated:
+                await interaction.response.edit_message(
+                    content="❌ Ce contrat a été annulé : le disciple n'existe plus.", embed=None, view=None)
+                return
+
+            note = (f"\n⚠️ {len(missing)} contrat(s) annulé(s) : le disciple n'existe plus." if missing else "")
             await interaction.response.edit_message(
-                content="✅ Tu as accepté ce(s) contrat(s). Ils sont désormais actifs.", embed=None, view=None)
+                content="✅ Tu as accepté ce(s) contrat(s). Ils sont désormais actifs." + note,
+                embed=None, view=None)
             # DM aux deux parties (l'éducateur qui vient d'accepter + le chef de l'ordre employeur).
             educ_name = self._char_name(contracts[0]["educator_character_id"])
-            employer = db.get_order(contracts[0]["employer_order_id"])
-            if employer:
-                await self._dm_character_owner(
-                    None, employer["chef_character_id"],
-                    f"✅ L'éducateur {educ_name} a ACCEPTÉ le(s) contrat(s). Ils sont désormais actifs.")
+            await self._dm_character_owner(
+                None, employer["chef_character_id"],
+                f"✅ L'éducateur {educ_name} a ACCEPTÉ le(s) contrat(s). Ils sont désormais actifs.")
             await self._dm_character_owner(
                 None, contracts[0]["educator_character_id"],
                 f"✅ Contrat(s) accepté(s) et actif(s). Tu percevras la part convenue tant qu'ils courent.")
@@ -2020,9 +2075,11 @@ class Ordre(commands.Cog):
         """Redistribue les disciples d'un éducateur supprimé vers les éducateurs restants ayant
         STRICTEMENT MOINS de disciples que lui (équilibrage : chaque disciple va à celui qui en a le
         moins parmi les éligibles). Si aucun n'est éligible mais qu'il reste des formateurs, on
-        redistribue quand même parmi tous (fallback). S'il ne reste aucun formateur, les disciples
-        restent orphelins. Retourne (reassignments, fallback_used, aucun_formateur_restant), où
-        reassignments = [(disciple_character_id, nouvel_educateur_id_ou_None), ...]."""
+        redistribue quand même parmi tous (fallback). S'il ne reste AUCUN formateur, le CHEF de l'ordre
+        éducatif devient le référent par défaut (plus de valeur NULL). Retourne
+        (reassignments, fallback_used, aucun_formateur_restant), où
+        reassignments = [(disciple_character_id, nouvel_educateur_id), ...] (jamais None : au pire le
+        chef). aucun_formateur_restant=True signale le repli sur le chef (messages adaptés en aval)."""
         disciples = db.get_disciples_of_educator(order_id, removed_educator_id)
         removed_count = len(disciples)
         if removed_count == 0:
@@ -2044,10 +2101,18 @@ class Ordre(commands.Cog):
 
         reassignments = []
         if not eligible:
-            # Aucun formateur ne reste dans l'ordre : les disciples deviennent orphelins.
+            # Aucun formateur ne reste dans l'ordre : le CHEF de l'ordre reprend les disciples par défaut
+            # (au lieu de les laisser orphelins avec educator_character_id = NULL), en attendant qu'un
+            # nouveau formateur soit recruté.
+            order = db.get_order(order_id)
+            chef_cid = order["chef_character_id"] if order else None
             for row in disciples:
-                db.set_assignment_educator(row["id"], None)
-                reassignments.append((row["disciple_character_id"], None))
+                db.set_assignment_educator(row["id"], chef_cid)
+                # Les contrats actifs du disciple suivent aussi le référent vers le chef (cohérence :
+                # le virement hebdomadaire lit educator_character_id au moment du paiement).
+                db.transfer_active_contracts_educator(
+                    row["disciple_character_id"], removed_educator_id, chef_cid)
+                reassignments.append((row["disciple_character_id"], chef_cid))
             return reassignments, fallback_used, True
 
         for row in disciples:
@@ -2065,10 +2130,22 @@ class Ordre(commands.Cog):
 
     async def _notify_redistribution(self, guild, order_name, old_educ_name, reassignments,
                                      fallback_used, aucun_formateur_restant):
-        """DM à chaque disciple (et à son nouvel éducateur), puis récap complet à OWNER_ID."""
+        """DM à chaque disciple (et à son nouvel éducateur / au chef si repli), puis récap à OWNER_ID."""
         for disciple_cid, new_educ_cid in reassignments:
             disc_name = self._char_name(disciple_cid)
-            if new_educ_cid is not None:
+            if aucun_formateur_restant:
+                # Aucun formateur restant : le chef de l'ordre reprend le disciple par défaut.
+                await self._dm_character_owner(
+                    guild, disciple_cid,
+                    f"📋 Ton éducateur ({old_educ_name}) a quitté l'ordre {order_name}. En l'absence "
+                    f"d'autre formateur disponible, tu es temporairement pris en charge directement par "
+                    f"le chef de l'ordre, {self._mention_of_character(guild, new_educ_cid)}.")
+                await self._dm_character_owner(
+                    guild, new_educ_cid,
+                    f"📋 Aucun formateur disponible pour reprendre {disc_name} suite au départ de "
+                    f"{old_educ_name}. Tu es maintenant son référent par défaut, en attendant qu'un "
+                    "nouveau formateur soit recruté.")
+            else:
                 new_name = self._char_name(new_educ_cid)
                 await self._dm_character_owner(
                     guild, disciple_cid,
@@ -2077,17 +2154,12 @@ class Ordre(commands.Cog):
                 await self._dm_character_owner(
                     guild, new_educ_cid,
                     f"📋 Tu as reçu un nouveau disciple suite au départ de {old_educ_name} : {disc_name}.")
-            else:
-                await self._dm_character_owner(
-                    guild, disciple_cid,
-                    f"⚠️ Ton éducateur ({old_educ_name}) a quitté l'ordre {order_name}, et il ne reste "
-                    "plus aucun formateur pour te reprendre. Un membre du staff doit s'en occuper.")
 
         # Récap complet au propriétaire du bot pour vérification.
         lines = []
         for disciple_cid, new_educ_cid in reassignments:
-            target = self._char_name(new_educ_cid) if new_educ_cid is not None else "AUCUN (orphelin)"
-            lines.append(f"• {self._char_name(disciple_cid)} → {target}")
+            suffix = " (chef, par défaut)" if aucun_formateur_restant else ""
+            lines.append(f"• {self._char_name(disciple_cid)} → {self._char_name(new_educ_cid)}{suffix}")
         recap = (f"📋 Redistribution des disciples suite au retrait de **{old_educ_name}** dans l'ordre "
                  f"**{order_name}** :\n" + "\n".join(lines))
         if fallback_used:
@@ -2095,7 +2167,8 @@ class Ordre(commands.Cog):
                       "répartition forcée parmi tous les formateurs restants.")
         if aucun_formateur_restant:
             recap += ("\n\n⚠️ aucun_formateur_restant : plus aucun formateur dans l'ordre, disciples "
-                      "laissés orphelins (à réassigner manuellement).")
+                      "repris par défaut par le chef de l'ordre (à réassigner à un formateur dès qu'un "
+                      "nouveau est recruté).")
         try:
             owner_user = await self.bot.fetch_user(OWNER_ID)
             await owner_user.send(recap)
@@ -2150,9 +2223,15 @@ class Ordre(commands.Cog):
         if reassignments:
             await self._notify_redistribution(
                 guild, order_name, old_name, reassignments, fallback_used, aucun_formateur_restant)
-        # Notifications spécifiques aux CONTRATS (chef employeur + disciple), défensives.
+        # Notifications spécifiques aux CONTRATS ACTIFS (chef employeur + disciple), défensives.
         await self._notify_educator_contract_transfer(
             guild, order_name, old_name, reassignments, contracts)
+        # Propositions ENCORE en attente (pending) : elles suivent aussi le disciple vers son nouvel
+        # éducateur (ré-émission de l'offre Accepter/Refuser), au lieu d'être perdues. En l'absence de
+        # formateur, le chef de l'ordre reçoit l'offre (chef_fallback).
+        await self._reassign_pending_contract_offers(
+            guild, order_name, old_name, character_id, reassignments,
+            chef_fallback=aucun_formateur_restant)
         # Confirmation explicite au chef de l'ordre ÉDUCATIF (celui qui employait l'éducateur parti).
         if order:
             await self._dm_character_owner(
@@ -2183,6 +2262,58 @@ class Ordre(commands.Cog):
                 guild, disciple_cid,
                 f"📋 L'éducateur {old_name} n'est plus dans l'ordre {order_name}. Ton nouveau référent "
                 f"est maintenant {new_mention}.")
+
+    async def _reassign_pending_contract_offers(self, guild, order_name, old_educ_name, old_educ_cid,
+                                                reassignments, chef_fallback=False):
+        """Les propositions de contrat ENCORE 'pending' de l'éducateur parti suivent chaque disciple vers
+        son nouvel éducateur (comme les contrats actifs), au lieu d'être annulées. Comme une proposition
+        (lot) peut désormais concerner PLUSIEURS nouveaux éducateurs (redistribution différente selon les
+        disciples), on re-scinde chaque lot par nouvel éducateur (nouveau batch_id), on renvoie un DM
+        Accepter/Refuser au bon éducateur (fenêtre de 2 min ré-armée par _send_contract_offer) et on
+        prévient le chef de l'ordre EMPLOYEUR.
+
+        Quand `chef_fallback` est vrai (aucun formateur restant), la redistribution a mis le CHEF de
+        l'ordre éducatif comme référent : ces disciples suivent donc le MÊME chemin de réémission (l'offre
+        part vers le chef, qui reçoit le DM Accepter/Refuser comme n'importe quel éducateur), seul le texte
+        d'information au chef employeur diffère. Plus aucune annulation ici : `db.cancel_contract` ne sert
+        plus qu'aux vraies annulations réactives (2b ordre employeur dissous / 2c disciple disparu)."""
+        pending = db.get_pending_contracts_of_educator(old_educ_cid)
+        if not pending:
+            return
+        new_by_disciple = {d: e for d, e in reassignments}
+        # Regroupe par (lot d'origine, nouvel éducateur) — que ce soit un vrai formateur ou le chef (repli).
+        groups = {}  # (old_batch_id, new_educ) -> [rows] ; dict standard : ordre d'insertion garanti (3.7+)
+        for r in pending:
+            new_educ = new_by_disciple.get(r["disciple_character_id"])
+            if new_educ is None:
+                # Ne devrait plus arriver (le chef sert toujours de repli) : on ignore par prudence
+                # plutôt que d'annuler une proposition qui pourrait encore être reprise.
+                continue
+            groups.setdefault((r["batch_id"], new_educ), []).append(r)
+
+        for (old_batch_id, new_educ), rows in groups.items():
+            new_batch_id = uuid.uuid4().hex
+            db.rebatch_pending_contracts([r["id"] for r in rows], new_batch_id, new_educ)
+            employer = db.get_order(rows[0]["employer_order_id"])
+            edu_order = db.get_order(rows[0]["source_order_id"])
+            employer_name = employer["name"] if employer else "?"
+            edu_order_name = edu_order["name"] if edu_order else order_name
+            # Reconstruit le récap (mêmes champs que la création) pour renvoyer l'offre au nouvel éducateur.
+            batch = [{"disciple_cid": r["disciple_character_id"], "duree_type": r["duree_type"],
+                      "duree_value": r["duree_value"], "duree_unit": r["duree_unit"],
+                      "pct": r["pct"], "salaire_fixe": r["salaire_fixe"]} for r in rows]
+            await self._send_contract_offer(
+                guild, new_batch_id, employer_name, edu_order_name, new_educ, batch)
+            if employer:
+                noms = ", ".join(self._char_name(r["disciple_character_id"]) for r in rows)
+                if chef_fallback:
+                    msg = (f"📋 Aucun formateur n'était disponible pour reprendre {noms}, la proposition "
+                           f"de contrat a été redirigée vers {self._mention_of_character(guild, new_educ)}.")
+                else:
+                    msg = (f"📋 L'éducateur initialement proposé pour le contrat de {noms} (lot "
+                           f"{new_batch_id[:8]}) a quitté son ordre. La proposition est maintenant adressée "
+                           f"à {self._mention_of_character(guild, new_educ)}.")
+                await self._dm_character_owner(guild, employer["chef_character_id"], msg)
 
     async def handle_disciple_departure_if_applicable(self, character_id, guild):
         """Départ d'un DISCIPLE sous contrat actif : prévient l'éducateur et le chef de l'ordre employeur,
