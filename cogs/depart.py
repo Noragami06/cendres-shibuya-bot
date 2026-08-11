@@ -2911,6 +2911,8 @@ def delete_character_cascade(character_id):
             "DELETE FROM educator_contracts WHERE disciple_character_id = ? OR educator_character_id = ?",
             (character_id, character_id),
         )
+        # Réservations d'apparence (/réserv-appa) liées à ce personnage.
+        conn.execute("DELETE FROM appearance_reservations WHERE character_id = ?", (character_id,))
 
 
 # =====================================================================

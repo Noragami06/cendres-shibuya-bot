@@ -371,6 +371,18 @@ CREATE TABLE IF NOT EXISTS educator_contracts (
     end_date TEXT,
     created_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS appearance_reservations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id INTEGER,
+    user_id INTEGER,
+    nom_original TEXT,
+    univers TEXT,
+    image_path TEXT,
+    status TEXT DEFAULT 'pending',   -- 'pending', 'accepted', 'refused'
+    refusal_reason TEXT,
+    created_at TEXT
+);
 """
 
 
@@ -2311,6 +2323,16 @@ def get_validated_characters(user_id: int, guild_id: int):
         ).fetchall()
 
 
+def get_validated_character_slot(user_id: int, guild_id: int, slot_number: int):
+    """Personnage validé d'un joueur dans un slot précis (id + nom), ou None."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT id, character_name FROM validated_characters "
+            "WHERE user_id = ? AND guild_id = ? AND slot_number = ?",
+            (user_id, guild_id, slot_number),
+        ).fetchone()
+
+
 def delete_validated_character(user_id: int, guild_id: int, slot_number: int) -> int:
     """Supprime définitivement le personnage d'un slot. Renvoie le nombre de lignes supprimées."""
     with get_connection() as conn:
@@ -2319,6 +2341,42 @@ def delete_validated_character(user_id: int, guild_id: int, slot_number: int) ->
             (user_id, guild_id, slot_number),
         )
         return cur.rowcount
+
+
+# ---------- Réservations d'apparence (/réserv-appa) ----------
+def create_appearance_reservation(character_id, user_id, nom_original, univers, image_path, created_at):
+    """Insère une demande de réservation d'apparence (status='pending'). Retourne son id."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO appearance_reservations (character_id, user_id, nom_original, univers, "
+            "image_path, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+            (character_id, user_id, nom_original, univers, image_path, created_at),
+        )
+        return cur.lastrowid
+
+
+def get_appearance_reservation(reservation_id: int):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM appearance_reservations WHERE id = ?", (reservation_id,)
+        ).fetchone()
+
+
+def get_accepted_appearance_reservations():
+    """Réservations déjà acceptées (id, user_id, nom_original) — base de la détection de doublons."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT id, user_id, nom_original FROM appearance_reservations WHERE status = 'accepted'"
+        ).fetchall()
+
+
+def set_appearance_reservation_status(reservation_id: int, status: str, refusal_reason=None):
+    """Passe une réservation à 'accepted' ou 'refused' (+ raison éventuelle)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE appearance_reservations SET status = ?, refusal_reason = ? WHERE id = ?",
+            (status, refusal_reason, reservation_id),
+        )
 
 
 def get_class_ranking(eo_classe: str):
