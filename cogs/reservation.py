@@ -53,16 +53,14 @@ def _image_extension(attachment: discord.Attachment) -> str:
     return sub or "png"
 
 
-async def slot_autocomplete(interaction: discord.Interaction, current: str):
-    """Propose UNIQUEMENT les slots du joueur qui n'ont PAS déjà une apparence validée. Liste vide si le
-    joueur n'a aucun personnage, ou si tous ses slots sont déjà validés (Discord n'affiche alors rien)."""
-    if interaction.guild is None:
-        return []
+def _available_slots(user_id: int, guild_id: int):
+    """Slots du joueur qui n'ont PAS encore d'apparence validée (triés croissant). Sert au message
+    d'erreur listant les slots encore disponibles."""
     with db.get_connection() as conn:
         chars = conn.execute(
             "SELECT id, slot_number FROM validated_characters WHERE user_id = ? AND guild_id = ? "
             "ORDER BY slot_number ASC",
-            (interaction.user.id, interaction.guild.id),
+            (user_id, guild_id),
         ).fetchall()
         if not chars:
             return []
@@ -75,10 +73,7 @@ async def slot_autocomplete(interaction: discord.Interaction, current: str):
                 ids,
             ).fetchall()
         }
-    return [
-        app_commands.Choice(name=f"Slot {c['slot_number']}", value=c["slot_number"])
-        for c in chars if c["id"] not in accepted
-    ]
+    return [c["slot_number"] for c in chars if c["id"] not in accepted]
 
 
 # =====================================================================
@@ -205,14 +200,18 @@ class Reservation(commands.Cog):
     # =================================================================
     @app_commands.command(name="réserv-appa", description="Réserver l'apparence d'un personnage pour ta fiche")
     @app_commands.describe(
-        personnage="Quel personnage (slot) concerné — seuls les slots sans apparence validée sont proposés",
+        personnage="Quel personnage (slot) concerné",
         nom_original="Nom original du personnage dans son œuvre",
         univers="Nom de l'univers/œuvre d'origine",
         image="Image du personnage (tout format accepté, GIF inclus)",
     )
-    @app_commands.autocomplete(personnage=slot_autocomplete)
+    @app_commands.choices(personnage=[
+        app_commands.Choice(name="Slot 1", value=1),
+        app_commands.Choice(name="Slot 2", value=2),
+        app_commands.Choice(name="Slot 3", value=3),
+    ])
     async def reserv_appa(self, interaction: discord.Interaction,
-                          personnage: int, nom_original: str, univers: str,
+                          personnage: app_commands.Choice[int], nom_original: str, univers: str,
                           image: discord.Attachment):
         # Le traitement (téléchargement d'image, vérifications) prend un peu de temps -> défère tout de suite.
         await interaction.response.defer(ephemeral=True)
@@ -220,26 +219,29 @@ class Reservation(commands.Cog):
         if interaction.guild is None:
             await interaction.followup.send("Cette commande s'utilise sur le serveur.", ephemeral=True)
             return
-        slot = personnage
+        slot = personnage.value
 
-        # 4) Résolution du personnage dans le slot demandé.
+        # 4) Validation stricte côté serveur — le personnage existe-t-il dans ce slot ?
         char = db.get_validated_character_slot(interaction.user.id, interaction.guild.id, slot)
         if char is None:
             await interaction.followup.send(
-                "Tu n'as pas de personnage validé dans ce slot.", ephemeral=True)
+                f"Tu n'as pas de personnage validé dans le Slot {slot}.", ephemeral=True)
             return
         character_id = char["id"]
         character_name = char["character_name"] or "?"
 
-        # Re-vérification explicite (au cas où un slot déjà validé aurait été tapé malgré l'autocomplete).
+        # ... et ce slot n'a-t-il pas DÉJÀ une apparence validée ? (avec la liste des slots encore libres)
         with db.get_connection() as conn:
             already_validated = conn.execute(
                 "SELECT 1 FROM appearance_reservations WHERE character_id = ? AND status = 'accepted' LIMIT 1",
                 (character_id,),
             ).fetchone()
         if already_validated:
+            libres = _available_slots(interaction.user.id, interaction.guild.id)
+            restants = ", ".join(f"Slot {n}" for n in libres) if libres else "aucun"
             await interaction.followup.send(
-                "Ce slot a déjà une apparence validée, choisis en un autre.", ephemeral=True)
+                f"❌ Le Slot {slot} a déjà une apparence validée. Slots encore disponibles pour toi : "
+                f"{restants}.", ephemeral=True)
             return
 
         # 5) Validation + téléchargement de l'image (TOUS formats image, GIF inclus, SANS recompression).
