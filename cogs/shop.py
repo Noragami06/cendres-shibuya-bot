@@ -28,7 +28,8 @@ from cogs.utils.image_gen import generate_shop_image
 # apply_debit reste une MÉTHODE du cog Banque (protection Livret A + compte à rebours) : on la
 # récupère via self.bot.get_cog("Banque") pour appeler la VRAIE fonction.
 from cogs.banque import (
-    get_characters, get_character, get_account, add_transaction, _fmt_date, PHOENIX_COLOR,
+    get_characters, get_character, get_account, add_transaction, credit_compte_courant,
+    _fmt_date, PHOENIX_COLOR,
 )
 
 # ---------- Constantes ----------
@@ -167,12 +168,9 @@ def _refund_character(character_id: int, montant: int, label: str) -> bool:
     le remboursement a bien été crédité."""
     if not get_account(character_id):
         return False
-    with db.get_connection() as conn:
-        conn.execute(
-            "UPDATE bank_accounts SET solde_courant = solde_courant + ? WHERE character_id = ?",
-            (montant, character_id),
-        )
-    add_transaction(character_id, label, montant)
+    # Remboursement d'un achat déjà payé par le joueur : category='remboursement' -> ne compte JAMAIS
+    # dans l'épargne automatique et ne la déclenche jamais.
+    credit_compte_courant(character_id, montant, label, category="remboursement")
     return True
 
 

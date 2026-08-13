@@ -11,7 +11,7 @@ from cogs.utils import database as db
 from cogs.utils.image_gen import generate_inventaire_image
 # Réutilise les helpers bancaires (personnages, comptes, crédit, transactions) déjà existants.
 from cogs.banque import (
-    get_characters, get_character, get_account, add_transaction, PHOENIX_COLOR,
+    get_characters, get_character, get_account, add_transaction, credit_compte_courant, PHOENIX_COLOR,
 )
 
 # ---------- Constantes ----------
@@ -840,17 +840,15 @@ class Inventaire(commands.Cog):
 
         if trade["request_type"] == "argent":
             amount = trade["request_amount"]
+            # Débit de l'acheteur (inchangé), crédit du vendeur via le point d'entrée unique (épargne auto).
             with db.get_connection() as conn:
                 conn.execute(
                     "UPDATE bank_accounts SET solde_courant = solde_courant - ? WHERE character_id = ?",
                     (amount, target_char),
                 )
-                conn.execute(
-                    "UPDATE bank_accounts SET solde_courant = solde_courant + ? WHERE character_id = ?",
-                    (amount, proposer_char),
-                )
-            add_transaction(target_char, "Échange d'objet", -amount)
-            add_transaction(proposer_char, "Échange d'objet", amount)
+            add_transaction(target_char, "Échange d'objet", -amount, category="depense")
+            # Le vendeur reçoit de l'argent contre son objet = gain -> category='revenu'.
+            credit_compte_courant(proposer_char, amount, "Échange d'objet", category="revenu")
             counterpart = f"{amount:,} ¥"
         else:
             r_item = trade["request_item_id"]

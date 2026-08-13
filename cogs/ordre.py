@@ -26,7 +26,7 @@ from cogs.utils.image_gen import (
 from cogs.banque import (
     get_characters, get_character, get_account, PHOENIX_COLOR,
     generate_unique_iban, generate_pin_code, _pin_values, _within_1h, _fmt_date, OWNER_ID,
-    credit_account, add_transaction,
+    credit_account, add_transaction, credit_compte_courant,
 )
 # Méthode standard du projet : rôle appliqué à un PERSONNAGE (réel slot 1 / virtuel slot 2-3).
 from cogs.profil import character_has_role
@@ -3165,8 +3165,8 @@ class Ordre(commands.Cog):
             montant, character_id = s["montant"], s["character_id"]
             db.adjust_order_solde(order_id, -montant)
             db.add_order_transaction(order_id, "Salaire hebdomadaire", -montant, _now())
-            credit_account(character_id, "courant", montant)
-            add_transaction(character_id, "Salaire hebdomadaire", montant)
+            # Crédit du salarié via le point d'entrée unique (revenu -> compte pour l'épargne auto).
+            credit_compte_courant(character_id, montant, "Salaire hebdomadaire", category="revenu")
 
     async def _check_locks_and_deadlines_one(self, order_id, guild):
         order = db.get_order(order_id)
@@ -3272,8 +3272,8 @@ class Ordre(commands.Cog):
             sal = db.get_salary(order_id, cid)
             indemnite = sal["montant"] * indemnity_weeks if sal else 0
             if indemnite > 0:
-                credit_account(cid, "courant", indemnite)
-                add_transaction(cid, tx_label, indemnite)
+                # Indemnité = vrai gain pour le joueur (pas un remboursement) -> category='revenu'.
+                credit_compte_courant(cid, indemnite, tx_label, category="revenu")
             txt = member_text.format(name=order_name)
             if indemnite > 0:
                 txt += f"\n💰 Tu as reçu une indemnité de **{_fmt(indemnite)} ¥**."

@@ -119,12 +119,92 @@ def find_account_by_any_iban(iban: str):
 
 
 def credit_account(character_id: int, target: str, montant: int):
-    """Crédite un solde (courant ou livret) d'un personnage."""
+    """Crédite un solde (courant ou livret) d'un personnage. Primitif bas niveau — pour un CRÉDIT
+    entrant sur le compte COURANT d'un joueur, utilise plutôt credit_compte_courant() (épargne auto)."""
     col = "solde_courant" if target == "courant" else "solde_livret"
     with db.get_connection() as conn:
         conn.execute(
             f"UPDATE bank_accounts SET {col} = {col} + ? WHERE character_id = ?", (montant, character_id)
         )
+
+
+# ---------- Crédit du compte courant AVEC épargne automatique (point d'entrée unique des gains) ----------
+AUTO_SAVINGS_THRESHOLD = 2000     # cumul de REVENUS (strict) au delà duquel l'épargne se déclenche
+AUTO_SAVINGS_AMOUNT = 70          # montant épargné automatiquement à chaque déclenchement
+AUTO_SAVINGS_WINDOW_HOURS = 3     # fenêtre glissante de cumul des revenus
+_EPOCH_ZERO = "0000-01-01T00:00:00"  # borne « jamais déclenché »
+
+
+def credit_compte_courant(character_id: int, amount: int, label: str, category: str = "revenu"):
+    """Crédite solde_courant du montant PLEIN et enregistre la transaction avec sa catégorie.
+
+    Si category == 'revenu', applique ensuite l'épargne automatique via une FENÊTRE GLISSANTE de 3 h :
+    on additionne tous les revenus depuis le dernier déclenchement (ou, si plus récent, depuis il y a
+    3 h) ; si ce cumul dépasse STRICTEMENT 2000 ¥, on prélève 70 ¥ du compte courant vers le Livret A
+    et on mémorise l'instant du déclenchement (last_savings_trigger_at) pour repartir de zéro ensuite.
+
+    Les autres catégories ('remboursement', etc.) créditent normalement mais ne déclenchent JAMAIS
+    l'épargne et n'entrent JAMAIS dans le cumul (seul category='revenu' est sommé). Les lignes d'épargne
+    elles mêmes sont en category='epargne' : exclues du cumul, donc aucune ré-déclenchement sur elles.
+
+    À utiliser pour TOUT crédit entrant sur un compte PERSONNEL. Ne concerne PAS les comptes d'ordre,
+    ni les mouvements internes (secours Livret→Courant, retrait de Livret A), ni les débits.
+
+    NB : tout se fait dans UNE seule connexion/transaction, pour que la transaction de revenu qu'on vient
+    d'insérer soit bien visible dans le SUM du cumul (et que l'ensemble soit atomique)."""
+    now = _now()
+    with db.get_connection() as conn:
+        # 1) Crédit du montant PLEIN + enregistrement catégorisé (même horodatage que la fenêtre).
+        conn.execute(
+            "UPDATE bank_accounts SET solde_courant = solde_courant + ? WHERE character_id = ?",
+            (amount, character_id),
+        )
+        conn.execute(
+            "INSERT INTO bank_transactions (character_id, label, amount, date, related_iban, category) "
+            "VALUES (?, ?, ?, ?, NULL, ?)",
+            (character_id, label, amount, now, category),
+        )
+
+        # 2) Seuls les REVENUS déclenchent / alimentent l'épargne automatique.
+        if category != "revenu":
+            return
+
+        row = conn.execute(
+            "SELECT last_savings_trigger_at FROM bank_accounts WHERE character_id = ?", (character_id,)
+        ).fetchone()
+        last_trigger = (row["last_savings_trigger_at"] if row else None) or _EPOCH_ZERO
+        three_hours_ago = (datetime.fromisoformat(now) - timedelta(hours=AUTO_SAVINGS_WINDOW_HOURS)).isoformat()
+        window_start = max(last_trigger, three_hours_ago)  # bornes ISO comparables lexicographiquement
+
+        # Borne basse STRICTE (> et non >=) : la fenêtre repart APRÈS le dernier déclenchement. Sinon la
+        # transaction de revenu qui a déclenché l'épargne (datée exactement à last_savings_trigger_at)
+        # serait recomptée et ferait re-déclencher l'épargne à chaque petit revenu suivant. La transaction
+        # courante (datée `now`, forcément > window_start) reste, elle, bien comptée.
+        cumul = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS s FROM bank_transactions "
+            "WHERE character_id = ? AND category = 'revenu' AND date > ? AND date <= ?",
+            (character_id, window_start, now),
+        ).fetchone()["s"]
+
+        # 3) Déclenchement : 70 ¥ courant -> Livret A, et on mémorise l'instant (repart à zéro ensuite).
+        if cumul > AUTO_SAVINGS_THRESHOLD:
+            conn.execute(
+                "UPDATE bank_accounts SET solde_courant = solde_courant - ?, "
+                "solde_livret = solde_livret + ?, last_savings_trigger_at = ? WHERE character_id = ?",
+                (AUTO_SAVINGS_AMOUNT, AUTO_SAVINGS_AMOUNT, now, character_id),
+            )
+            # Sortie côté compte courant (-70) puis entrée côté Livret A (+70), toutes deux en 'epargne'
+            # (exclues du cumul 'revenu' -> jamais de ré-déclenchement sur elles mêmes).
+            conn.execute(
+                "INSERT INTO bank_transactions (character_id, label, amount, date, related_iban, category) "
+                "VALUES (?, ?, ?, ?, NULL, 'epargne')",
+                (character_id, "Épargne automatique (Livret A)", -AUTO_SAVINGS_AMOUNT, now),
+            )
+            conn.execute(
+                "INSERT INTO bank_transactions (character_id, label, amount, date, related_iban, category) "
+                "VALUES (?, ?, ?, ?, NULL, 'epargne')",
+                (character_id, "Épargne automatique (Livret A)", AUTO_SAVINGS_AMOUNT, now),
+            )
 
 
 def get_session(user_id: int, character_id: int):
@@ -143,12 +223,12 @@ def set_session(user_id: int, character_id: int):
         )
 
 
-def add_transaction(character_id: int, label: str, amount: int, related_iban=None):
+def add_transaction(character_id: int, label: str, amount: int, related_iban=None, category: str = "autre"):
     with db.get_connection() as conn:
         conn.execute(
-            "INSERT INTO bank_transactions (character_id, label, amount, date, related_iban) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (character_id, label, amount, _now(), related_iban),
+            "INSERT INTO bank_transactions (character_id, label, amount, date, related_iban, category) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (character_id, label, amount, _now(), related_iban, category),
         )
 
 
@@ -305,6 +385,10 @@ class AccountView(discord.ui.View):
             label="Informations", emoji="📜", style=discord.ButtonStyle.secondary,
             custom_id=f"banque_info:{character_id}",
         ))
+        self.add_item(discord.ui.Button(
+            label="Retirer du Livret A", emoji="🔄", style=discord.ButtonStyle.secondary,
+            custom_id=f"banque_retrait_livret:{character_id}:{owner_id}",
+        ))
 
 
 # =====================================================================
@@ -391,6 +475,8 @@ class Banque(commands.Cog):
         self.bot = bot
         # Saisie du code en cours : clé composite (user_id, character_id) -> "chiffres tapés".
         self.pin_buffers = {}
+        # Anti double-clic sur le retrait du Livret A (par character_id), le temps du flux de saisie.
+        self._livret_locks = set()
 
     async def cog_load(self):
         # NOTE : les boutons du clavier ont un custom_id contenant character_id/user_id (inconnus
@@ -755,6 +841,8 @@ class Banque(commands.Cog):
             await self.handle_virement(interaction, cid)
         elif cid.startswith("banque_info:"):
             await self.handle_info(interaction, cid)
+        elif cid.startswith("banque_retrait_livret:"):
+            await self.handle_retrait_livret(interaction, cid)
 
     async def handle_staff_self(self, interaction, cid):
         owner = int(cid.split(":")[1])
@@ -805,9 +893,11 @@ class Banque(commands.Cog):
         guild_id = char["guild_id"]
         argent = get_argent_recompense(owner_id)
 
-        iban_c, iban_l, pin = create_account(character_id, owner_id, guild_id, argent)
+        # Compte créé à 0, puis récompense créditée via le point d'entrée unique (épargne auto incluse
+        # si la récompense dépasse 2000 ¥).
+        iban_c, iban_l, pin = create_account(character_id, owner_id, guild_id, 0)
         if argent > 0:
-            add_transaction(character_id, "Récompense de départ", argent)
+            credit_compte_courant(character_id, argent, "Récompense de départ", category="revenu")
             clear_argent_recompense(owner_id)
 
         dm_text = (
@@ -1075,13 +1165,17 @@ class Banque(commands.Cog):
 
         # Cas destinataire = compte personnel : crédite le bon solde (courant OU livret).
         dest_target = dest["type_compte"]  # "courant" | "livret"
-        credit_account(dest["character_id"], dest_target, amount)
         if dest_target == "livret":
+            # Virement DIRECT vers un Livret A : pas d'épargne auto (déjà de l'épargne).
+            credit_account(dest["character_id"], "livret", amount)
             add_transaction(dest["character_id"], f"Virement reçu sur Livret A de {sender_iban}",
                             amount, sender_iban)
         else:
-            add_transaction(dest["character_id"], f"Virement reçu de {sender_iban}", amount, sender_iban)
-        add_transaction(character_id, f"Virement envoyé à {dest_iban}", -amount, dest_iban)
+            # Virement reçu sur le compte courant : gain -> catégorie 'revenu' (compte pour l'épargne auto).
+            credit_compte_courant(dest["character_id"], amount, f"Virement reçu de {sender_iban}",
+                                  category="revenu")
+        add_transaction(character_id, f"Virement envoyé à {dest_iban}", -amount, dest_iban,
+                        category="transfert_sortant")
 
         # Débit du compte courant de l'expéditeur (avec protection découvert + compte à rebours).
         await self.apply_debit(character_id, amount, interaction.guild, compte="courant")
@@ -1111,6 +1205,65 @@ class Banque(commands.Cog):
         else:
             pv = PaginationView("📜 Historique des transactions", pages, PHOENIX_COLOR)
             await interaction.response.send_message(embed=pv.build_embed(), view=pv)
+
+    async def handle_retrait_livret(self, interaction, cid):
+        _, character_id, owner_id = cid.split(":")
+        character_id, owner_id = int(character_id), int(owner_id)
+        if interaction.user.id != owner_id:
+            await interaction.response.send_message("Ce compte n'est pas le tien.", ephemeral=True)
+            return
+        account = get_account(character_id)
+        if not account:
+            await interaction.response.send_message("Compte introuvable.", ephemeral=True)
+            return
+        # Anti double-clic : verrou en mémoire par compte, le temps du flux de saisie.
+        if character_id in self._livret_locks:
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.defer()
+            except discord.HTTPException:
+                pass
+            return
+        self._livret_locks.add(character_id)
+        try:
+            await interaction.response.send_message(
+                "🔄 Retrait du Livret A — suis les instructions ci-dessous.", ephemeral=True)
+            channel = interaction.channel
+
+            montant = None
+            while montant is None:
+                await channel.send("Quel montant veux tu retirer de ton Livret A ?")
+                m = await self.wait_message(channel, interaction.user)  # isolation : uniquement CE joueur
+                if m is None:
+                    await channel.send("⏳ Retrait annulé (délai dépassé).")
+                    return
+                content = m.content.strip().replace(" ", "")
+                if not content.isdigit() or int(content) <= 0:
+                    await channel.send("Le montant doit être un nombre entier positif.")
+                    continue
+                val = int(content)
+                fresh = get_account(character_id)  # solde livret à jour
+                if val > fresh["solde_livret"]:
+                    await channel.send(
+                        f"❌ Solde insuffisant sur ton Livret A (tu as {fresh['solde_livret']:,} ¥). Réessaie.")
+                    continue
+                montant = val
+
+            # Transfert Livret A -> compte courant (mouvement interne : PAS d'épargne automatique).
+            with db.get_connection() as conn:
+                conn.execute(
+                    "UPDATE bank_accounts SET solde_livret = solde_livret - ?, "
+                    "solde_courant = solde_courant + ? WHERE character_id = ?",
+                    (montant, montant, character_id),
+                )
+            add_transaction(character_id, "Retrait du Livret A", montant)
+
+            await channel.send(embed=discord.Embed(
+                description=f"✅ {montant:,} ¥ retirés de ton Livret A et crédités sur ton compte courant.",
+                color=PHOENIX_COLOR))
+            await self.show_account_screen(channel, character_id)
+        finally:
+            self._livret_locks.discard(character_id)
 
 
 async def setup(bot):

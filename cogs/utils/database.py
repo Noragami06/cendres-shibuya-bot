@@ -149,7 +149,8 @@ CREATE TABLE IF NOT EXISTS bank_accounts (
     solde_livret INTEGER DEFAULT 0,
     created_at TEXT,
     is_at_risk INTEGER DEFAULT 0,
-    deletion_deadline TEXT
+    deletion_deadline TEXT,
+    last_savings_trigger_at TEXT        -- dernier déclenchement de l'épargne auto (fenêtre glissante 3h)
 );
 
 CREATE TABLE IF NOT EXISTS bank_sessions (
@@ -165,7 +166,8 @@ CREATE TABLE IF NOT EXISTS bank_transactions (
     label TEXT,
     amount INTEGER,
     date TEXT,
-    related_iban TEXT
+    related_iban TEXT,
+    category TEXT DEFAULT 'autre'        -- 'revenu' | 'remboursement' | 'depense' | 'transfert_sortant' | 'epargne' | 'autre'
 );
 
 CREATE TABLE IF NOT EXISTS shop_categories (
@@ -460,6 +462,7 @@ _VALIDATED_EXTRA_COLUMNS = [
 _BANK_EXTRA_COLUMNS = [
     ("is_at_risk", "INTEGER DEFAULT 0"),
     ("deletion_deadline", "TEXT"),
+    ("last_savings_trigger_at", "TEXT"),
 ]
 
 
@@ -491,6 +494,15 @@ def _ensure_bank_columns(conn):
     for name, decl in _BANK_EXTRA_COLUMNS:
         if name not in cols:
             conn.execute(f"ALTER TABLE bank_accounts ADD COLUMN {name} {decl}")
+
+
+def _ensure_bank_transactions_columns(conn):
+    """Ajoute la colonne de catégorisation à bank_transactions (DB existante)."""
+    cols = _column_names(conn, "bank_transactions")
+    if not cols:
+        return
+    if "category" not in cols:
+        conn.execute("ALTER TABLE bank_transactions ADD COLUMN category TEXT DEFAULT 'autre'")
 
 
 def _migrate_item_categorie_id(conn):
@@ -568,6 +580,7 @@ def init_db():
         _ensure_progress_columns(conn)
         _ensure_validated_columns(conn)
         _ensure_bank_columns(conn)
+        _ensure_bank_transactions_columns(conn)
         _ensure_order_columns(conn)
         _ensure_salary_columns(conn)
         # Unicité de l'IBAN d'ordre (fonctionne aussi sur une base migrée ; NULL multiples autorisés).
