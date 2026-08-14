@@ -1145,6 +1145,8 @@ def _ordre_member_row(d, x, y, w, label, count, color, text_color):
 def _ordre_line_chart(d, x0, y0, x1, y1, values, days, sub_color):
     w, h = x1 - x0, y1 - y0
     max_abs = max(abs(v) for v in values) * 1.2 if values else 1
+    if max_abs == 0:
+        max_abs = 1  # évite la division par zéro quand toutes les valeurs sont à 0 (ordre sans transaction)
     zero_y = y0 + h / 2
     d.line((x0, zero_y, x1, zero_y), fill=(40, 40, 48, 255), width=1)
     n = len(values)
