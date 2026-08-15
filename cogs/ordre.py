@@ -4,6 +4,7 @@
 
 import asyncio
 import os
+import unicodedata
 import uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -43,6 +44,11 @@ ORDER_TYPES = {
 }
 TAXE_SALON = 15000  # taxe hebdomadaire ET prix d'achat/vente au gouvernement, par salon
 STAFF_MANAGER_ROLE_ID = 1522182819462381729  # rôle (réel ou virtuel) autorisant la gestion staff
+FICHE_STAFF_ROLE_ID = 1521229332075512039    # rôle staff global (défini localement, comme dans les autres cogs)
+
+# Paramètres modifiables en « 🔧 Mode staff » (résolution par préfixe, accents ignorés).
+STAFF_EDIT_PARAMS = ["Nom", "Effectif ajouter", "Effectif retiré", "Trésorerie ajouter",
+                     "Trésorerie retirer", "Salon ajouté", "Salon retiré", "Salon modifié"]
 
 ROLE_COLORS = {
     "Chef d'ordre": (255, 165, 60),
@@ -101,6 +107,30 @@ def _parse_int(raw: str):
     if c.lstrip("-").isdigit():
         return int(c)
     return None
+
+
+def _is_staff(member) -> bool:
+    return any(r.id == FICHE_STAFF_ROLE_ID for r in getattr(member, "roles", []))
+
+
+def _fold(s: str) -> str:
+    """Minuscule + sans accents (pour la résolution par préfixe, insensible casse/accents)."""
+    return "".join(
+        c for c in unicodedata.normalize("NFD", (s or "").lower().strip())
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+def _match_staff_param(raw: str):
+    """Résout un nom de paramètre staff : correspondance exacte sinon par préfixe (accents ignorés).
+    Retourne la liste des correspondances (0 = inconnu, 1 = résolu, >1 = ambigu)."""
+    t = _fold(raw)
+    if not t:
+        return []
+    exact = [p for p in STAFF_EDIT_PARAMS if _fold(p) == t]
+    if exact:
+        return exact
+    return [p for p in STAFF_EDIT_PARAMS if _fold(p).startswith(t)]
 
 
 def _plus_months(iso: str, months: int) -> str:
@@ -443,6 +473,19 @@ class ExternalSalaryExpiryView(discord.ui.View):
             custom_id=f"ordre_salext_renew:{salary_id}"))
 
 
+class OrdreStaffChoiceView(discord.ui.View):
+    """Écran d'accueil /ordre pour un membre du staff : consulter son ordre ou entrer en mode staff."""
+
+    def __init__(self, user_id: int):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Afficher mon ordre", emoji="👤", style=discord.ButtonStyle.primary,
+            custom_id=f"ordre_self:{user_id}"))
+        self.add_item(discord.ui.Button(
+            label="Mode staff", emoji="🔧", style=discord.ButtonStyle.secondary,
+            custom_id=f"ordre_staff_mode:{user_id}"))
+
+
 class OrdreStaffView(discord.ui.View):
     """Sous la pillow du staff : pagination (ligne 0, seulement si plusieurs pages, page encodée dans
     le custom_id) + actions Ajouter / Virer / Muter (ligne 1)."""
@@ -621,7 +664,8 @@ class Ordre(commands.Cog):
         await view.wait()
         return view.result
 
-    async def _select_character_of(self, channel, invoker, target, none_msg):
+    async def _select_character_of(self, channel, invoker, target, none_msg,
+                                   prompt="Sélectionne le personnage :"):
         chars = get_characters(target.id, channel.guild.id)
         if not chars:
             await channel.send(none_msg)
@@ -629,7 +673,7 @@ class Ordre(commands.Cog):
         if len(chars) == 1:
             return chars[0]["id"]
         view = OrdreCharacterSelectView(chars, invoker.id)
-        await channel.send("Sélectionne le personnage :", view=view)
+        await channel.send(prompt, view=view)
         await view.wait()
         return view.result
 
@@ -737,9 +781,18 @@ class Ordre(commands.Cog):
     # =================================================================
     @app_commands.command(name="ordre", description="Gère ou crée ton ordre")
     async def ordre(self, interaction: discord.Interaction):
+        # Staff : écran de choix (afficher son ordre / mode staff). Sinon : accès direct comme avant.
+        if _is_staff(interaction.user):
+            embed = discord.Embed(title="🏛️ Ordres", description="Que veux tu faire ?", color=PHOENIX_COLOR)
+            await interaction.response.send_message(embed=embed, view=OrdreStaffChoiceView(interaction.user.id))
+            return
         await interaction.response.send_message("🏛️ Ouverture des ordres…", ephemeral=True)
-        channel = interaction.channel
-        character_id = await self._select_character(channel, interaction.user)
+        await self._open_own_order(interaction.channel, interaction.user)
+
+    async def _open_own_order(self, channel, user):
+        """Flux « consultation de SON propre ordre » : sélection de personnage puis dashboard (ou
+        proposition de création). Partagé entre la commande /ordre et le bouton « 👤 Afficher mon ordre »."""
+        character_id = await self._select_character(channel, user)
         if character_id is None:
             return
         if get_account(character_id) is None:
@@ -749,14 +802,14 @@ class Ordre(commands.Cog):
             return
         order = db.get_order_by_chief(character_id)
         if order:
-            await self._send_dashboard(channel, order, interaction.user.id)
+            await self._send_dashboard(channel, order, user.id)
         else:
             embed = discord.Embed(
                 title="🏛️ Aucun ordre",
                 description="Tu n'as pas encore d'ordre. Veux tu en créer un ?",
                 color=PHOENIX_COLOR,
             )
-            await channel.send(embed=embed, view=OrdreCreateConfirmView(character_id, interaction.user.id))
+            await channel.send(embed=embed, view=OrdreCreateConfirmView(character_id, user.id))
 
     # =================================================================
     # LISTENER
@@ -766,7 +819,11 @@ class Ordre(commands.Cog):
         if interaction.type != discord.InteractionType.component:
             return
         cid = interaction.data.get("custom_id", "")
-        if cid.startswith("ordre_create_yes:"):
+        if cid.startswith("ordre_self:"):
+            await self.handle_ordre_self(interaction, cid)
+        elif cid.startswith("ordre_staff_mode:"):
+            await self.handle_ordre_staff_mode(interaction, cid)
+        elif cid.startswith("ordre_create_yes:"):
             await self.handle_create_yes(interaction, cid)
         elif cid.startswith("ordre_create_no:"):
             await self.handle_create_no(interaction, cid)
@@ -1998,48 +2055,359 @@ class Ordre(commands.Cog):
                 if target_cid is None:
                     await channel.send("⏳ Annulé.")
                     return
-            name = get_character(target_cid)["character_name"] if get_character(target_cid) else "?"
-            # Rôle lu AVANT le retrait (pour savoir si c'était un disciple « Membre d'équipe »).
-            member_row = db.get_order_member(order_id, target_cid)
-            fired_role = member_row["role_label"] if member_row else None
-            # Conséquences côté ordre via le POINT D'ENTRÉE UNIQUE (redistribution + notifications), AVANT
-            # de retirer le membre (les liens doivent encore exister). La détection « est-ce un formateur »
-            # est faite à l'intérieur (via order_id_hint).
-            reassignments, fallback_used, aucun_formateur_restant = [], False, False
-            edu_result = await self.handle_educator_departure_if_applicable(
-                target_cid, channel.guild, order_id_hint=order_id)
-            if edu_result is not None:
-                _, reassignments, fallback_used, aucun_formateur_restant = edu_result
-            else:
-                # Non-formateur : détache son rattachement de disciple.
-                db.remove_disciple_assignment(order_id, target_cid)
-                fired_order = db.get_order(order_id)
-                if fired_order and fired_order["type"] == "educatif":
-                    # Disciple (« Membre d'équipe ») viré de son ordre éducatif d'origine : ses contrats
-                    # sourcés ici prennent fin (DM disciple + éducateur + chef employeur).
-                    if fired_role == "Membre d'équipe":
-                        await self._end_disciple_source_contracts(
-                            target_cid, order_id, fired_order["name"], channel.guild)
-                else:
-                    # Ordre employeur (Direct/Hybride) : clôture générique du contrat où il travaillait.
-                    await self.handle_disciple_departure_if_applicable(target_cid, channel.guild)
-
-            db.remove_order_member(order_id, target_cid)
-
-            desc = f"✅ {name} a été retiré de l'ordre."
-            if edu_result is not None and reassignments:
-                nb_reassignes = sum(1 for _, e in reassignments if e is not None)
-                nb_orphelins = sum(1 for _, e in reassignments if e is None)
-                if nb_reassignes:
-                    desc += (f"\n🔁 {nb_reassignes} disciple(s) redistribué(s) parmi les autres formateurs"
-                             + (" (répartition forcée)." if fallback_used else "."))
-                if nb_orphelins:
-                    desc += (f"\n⚠️ {nb_orphelins} disciple(s) sans éducateur (aucun formateur restant), "
-                             "le staff doit s'en occuper.")
+            # Retrait complet (redistribution disciples + contrats + notifications), logique partagée.
+            desc = await self._remove_member_full(order_id, target_cid, channel.guild)
             await channel.send(embed=discord.Embed(description=desc, color=PHOENIX_COLOR))
             await self._send_staff(channel, order_id, interaction.user.id, 1)
         finally:
             self._release(interaction.user.id)
+
+    async def _remove_member_full(self, order_id, target_cid, guild):
+        """Retrait COMPLET d'un membre d'un ordre — EXACTEMENT la logique du clic « ➖ Virer » (point
+        d'entrée unique de départ d'éducateur/redistribution, clôture des contrats du disciple,
+        notifications), puis retrait de order_members. Retourne le récapitulatif à afficher.
+        Partagé entre le bouton « ➖ Virer » et le « 🔧 Mode staff » (Effectif retiré)."""
+        name = get_character(target_cid)["character_name"] if get_character(target_cid) else "?"
+        # Rôle lu AVANT le retrait (pour savoir si c'était un disciple « Membre d'équipe »).
+        member_row = db.get_order_member(order_id, target_cid)
+        fired_role = member_row["role_label"] if member_row else None
+        # Conséquences côté ordre via le POINT D'ENTRÉE UNIQUE (redistribution + notifications), AVANT
+        # de retirer le membre (les liens doivent encore exister).
+        reassignments, fallback_used, aucun_formateur_restant = [], False, False
+        edu_result = await self.handle_educator_departure_if_applicable(
+            target_cid, guild, order_id_hint=order_id)
+        if edu_result is not None:
+            _, reassignments, fallback_used, aucun_formateur_restant = edu_result
+        else:
+            # Non-formateur : détache son rattachement de disciple.
+            db.remove_disciple_assignment(order_id, target_cid)
+            fired_order = db.get_order(order_id)
+            if fired_order and fired_order["type"] == "educatif":
+                # Disciple (« Membre d'équipe ») viré de son ordre éducatif d'origine : ses contrats
+                # sourcés ici prennent fin (DM disciple + éducateur + chef employeur).
+                if fired_role == "Membre d'équipe":
+                    await self._end_disciple_source_contracts(
+                        target_cid, order_id, fired_order["name"], guild)
+            else:
+                # Ordre employeur (Direct/Hybride) : clôture générique du contrat où il travaillait.
+                await self.handle_disciple_departure_if_applicable(target_cid, guild)
+
+        db.remove_order_member(order_id, target_cid)
+
+        desc = f"✅ {name} a été retiré de l'ordre."
+        if edu_result is not None and reassignments:
+            nb_reassignes = sum(1 for _, e in reassignments if e is not None)
+            nb_orphelins = sum(1 for _, e in reassignments if e is None)
+            if nb_reassignes:
+                desc += (f"\n🔁 {nb_reassignes} disciple(s) redistribué(s) parmi les autres formateurs"
+                         + (" (répartition forcée)." if fallback_used else "."))
+            if nb_orphelins:
+                desc += (f"\n⚠️ {nb_orphelins} disciple(s) sans éducateur (aucun formateur restant), "
+                         "le staff doit s'en occuper.")
+        return desc
+
+    # =================================================================
+    # MODE STAFF /ordre (afficher son ordre / éditer n'importe quel ordre)
+    # =================================================================
+    async def handle_ordre_self(self, interaction, cid):
+        user_id = int(cid.split(":")[1])
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce panneau ne t'appartient pas.", ephemeral=True)
+            return
+        await interaction.response.send_message("🏛️ Ouverture de ton ordre…", ephemeral=True)
+        await self._open_own_order(interaction.channel, interaction.user)
+
+    async def handle_ordre_staff_mode(self, interaction, cid):
+        user_id = int(cid.split(":")[1])
+        if interaction.user.id != user_id or not _is_staff(interaction.user):
+            await interaction.response.send_message("Ce panneau ne t'appartient pas.", ephemeral=True)
+            return
+        if not self._acquire(interaction.user.id):
+            await interaction.response.send_message(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True)
+            return
+        try:
+            await interaction.response.send_message("🔧 Mode staff…", ephemeral=True)
+            channel, user, guild = interaction.channel, interaction.user, interaction.channel.guild
+
+            # 1-2) Liste numérotée de TOUS les ordres du serveur.
+            orders = db.get_orders_in_guild_full(guild.id)
+            if not orders:
+                await channel.send("Aucun ordre n'existe pour l'instant.")
+                return
+            lines = []
+            for i, o in enumerate(orders, 1):
+                chef = get_character(o["chef_character_id"])
+                prenom = (chef["character_name"] or "?").split()[0] if chef and chef["character_name"] else "?"
+                lines.append(f"**{i}.** {o['name']} — dirigé par {prenom} (<@{o['owner_user_id']}>)")
+            await channel.send(embed=discord.Embed(
+                title="🔧 Mode staff — choisis un ordre",
+                description="\n".join(lines) + "\n\nRéponds par le **numéro** de l'ordre à modifier.",
+                color=PHOENIX_COLOR))
+            idx = await self._ask_int_range(channel, user, None, 1, len(orders))
+            if idx is None:
+                await channel.send("⏳ Annulé.")
+                return
+            order_id = orders[idx - 1]["id"]
+            await self._staff_edit_menu(channel, user, guild, order_id)
+        finally:
+            self._release(interaction.user.id)
+
+    async def _staff_edit_menu(self, channel, user, guild, order_id):
+        """Menu des catégories + boucle de N modifications, puis régénération du dashboard."""
+        await channel.send(embed=discord.Embed(
+            title="🔧 Modifications disponibles",
+            description=("**PRINCIPAL :**\nNom, Effectif ajouter, Effectif retiré, Trésorerie ajouter, "
+                         "Trésorerie retirer, Salon ajouté, Salon retiré, Salon modifié"),
+            color=PHOENIX_COLOR))
+        n = await self._ask_positive_int(channel, user, "Combien de modifications veux tu faire ?")
+        if n is None:
+            return
+        for i in range(n):
+            param = await self._staff_pick_param(channel, user, i + 1, n)
+            if param is None:
+                await channel.send("⏳ Modifications interrompues.")
+                break
+            await self._staff_apply_param(channel, user, guild, order_id, param)
+
+        # 5) Régénération du dashboard à jour de l'ordre concerné.
+        order = db.get_order(order_id)
+        if order:
+            await channel.send(embed=discord.Embed(
+                description="✅ Terminé. Dashboard à jour ci dessous :", color=PHOENIX_COLOR))
+            await self._send_dashboard(channel, order, user.id)
+
+    async def _staff_pick_param(self, channel, user, i, n):
+        """Demande le nom d'un paramètre (résolution par préfixe, accents ignorés). Redemande si inconnu
+        ou ambigu. Retourne le nom canonique, ou None si annulé."""
+        while True:
+            await channel.send(
+                f"Modification {i}/{n} — écris le nom du paramètre (ex : « Nom », « Effectif ajouter », "
+                "« Trésorerie retirer »…).")
+            m = await self.wait_message(channel, user)
+            if m is None:
+                await channel.send("⏳ Annulé.")
+                return None
+            matches = _match_staff_param(m.content)
+            if len(matches) == 1:
+                return matches[0]
+            if not matches:
+                await channel.send("Paramètre inconnu. Réessaie.")
+            else:
+                await channel.send("Ambigu (" + ", ".join(matches) + "). Précise davantage.")
+
+    async def _staff_apply_param(self, channel, user, guild, order_id, param):
+        if param == "Nom":
+            await self._staff_edit_nom(channel, user, order_id)
+        elif param == "Effectif ajouter":
+            await self._staff_effectif_add(channel, user, guild, order_id)
+        elif param == "Effectif retiré":
+            await self._staff_effectif_remove(channel, user, guild, order_id)
+        elif param == "Trésorerie ajouter":
+            await self._staff_tresorerie(channel, user, order_id, sign=1)
+        elif param == "Trésorerie retirer":
+            await self._staff_tresorerie(channel, user, order_id, sign=-1)
+        elif param == "Salon ajouté":
+            await self._staff_salon_add(channel, user, order_id)
+        elif param == "Salon retiré":
+            await self._staff_salon_remove(channel, user, order_id)
+        elif param == "Salon modifié":
+            await self._staff_salon_modify(channel, user, order_id)
+
+    async def _await_channel_mention(self, channel, user, prompt):
+        """Attend un message mentionnant un salon (#salon) et retourne ce salon, ou None si annulé."""
+        while True:
+            await channel.send(prompt)
+            m = await self.wait_message(channel, user)
+            if m is None:
+                await channel.send("⏳ Annulé.")
+                return None
+            if m.channel_mentions:
+                return m.channel_mentions[0]
+            await channel.send("Merci de **mentionner** un salon (ex : #salon).")
+
+    # ---------- paramètres staff ----------
+    async def _staff_edit_nom(self, channel, user, order_id):
+        await channel.send("Quel est le nouveau nom ?")
+        m = await self.wait_message(channel, user)
+        if m is None:
+            await channel.send("⏳ Annulé.")
+            return
+        new_name = m.content.strip()
+        if not new_name:
+            await channel.send("Nom vide, modification ignorée.")
+            return
+        full = f"Ordre de {new_name}"
+        with db.get_connection() as conn:
+            conn.execute("UPDATE orders SET name = ? WHERE id = ?", (full, order_id))
+        await channel.send(embed=discord.Embed(
+            description=f"✅ Ordre renommé en **{full}**.", color=PHOENIX_COLOR))
+
+    async def _staff_tresorerie(self, channel, user, order_id, sign):
+        verbe = "ajouter" if sign > 0 else "retirer"
+        montant = await self._ask_positive_int(channel, user, f"Quel montant veux tu {verbe} ?")
+        if montant is None:
+            return
+        old = db.get_order(order_id)["solde_courant"]
+        new = db.adjust_order_solde(order_id, sign * montant)  # ADDITIF (peut passer en négatif si retrait)
+        label = "Ajustement staff (ajout)" if sign > 0 else "Ajustement staff (retrait)"
+        db.add_order_transaction(order_id, label, sign * montant, _now())
+        await channel.send(embed=discord.Embed(
+            description=(f"✅ Trésorerie : {verbe} **{_fmt(montant)} ¥**.\n"
+                         f"Ancien solde : **{_fmt(old)} ¥**\nNouveau solde : **{_fmt(new)} ¥**"),
+            color=PHOENIX_COLOR))
+
+    async def _staff_salon_add(self, channel, user, order_id):
+        ch = await self._await_channel_mention(channel, user, "Mentionne le salon à ajouter.")
+        if ch is None:
+            return
+        owner = db.resolve_salon_true_owner(ch.id)
+        if owner is not None:
+            owner_order = db.get_order(owner["order_id"])
+            await channel.send(
+                f"❌ Ce salon appartient déjà à l'ordre {owner_order['name'] if owner_order else '?'}.")
+            return
+        # Correction de désynchronisation : ajout sans AUCUNE transaction financière.
+        db.add_order_salon(order_id, ch.id, "Acheté")
+        await channel.send(embed=discord.Embed(
+            description=f"✅ Salon #{ch.name} ajouté à l'ordre (aucune transaction).", color=PHOENIX_COLOR))
+
+    async def _staff_salon_remove(self, channel, user, order_id):
+        ch = await self._await_channel_mention(channel, user, "Mentionne le salon à retirer.")
+        if ch is None:
+            return
+        mine = next((r for r in db.get_all_salon_rows(ch.id) if r["order_id"] == order_id), None)
+        if mine is None:
+            await channel.send("❌ Ce salon n'appartient pas à cet ordre.")
+            return
+        with db.get_connection() as conn:
+            conn.execute("DELETE FROM order_salons WHERE id = ?", (mine["id"],))
+        await channel.send(embed=discord.Embed(
+            description=f"✅ Salon #{ch.name} retiré de l'ordre (aucune transaction).", color=PHOENIX_COLOR))
+
+    async def _staff_salon_modify(self, channel, user, order_id):
+        old_ch = await self._await_channel_mention(
+            channel, user, "Mentionne l'ANCIEN salon (celui actuellement enregistré, potentiellement mal renseigné).")
+        if old_ch is None:
+            return
+        mine = next((r for r in db.get_all_salon_rows(old_ch.id) if r["order_id"] == order_id), None)
+        if mine is None:
+            await channel.send("❌ Cet ancien salon n'appartient pas à cet ordre.")
+            return
+        new_ch = await self._await_channel_mention(channel, user, "Mentionne le NOUVEAU salon (le bon).")
+        if new_ch is None:
+            return
+        owner = db.resolve_salon_true_owner(new_ch.id)
+        if owner is not None:
+            owner_order = db.get_order(owner["order_id"])
+            await channel.send(
+                f"❌ Le nouveau salon appartient déjà à l'ordre {owner_order['name'] if owner_order else '?'}.")
+            return
+        # Transfert direct de la ligne : l'ancien salon redevient libre, le nouveau est possédé par cet ordre.
+        with db.get_connection() as conn:
+            conn.execute("UPDATE order_salons SET channel_id = ? WHERE id = ?", (new_ch.id, mine["id"]))
+        await channel.send(embed=discord.Embed(
+            description=f"✅ Salon corrigé : #{old_ch.name} → #{new_ch.name}.", color=PHOENIX_COLOR))
+
+    async def _staff_effectif_remove(self, channel, user, guild, order_id):
+        await channel.send("Écris le nom du personnage à retirer.")
+        m = await self.wait_message(channel, user)
+        if m is None:
+            await channel.send("⏳ Annulé.")
+            return
+        query = _fold(m.content)
+        if not query:
+            await channel.send("Nom vide, annulé.")
+            return
+        members = db.get_order_members(order_id)
+        exact = [mem for mem in members if _fold(mem["character_name"] or "") == query]
+        cand = exact or [mem for mem in members if _fold(mem["character_name"] or "").startswith(query)]
+        if not cand:
+            await channel.send("Aucun membre de cet ordre ne correspond à ce nom.")
+            return
+        if len(cand) > 1:
+            lines = [f"**{i}.** {mem['character_name']} ({mem['role_label']})" for i, mem in enumerate(cand, 1)]
+            await channel.send(embed=discord.Embed(
+                title="Plusieurs correspondances",
+                description="\n".join(lines) + "\n\nRéponds par le **numéro**.", color=PHOENIX_COLOR))
+            k = await self._ask_int_range(channel, user, None, 1, len(cand))
+            if k is None:
+                await channel.send("⏳ Annulé.")
+                return
+            target = cand[k - 1]
+        else:
+            target = cand[0]
+        # RÉUTILISE EXACTEMENT la logique du clic « ➖ Virer ».
+        desc = await self._remove_member_full(order_id, target["character_id"], guild)
+        await channel.send(embed=discord.Embed(description=desc, color=PHOENIX_COLOR))
+
+    async def _staff_effectif_add(self, channel, user, guild, order_id):
+        # 1-2) Rôle numéroté (STAFF_ROLE_ORDER, couleurs déjà fixées ailleurs).
+        lines = [f"**{i}.** {r}" for i, r in enumerate(STAFF_ROLE_ORDER, 1)]
+        await channel.send(embed=discord.Embed(
+            title="Quel rôle attribuer ?", description="\n".join(lines) + "\n\nRéponds par le **numéro**.",
+            color=PHOENIX_COLOR))
+        idx = await self._ask_int_range(channel, user, None, 1, len(STAFF_ROLE_ORDER))
+        if idx is None:
+            await channel.send("⏳ Annulé.")
+            return
+        role = STAFF_ROLE_ORDER[idx - 1]
+
+        # 3) Mentions de toutes les personnes à ajouter, en un seul message.
+        await channel.send("Mentionne toutes les personnes à ajouter avec ce rôle, en un seul message.")
+        m = await self.wait_message(channel, user)
+        if m is None:
+            await channel.send("⏳ Annulé.")
+            return
+        people, seen = [], set()
+        for u in m.mentions:  # ordre d'apparition préservé, dédoublonné
+            if u.id not in seen:
+                seen.add(u.id)
+                people.append(u)
+        if not people:
+            await channel.send("Aucune personne mentionnée, ajout annulé.")
+            return
+
+        order = db.get_order(order_id)
+        added = []
+        for member in people:
+            # 4) Sélection du personnage de CE joueur (auto si un seul), traitée AVANT la personne suivante.
+            target_cid = await self._select_character_of(
+                channel, user, member, f"{member.mention} n'a aucun personnage validé, ignoré.",
+                prompt=f"Pour {member.mention}, sélectionne son personnage :")
+            if target_cid is None:
+                continue
+            if target_cid == order["chef_character_id"] or db.get_order_member(order_id, target_cid):
+                await channel.send(f"{self._char_name(target_cid)} fait déjà partie de l'ordre, ignoré.")
+                continue
+            educator_cid = None
+            if role == "Membre d'équipe" and order["type"] == "educatif":
+                educator_cid = await self._pick_educator(channel, user, order_id, guild)
+                if educator_cid == "NO_EDUCATOR":
+                    await channel.send(
+                        "Aucun formateur dans cet ordre : impossible d'assigner ce disciple, "
+                        f"{self._char_name(target_cid)} ignoré.")
+                    continue
+                if educator_cid is None:
+                    await channel.send(f"Aucun éducateur choisi, {self._char_name(target_cid)} ignoré.")
+                    continue
+            db.add_order_member(order_id, target_cid, role)
+            if educator_cid is not None:
+                db.add_disciple_assignment(order_id, target_cid, educator_cid)
+            added.append((target_cid, role, educator_cid))
+
+        # 5) Récapitulatif.
+        if not added:
+            await channel.send("Personne n'a finalement été ajouté.")
+            return
+        recap = []
+        for cid_, role_, educ_ in added:
+            line = f"• {self._char_name(cid_)} — **{role_}**"
+            if educ_ is not None:
+                line += f" (rattaché à {self._char_name(educ_)})"
+            recap.append(line)
+        await channel.send(embed=discord.Embed(
+            title="✅ Membres ajoutés", description="\n".join(recap), color=PHOENIX_COLOR))
 
     async def handle_staff_mute(self, interaction, cid):
         order_id = int(cid.split(":")[1])
