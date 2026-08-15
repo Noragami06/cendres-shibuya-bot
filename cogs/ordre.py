@@ -610,6 +610,7 @@ class Ordre(commands.Cog):
         self._contract_timeout_tasks = set()  # tâches de timeout (2 min) des propositions de contrat en attente
         self._ext_salary_prompt_pending = set()  # salaires externes déjà notifiés au chef (évite le rappel quotidien)
         self._contracts_resumed = False  # garde : reprise des minuteries de contrat une seule fois au démarrage
+        self._bank_backfilled = False  # garde : rattrapage des comptes bancaires d'ordre une seule fois au démarrage
 
     async def cog_load(self):
         # Tâche planifiée UNIQUE (présence des chefs + expiration des locations + cycle hebdomadaire
@@ -631,6 +632,14 @@ class Ordre(commands.Cog):
             await self.resume_pending_contract_timeouts()
         except Exception as e:
             print(f"[ordre] resume_pending_contract_timeouts : {e}")
+        # Rattrapage UNE SEULE FOIS des ordres créés avant l'ajout du système bancaire (IBAN/code
+        # manquants). Idempotent : ne touche rien si tous les ordres ont déjà leurs identifiants.
+        if not self._bank_backfilled:
+            self._bank_backfilled = True
+            try:
+                await self.backfill_order_bank_accounts()
+            except Exception as e:
+                print(f"[ordre] backfill_order_bank_accounts : {e}")
 
     # ---------- verrou de flux ----------
     def _acquire(self, user_id) -> bool:
@@ -1698,6 +1707,44 @@ class Ordre(commands.Cog):
                 f"Compte d'ordre créé — **{order_name}** (chef {interaction.user.mention})\n\n{dm_text}")
         except discord.HTTPException:
             pass
+
+    async def backfill_order_bank_accounts(self):
+        """Génère IBAN + code secret pour tout ordre existant qui n'en a pas encore (créé avant
+        l'ajout du système bancaire), et envoie les infos au chef par DM (copie au propriétaire du bot).
+        Idempotent : les ordres ayant déjà iban ET pin_code sont ignorés."""
+        with db.get_connection() as conn:
+            orders_sans_compte = conn.execute(
+                "SELECT o.id, o.name, o.chef_character_id, v.user_id AS owner_user_id "
+                "FROM orders o JOIN validated_characters v ON v.id = o.chef_character_id "
+                "WHERE o.iban IS NULL OR o.pin_code IS NULL"
+            ).fetchall()
+
+        for order in orders_sans_compte:
+            iban, pin = self._generate_order_creds()  # unique vs comptes personnels ET ordres
+            db.set_order_bank_creds(order["id"], iban, pin)
+
+            dm_text = (
+                f"🏦 Ton ordre {order['name']} n'avait pas encore de compte bancaire (créé avant "
+                "l'ajout de ce système), le voici maintenant !\n\n"
+                f"**IBAN :** {iban}\n"
+                f"**Code secret :** {pin}\n\n"
+                "Garde ces informations précieusement."
+            )
+            try:
+                chef_user = await self.bot.fetch_user(order["owner_user_id"])
+                await chef_user.send(dm_text)
+            except discord.HTTPException:
+                pass
+            try:
+                owner_user = await self.bot.fetch_user(OWNER_ID)
+                await owner_user.send(
+                    f"Compte d'ordre créé rétroactivement — **{order['name']}** "
+                    f"(chef <@{order['owner_user_id']}>)\n\n{dm_text}")
+            except discord.HTTPException:
+                pass
+
+            print(f"🔍 [backfill] Compte bancaire créé rétroactivement pour l'ordre "
+                  f"{order['name']} (id {order['id']})")
 
     # ---------- clavier PIN ----------
     def _render_order_pin(self, buffer):
