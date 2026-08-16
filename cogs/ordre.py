@@ -2700,39 +2700,21 @@ class Ordre(commands.Cog):
 
     async def _finalize_order_deletion(self, order, guild):
         order_id = order["id"]
-
-        async def member_handler(m, order_name):
-            # Indemnité GRADUÉE selon l'ancienneté INDIVIDUELLE du membre (son joined_at à lui, pas l'âge
-            # de l'ordre) : < 1 mois -> 0 %, < 2 mois -> 50 %, sinon 100 % du montant × 4 semaines.
-            cid = m["character_id"]
-            pct = compute_indemnity_pct(m["joined_at"])
-            sal = db.get_salary(order_id, cid)
-            base = sal["montant"] * 4 if sal else 0
-            indemnite = int(base * pct)
-            txt = ("❌ L'ordre **{name}** a été définitivement supprimé (délai de restauration écoulé). "
-                   "Tu n'en fais plus partie.").format(name=order_name)
-            if pct == 0:
-                txt += "\n💰 Aucune indemnité, ancienneté insuffisante."
-            else:
-                if indemnite > 0:
-                    # Indemnité = vrai gain (pas un remboursement) -> category='revenu'.
-                    credit_compte_courant(cid, indemnite, "Indemnité de suppression d'ordre", category="revenu")
-                if pct < 1:
-                    txt += (f"\n💰 Indemnité à 50 %, ancienneté d'un mois : **{_fmt(indemnite)} ¥**.")
-                else:
-                    txt += f"\n💰 Tu as reçu une indemnité de **{_fmt(indemnite)} ¥**."
-            await self._dm_character_owner(guild, cid, txt)
-
         # Vrai nettoyage complet via la machinerie de dissolution (libération croisée des salons, clôture
         # des contrats avec notifications, DM finaux, purge de toutes les tables), sans ban du chef.
-        # L'indemnité de chaque membre est gérée par member_handler (graduée) ; le chef n'en reçoit aucune.
+        # Indemnité de chaque membre GRADUÉE par ancienneté individuelle (base 1 mois = montant × 4 × pct),
+        # via le handler partagé ; le chef n'en reçoit aucune.
         await self._dissolve_common(
             order_id, guild, indemnity_weeks=0, ban_chief=False,
             tx_label="Indemnité de suppression d'ordre",
             member_text="",  # non utilisé : member_handler prend en charge indemnité + DM des membres
             chef_text=("❌ Ton ordre **{name}** a été définitivement supprimé, le délai de restauration "
                        "de 15 jours étant écoulé."),
-            member_handler=member_handler)
+            member_handler=self._graduated_member_handler(
+                order_id, guild, 4,
+                ("❌ L'ordre **{name}** a été définitivement supprimé (délai de restauration écoulé). "
+                 "Tu n'en fais plus partie."),
+                "Indemnité de suppression d'ordre"))
         # Édite le message de logs : retire le bouton, ajoute la mention de suppression définitive.
         ref = db.get_bot_state(f"order_del_msg:{order_id}")
         if ref:
@@ -3945,30 +3927,66 @@ class Ordre(commands.Cog):
     # =================================================================
     # DISSOLUTION D'UN ORDRE
     # =================================================================
+    def _graduated_member_handler(self, order_id, guild, weeks, base_text, tx_label):
+        """Construit le handler d'indemnité GRADUÉE (passé à _dissolve_common) partagé par les 3 chemins
+        de suppression/dissolution. base = montant_salaire × `weeks` ; indemnité = base × pct, où
+        pct = compute_indemnity_pct(joined_at INDIVIDUEL du membre) : < 1 mois -> 0 %, < 2 mois -> 50 %,
+        sinon 100 %. Le DM précise le pourcentage appliqué. Cohérence (section 3) : un joined_at NULL ou
+        invalide donne pct = 0 (aucune indemnité) sans jamais planter (cf. compute_indemnity_pct)."""
+        async def handler(m, order_name):
+            cid = m["character_id"]
+            pct = compute_indemnity_pct(m["joined_at"])
+            sal = db.get_salary(order_id, cid)
+            base = sal["montant"] * weeks if sal else 0
+            indemnite = int(base * pct)
+            txt = base_text.format(name=order_name)
+            if pct == 0:
+                txt += "\n💰 Aucune indemnité, ancienneté insuffisante."
+            else:
+                if indemnite > 0:
+                    # Indemnité = vrai gain pour le joueur (pas un remboursement) -> category='revenu'.
+                    credit_compte_courant(cid, indemnite, tx_label, category="revenu")
+                if pct < 1:
+                    txt += f"\n💰 Indemnité à 50 %, ancienneté d'un mois : **{_fmt(indemnite)} ¥**."
+                else:
+                    txt += (f"\n💰 Indemnité complète, ancienneté de 2 mois ou plus : "
+                            f"**{_fmt(indemnite)} ¥**.")
+            await self._dm_character_owner(guild, cid, txt)
+        return handler
+
     async def dissolve_order(self, order_id, guild):
-        """Dissolution pour trésorerie négative prolongée : indemnité de 2 mois (montant x8) aux membres
-        salariés, et bannissement de création d'ordre du chef pendant 2 mois."""
+        """Dissolution pour trésorerie négative prolongée : indemnité GRADUÉE par ancienneté individuelle
+        (base 2 mois = montant × 8 × pct) aux membres salariés, et bannissement de création d'ordre du
+        chef pendant 2 mois."""
         await self._dissolve_common(
             order_id, guild, indemnity_weeks=8, ban_chief=True,
             tx_label="Indemnité de dissolution d'ordre",
-            member_text=("⚠️ L'ordre **{name}** a été dissous suite à une trésorerie négative "
-                         "prolongée. Tu n'en fais plus partie."),
+            member_text="",  # ignoré : indemnité + DM gérés par le handler gradué
             chef_text=("⚠️ Ton ordre **{name}** a été dissous suite à une trésorerie négative prolongée "
                        "pendant 2 mois. En tant que chef, tu ne reçois pas d'indemnité, et tu ne pourras "
-                       "pas créer de nouvel ordre avant 2 mois."))
+                       "pas créer de nouvel ordre avant 2 mois."),
+            member_handler=self._graduated_member_handler(
+                order_id, guild, 8,
+                ("⚠️ L'ordre **{name}** a été dissous suite à une trésorerie négative prolongée. "
+                 "Tu n'en fais plus partie."),
+                "Indemnité de dissolution d'ordre"))
 
     async def dissolve_order_chief_departed(self, order_id, guild):
         """Dissolution suite au départ CONFIRMÉ du chef du serveur (détecté par la tâche planifiée
-        ordre_scheduler). Indemnité de 1 mois (montant x4), annonce à tous les membres
-        AVANT toute suppression, suppression du personnage du chef lui même (sautée au moment du départ),
-        et AUCUN bannissement (le chef est parti, il n'est pas fautif)."""
+        ordre_scheduler). Indemnité GRADUÉE par ancienneté individuelle (base 1 mois = montant × 4 × pct),
+        annonce à tous les membres AVANT toute suppression, suppression du personnage du chef lui même
+        (sautée au moment du départ), et AUCUN bannissement (le chef est parti, il n'est pas fautif)."""
         await self._dissolve_common(
             order_id, guild, indemnity_weeks=4, ban_chief=False,
             tx_label="Indemnité de dissolution d'ordre (départ du chef)",
-            member_text=("📢 L'ordre **{name}** a été dissous suite au départ de son chef du serveur. "
-                         "Tu as été exclu de l'ordre."),
+            member_text="",  # ignoré : indemnité + DM gérés par le handler gradué
             chef_text=None,               # le chef a quitté le serveur : injoignable
-            delete_chief_character=True)  # on supprime enfin son personnage (sauté à son départ)
+            delete_chief_character=True,  # on supprime enfin son personnage (sauté à son départ)
+            member_handler=self._graduated_member_handler(
+                order_id, guild, 4,
+                ("📢 L'ordre **{name}** a été dissous suite au départ de son chef du serveur. "
+                 "Tu as été exclu de l'ordre."),
+                "Indemnité de dissolution d'ordre (départ du chef)"))
 
     async def _dissolve_common(self, order_id, guild, *, indemnity_weeks, ban_chief,
                                tx_label, member_text, chef_text, delete_chief_character=False,
