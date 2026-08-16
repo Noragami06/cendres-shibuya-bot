@@ -46,9 +46,16 @@ TAXE_SALON = 15000  # taxe hebdomadaire ET prix d'achat/vente au gouvernement, p
 STAFF_MANAGER_ROLE_ID = 1522182819462381729  # rôle (réel ou virtuel) autorisant la gestion staff
 FICHE_STAFF_ROLE_ID = 1521229332075512039    # rôle staff global (défini localement, comme dans les autres cogs)
 
+# Suppression d'ordre avec période de grâce (soft delete + restauration + suppression différée).
+ORDER_LOGS_CATEGORY_ID = 1514876234461351957
+ORDER_LOGS_BEFORE_CHANNEL_ID = 1521243652372955286
+RESTORE_GRACE_DAYS = 15
+MIN_ORDER_AGE_FOR_INDEMNITY_DAYS = 60  # 2 mois — remplacé par l'ancienneté INDIVIDUELLE (compute_indemnity_pct)
+
 # Paramètres modifiables en « 🔧 Mode staff » (résolution par préfixe, accents ignorés).
 STAFF_EDIT_PARAMS = ["Nom", "Effectif ajouter", "Effectif retiré", "Trésorerie ajouter",
-                     "Trésorerie retirer", "Salon ajouté", "Salon retiré", "Salon modifié"]
+                     "Trésorerie retirer", "Salon ajouté", "Salon retiré", "Salon modifié",
+                     "Supprimer l'ordre"]
 
 ROLE_COLORS = {
     "Chef d'ordre": (255, 165, 60),
@@ -141,6 +148,37 @@ def _plus_months(iso: str, months: int) -> str:
     except (TypeError, ValueError):
         base = datetime.utcnow()
     return (base + timedelta(days=30 * months)).isoformat()
+
+
+def _plus_days(iso: str, days: int) -> str:
+    """Ajoute `days` jours à une date ISO (échéance de restauration : deleted_at + 15 jours)."""
+    try:
+        base = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        base = datetime.utcnow()
+    return (base + timedelta(days=days)).isoformat()
+
+
+def _days_between(start_iso: str, end_iso: str) -> int:
+    """Nombre de jours entiers entre deux dates ISO (âge de l'ordre = deleted_at - created_at)."""
+    try:
+        a = datetime.fromisoformat(start_iso)
+        b = datetime.fromisoformat(end_iso)
+    except (TypeError, ValueError):
+        return 0
+    return (b - a).days
+
+
+def compute_indemnity_pct(joined_at) -> float:
+    """Pourcentage d'indemnité selon l'ancienneté INDIVIDUELLE du membre (pas l'âge de l'ordre) :
+    < 1 mois -> 0 %, < 2 mois -> 50 %, sinon 100 %."""
+    anciennete_jours = _days_between(joined_at, _now())
+    if anciennete_jours < 30:
+        return 0.0
+    elif anciennete_jours < 60:
+        return 0.5
+    else:
+        return 1.0
 
 
 # Rang hiérarchique d'un rôle (0 = plus haut gradé). Réutilise l'ordre déjà défini pour la pillow staff.
@@ -486,6 +524,18 @@ class OrdreStaffChoiceView(discord.ui.View):
             custom_id=f"ordre_staff_mode:{user_id}"))
 
 
+class OrderRestoreView(discord.ui.View):
+    """Bouton « 🔄 Restaurer » d'un ordre en attente de suppression. Persistant (timeout=None) : le clic
+    est dispatché par le listener central on_interaction du cog (comme TOUS les boutons de ce cog), donc
+    il reste fonctionnel même après un redémarrage, sur un message posté avant le redémarrage."""
+
+    def __init__(self, order_id: int):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Restaurer", emoji="🔄", style=discord.ButtonStyle.success,
+            custom_id=f"order_restore:{order_id}"))
+
+
 class OrdreStaffView(discord.ui.View):
     """Sous la pillow du staff : pagination (ligne 0, seulement si plusieurs pages, page encodée dans
     le custom_id) + actions Ajouter / Virer / Muter (ligne 1)."""
@@ -617,6 +667,10 @@ class Ordre(commands.Cog):
         # taxe/salaires + verrous), déterministe et idempotente.
         if not self.ordre_scheduler.is_running():
             self.ordre_scheduler.start()
+        # Bouton « 🔄 Restaurer » persistant : dans ce cog, TOUS les boutons (y compris ceux des messages
+        # postés avant un redémarrage) sont dispatchés par le listener central on_interaction, qui est
+        # actif dès le chargement du cog. La persistance du bouton de restauration est donc déjà garantie
+        # par ce mécanisme, sans add_view (les custom_id sont dynamiques : ils contiennent l'order_id).
 
     async def cog_unload(self):
         self.ordre_scheduler.cancel()
@@ -756,8 +810,11 @@ class Ordre(commands.Cog):
 
     # ---------- garde "chef uniquement" (à appliquer EN PREMIER dans chaque bouton) ----------
     def _is_chief(self, order_id, user_id) -> bool:
+        # Point de passage central de TOUTES les actions du chef (dashboard, staff, trésorerie, salons,
+        # contrats, salaires). Un ordre en attente de suppression est totalement gelé : plus AUCUNE
+        # action de chef n'est possible tant qu'il n'est pas restauré ou définitivement supprimé.
         order = db.get_order(order_id)
-        if not order:
+        if not order or order["status"] == "pending_deletion":
             return False
         chef = get_character(order["chef_character_id"])
         return chef is not None and chef["user_id"] == user_id
@@ -810,6 +867,12 @@ class Ordre(commands.Cog):
             )
             return
         order = db.get_order_by_chief(character_id)
+        if order and order["status"] == "pending_deletion":
+            # Ordre suspendu : aucun accès au dashboard ni à aucune action (tout premier point d'entrée).
+            await channel.send(
+                "⚠️ Cet ordre a été suspendu et est en attente de suppression définitive. Contacte le "
+                "staff si tu penses que c'est une erreur.")
+            return
         if order:
             await self._send_dashboard(channel, order, user.id)
         else:
@@ -832,6 +895,8 @@ class Ordre(commands.Cog):
             await self.handle_ordre_self(interaction, cid)
         elif cid.startswith("ordre_staff_mode:"):
             await self.handle_ordre_staff_mode(interaction, cid)
+        elif cid.startswith("order_restore:"):
+            await self.handle_order_restore(interaction, cid)
         elif cid.startswith("ordre_create_yes:"):
             await self.handle_create_yes(interaction, cid)
         elif cid.startswith("ordre_create_no:"):
@@ -2058,7 +2123,7 @@ class Ordre(commands.Cog):
                     await channel.send("⏳ Aucun éducateur choisi, ajout annulé.")
                     return
 
-            db.add_order_member(order_id, target_cid, role)
+            db.add_order_member(order_id, target_cid, role, joined_at=_now())  # ancienneté individuelle
             if educator_cid is not None:
                 db.add_disciple_assignment(order_id, target_cid, educator_cid)
             name = get_character(target_cid)["character_name"]
@@ -2205,7 +2270,7 @@ class Ordre(commands.Cog):
         await channel.send(embed=discord.Embed(
             title="🔧 Modifications disponibles",
             description=("**PRINCIPAL :**\nNom, Effectif ajouter, Effectif retiré, Trésorerie ajouter, "
-                         "Trésorerie retirer, Salon ajouté, Salon retiré, Salon modifié"),
+                         "Trésorerie retirer, Salon ajouté, Salon retiré, Salon modifié, Supprimer l'ordre"),
             color=PHOENIX_COLOR))
         n = await self._ask_positive_int(channel, user, "Combien de modifications veux tu faire ?")
         if n is None:
@@ -2260,6 +2325,8 @@ class Ordre(commands.Cog):
             await self._staff_salon_remove(channel, user, order_id)
         elif param == "Salon modifié":
             await self._staff_salon_modify(channel, user, order_id)
+        elif param == "Supprimer l'ordre":
+            await self._staff_delete_order(channel, user, guild, order_id)
 
     async def _await_channel_mention(self, channel, user, prompt):
         """Attend un message mentionnant un salon (#salon) et retourne ce salon, ou None si annulé."""
@@ -2291,6 +2358,7 @@ class Ordre(commands.Cog):
             description=f"✅ Ordre renommé en **{full}**.", color=PHOENIX_COLOR))
 
     async def _staff_tresorerie(self, channel, user, order_id, sign):
+        # Le staff n'est jamais bloqué par le verrou de sécurité, ses actions sont correctives par nature.
         verbe = "ajouter" if sign > 0 else "retirer"
         montant = await self._ask_positive_int(channel, user, f"Quel montant veux tu {verbe} ?")
         if montant is None:
@@ -2305,6 +2373,7 @@ class Ordre(commands.Cog):
             color=PHOENIX_COLOR))
 
     async def _staff_salon_add(self, channel, user, order_id):
+        # Le staff n'est jamais bloqué par le verrou de sécurité, ses actions sont correctives par nature.
         ch = await self._await_channel_mention(channel, user, "Mentionne le salon à ajouter.")
         if ch is None:
             return
@@ -2320,6 +2389,7 @@ class Ordre(commands.Cog):
             description=f"✅ Salon #{ch.name} ajouté à l'ordre (aucune transaction).", color=PHOENIX_COLOR))
 
     async def _staff_salon_remove(self, channel, user, order_id):
+        # Le staff n'est jamais bloqué par le verrou de sécurité, ses actions sont correctives par nature.
         ch = await self._await_channel_mention(channel, user, "Mentionne le salon à retirer.")
         if ch is None:
             return
@@ -2333,10 +2403,12 @@ class Ordre(commands.Cog):
             description=f"✅ Salon #{ch.name} retiré de l'ordre (aucune transaction).", color=PHOENIX_COLOR))
 
     async def _staff_salon_modify(self, channel, user, order_id):
+        # Le staff n'est jamais bloqué par le verrou de sécurité, ses actions sont correctives par nature.
         old_ch = await self._await_channel_mention(
             channel, user, "Mentionne l'ANCIEN salon (celui actuellement enregistré, potentiellement mal renseigné).")
         if old_ch is None:
             return
+        # 1) Ligne EXACTE de cet ordre pour l'ancien salon (par id, quel que soit son statut).
         mine = next((r for r in db.get_all_salon_rows(old_ch.id) if r["order_id"] == order_id), None)
         if mine is None:
             await channel.send("❌ Cet ancien salon n'appartient pas à cet ordre.")
@@ -2344,17 +2416,28 @@ class Ordre(commands.Cog):
         new_ch = await self._await_channel_mention(channel, user, "Mentionne le NOUVEAU salon (le bon).")
         if new_ch is None:
             return
+        # 2) Le nouveau salon ne doit pas déjà appartenir réellement à un autre ordre.
         owner = db.resolve_salon_true_owner(new_ch.id)
         if owner is not None:
             owner_order = db.get_order(owner["order_id"])
             await channel.send(
                 f"❌ Le nouveau salon appartient déjà à l'ordre {owner_order['name'] if owner_order else '?'}.")
             return
-        # Transfert direct de la ligne : l'ancien salon redevient libre, le nouveau est possédé par cet ordre.
+        # 3-4) UPDATE de la MÊME ligne (channel_id uniquement : status, linked_order_id, location_expiry
+        # sont préservés automatiquement). Si le salon est lié à une location, on met aussi à jour la
+        # ligne miroir chez la contrepartie pour que les deux côtés pointent vers le bon salon.
         with db.get_connection() as conn:
             conn.execute("UPDATE order_salons SET channel_id = ? WHERE id = ?", (new_ch.id, mine["id"]))
+            mirror_updated = False
+            if mine["status"] in ("Location", "Louée") and mine["linked_order_id"]:
+                cur = conn.execute(
+                    "UPDATE order_salons SET channel_id = ? WHERE order_id = ? AND channel_id = ?",
+                    (new_ch.id, mine["linked_order_id"], old_ch.id))
+                mirror_updated = cur.rowcount > 0
+        # 5) Confirmation au staff.
+        extra = "\n🔗 La ligne miroir de location a aussi été mise à jour." if mirror_updated else ""
         await channel.send(embed=discord.Embed(
-            description=f"✅ Salon corrigé : #{old_ch.name} → #{new_ch.name}.", color=PHOENIX_COLOR))
+            description=f"✅ Salon corrigé : #{old_ch.name} → #{new_ch.name}.{extra}", color=PHOENIX_COLOR))
 
     async def _staff_effectif_remove(self, channel, user, guild, order_id):
         await channel.send("Écris le nom du personnage à retirer.")
@@ -2438,7 +2521,7 @@ class Ordre(commands.Cog):
                 if educator_cid is None:
                     await channel.send(f"Aucun éducateur choisi, {self._char_name(target_cid)} ignoré.")
                     continue
-            db.add_order_member(order_id, target_cid, role)
+            db.add_order_member(order_id, target_cid, role, joined_at=_now())  # ancienneté individuelle
             if educator_cid is not None:
                 db.add_disciple_assignment(order_id, target_cid, educator_cid)
             added.append((target_cid, role, educator_cid))
@@ -2455,6 +2538,218 @@ class Ordre(commands.Cog):
             recap.append(line)
         await channel.send(embed=discord.Embed(
             title="✅ Membres ajoutés", description="\n".join(recap), color=PHOENIX_COLOR))
+
+    # =================================================================
+    # SUPPRESSION D'ORDRE AVEC PÉRIODE DE GRÂCE (staff)
+    # =================================================================
+    async def get_or_create_order_logs_channel(self, guild):
+        """Salon de logs des suppressions d'ordre, créé paresseusement UNE SEULE FOIS (jamais recréé
+        ensuite : son id est mémorisé dans bot_state)."""
+        channel_id = db.get_bot_state("order_logs_channel_id")
+        if channel_id:
+            channel = guild.get_channel(int(channel_id))
+            if channel:
+                return channel
+        category = guild.get_channel(ORDER_LOGS_CATEGORY_ID)
+        if category is None:
+            return None
+        reference = guild.get_channel(ORDER_LOGS_BEFORE_CHANNEL_ID)
+        new_channel = await category.create_text_channel(
+            "❘・📜-logs", position=reference.position if reference else None)
+        if reference:
+            try:
+                await new_channel.move(before=reference)
+            except discord.HTTPException:
+                pass
+        db.set_bot_state("order_logs_channel_id", str(new_channel.id))
+        return new_channel
+
+    async def _staff_delete_order(self, channel, user, guild, order_id):
+        # Le staff n'est jamais bloqué par le verrou de sécurité, ses actions sont correctives par nature.
+        order = db.get_order(order_id)
+        if order is None:
+            await channel.send("Cet ordre n'existe plus.")
+            return
+        if order["status"] == "pending_deletion":
+            await channel.send("Cet ordre est déjà en attente de suppression.")
+            return
+        # Confirmation explicite (anti double-clic géré par TwoChoiceView).
+        confirm = TwoChoiceView(
+            user.id, "✅ Confirmer", "yes", "❌ Annuler", "no",
+            a_style=discord.ButtonStyle.danger, b_style=discord.ButtonStyle.secondary)
+        await channel.send(
+            embed=discord.Embed(
+                title="🗑️ Suppression de l'ordre",
+                description=(
+                    f"Tu es sur le point de supprimer **{order['name']}**. Il entrera en période de grâce "
+                    f"de {RESTORE_GRACE_DAYS} jours (restaurable par le staff), puis sera supprimé "
+                    "définitivement. Confirmer ?"),
+                color=discord.Color.red()),
+            view=confirm)
+        await confirm.wait()
+        if confirm.result != "yes":
+            await channel.send("Suppression annulée.")
+            return
+        # Raison OBLIGATOIRE : n'importe quel texte non vide est accepté, redemande tant que c'est vide.
+        reason = None
+        while True:
+            await channel.send("Indique la **raison** de la suppression.")
+            m = await self.wait_message(channel, user)
+            if m is None:
+                await channel.send("⏳ Annulé.")
+                return
+            if m.content.strip():
+                reason = m.content.strip()
+                break
+            await channel.send("La raison ne peut pas être vide.")
+
+        # Soft delete : AUCUN nettoyage, AUCUNE indemnité, AUCUNE notification définitive — tout reste
+        # intact en base, seul le statut change.
+        now = _now()
+        deadline = _plus_days(now, RESTORE_GRACE_DAYS)
+        db.set_order_pending_deletion(order_id, reason, now, deadline)
+
+        chef = get_character(order["chef_character_id"])
+        chef_mention = f"<@{chef['user_id']}>" if chef else "?"
+        # Embed + bouton « 🔄 Restaurer » dans le salon de logs.
+        logs = await self.get_or_create_order_logs_channel(guild)
+        if logs is not None:
+            embed = discord.Embed(
+                title="🗑️ Ordre en attente de suppression",
+                description=(
+                    f"**Ordre :** {order['name']}\n"
+                    f"**Chef :** {chef_mention}\n"
+                    f"**Raison :** {reason}\n"
+                    f"**Supprimé par :** {user.mention}\n"
+                    f"**Restaurable jusqu'au :** {_fmt_date(deadline)}\n\n"
+                    "🗑️ Cet ordre a été supprimé **officieusement** et sera supprimé **officiellement et "
+                    "définitivement** dans 15 jours si le staff ne le restaure pas d'ici là."),
+                color=discord.Color.red())
+            try:
+                msg = await logs.send(embed=embed, view=OrderRestoreView(order_id))
+                db.set_bot_state(f"order_del_msg:{order_id}", f"{logs.id}:{msg.id}")
+            except discord.HTTPException:
+                pass
+
+        # DM au chef ET à tous les membres.
+        dm = (f"⚠️ L'ordre {order['name']} est en attente de suppression définitive (raison : {reason}). "
+              f"Le staff peut encore le restaurer dans les {RESTORE_GRACE_DAYS} prochains jours.")
+        await self._dm_character_owner(guild, order["chef_character_id"], dm)
+        for mem in db.get_order_members(order_id):
+            if mem["character_id"] != order["chef_character_id"]:
+                await self._dm_character_owner(guild, mem["character_id"], dm)
+
+        await channel.send(embed=discord.Embed(
+            description=(f"✅ **{order['name']}** placé en attente de suppression "
+                         f"(grâce de {RESTORE_GRACE_DAYS} jours, restaurable par le staff)."),
+            color=PHOENIX_COLOR))
+
+    async def handle_order_restore(self, interaction, cid):
+        """Clic « 🔄 Restaurer » (staff uniquement, dans le délai de grâce)."""
+        if not _is_staff(interaction.user):
+            await interaction.response.send_message(
+                "Seul le staff peut restaurer un ordre.", ephemeral=True)
+            return
+        order_id = int(cid.split(":")[1])
+        order = db.get_order(order_id)
+        if order is None or order["status"] != "pending_deletion":
+            await interaction.response.send_message(
+                "Cet ordre n'est plus en attente de suppression.", ephemeral=True)
+            return
+        # Sécurité : délai dépassé (ne devrait pas arriver si le nettoyage automatique fonctionne).
+        if order["restore_deadline"] and order["restore_deadline"] <= _now():
+            await interaction.response.send_message("Le délai de restauration est dépassé.", ephemeral=True)
+            try:
+                await interaction.message.edit(view=None)
+            except discord.HTTPException:
+                pass
+            return
+        # Restauration ATOMIQUE : la condition `status = 'pending_deletion'` est DANS l'UPDATE, donc la
+        # base elle-même garantit qu'une seule restauration réussit, même si deux clics quasi simultanés
+        # de deux staffs différents arrivent (ou en cas de double envoi Discord). rowcount == 0 => un
+        # autre a déjà restauré (ou le délai est passé) entre l'arrivée du clic et cette requête.
+        if db.restore_order(order_id) == 0:
+            await interaction.response.send_message(
+                "Cet ordre a déjà été restauré (ou n'est plus en attente de suppression).", ephemeral=True)
+            return
+        db.set_bot_state(f"order_del_msg:{order_id}", "")
+        when = _fmt_date(_now())
+        emb = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed()
+        emb.add_field(name="​", value=f"✅ Restauré par {interaction.user.mention} le {when}.",
+                      inline=False)
+        try:
+            await interaction.response.edit_message(embed=emb, view=None)
+        except discord.HTTPException:
+            try:
+                await interaction.message.edit(embed=emb, view=None)
+            except discord.HTTPException:
+                pass
+        dm = f"✅ L'ordre {order['name']} a été restauré, tout redevient comme avant."
+        await self._dm_character_owner(interaction.guild, order["chef_character_id"], dm)
+        for mem in db.get_order_members(order_id):
+            if mem["character_id"] != order["chef_character_id"]:
+                await self._dm_character_owner(interaction.guild, mem["character_id"], dm)
+
+    async def _finalize_pending_deletions(self, guild):
+        """Suppression DÉFINITIVE des ordres dont le délai de restauration est écoulé (à chaque créneau)."""
+        for order in db.get_orders_pending_deletion_due(guild.id, _now()):
+            try:
+                await self._finalize_order_deletion(order, guild)
+            except Exception as e:  # un ordre en erreur ne doit pas bloquer les autres
+                print(f"[ordre_scheduler] suppression définitive ordre {order['id']} : {e}")
+
+    async def _finalize_order_deletion(self, order, guild):
+        order_id = order["id"]
+
+        async def member_handler(m, order_name):
+            # Indemnité GRADUÉE selon l'ancienneté INDIVIDUELLE du membre (son joined_at à lui, pas l'âge
+            # de l'ordre) : < 1 mois -> 0 %, < 2 mois -> 50 %, sinon 100 % du montant × 4 semaines.
+            cid = m["character_id"]
+            pct = compute_indemnity_pct(m["joined_at"])
+            sal = db.get_salary(order_id, cid)
+            base = sal["montant"] * 4 if sal else 0
+            indemnite = int(base * pct)
+            txt = ("❌ L'ordre **{name}** a été définitivement supprimé (délai de restauration écoulé). "
+                   "Tu n'en fais plus partie.").format(name=order_name)
+            if pct == 0:
+                txt += "\n💰 Aucune indemnité, ancienneté insuffisante."
+            else:
+                if indemnite > 0:
+                    # Indemnité = vrai gain (pas un remboursement) -> category='revenu'.
+                    credit_compte_courant(cid, indemnite, "Indemnité de suppression d'ordre", category="revenu")
+                if pct < 1:
+                    txt += (f"\n💰 Indemnité à 50 %, ancienneté d'un mois : **{_fmt(indemnite)} ¥**.")
+                else:
+                    txt += f"\n💰 Tu as reçu une indemnité de **{_fmt(indemnite)} ¥**."
+            await self._dm_character_owner(guild, cid, txt)
+
+        # Vrai nettoyage complet via la machinerie de dissolution (libération croisée des salons, clôture
+        # des contrats avec notifications, DM finaux, purge de toutes les tables), sans ban du chef.
+        # L'indemnité de chaque membre est gérée par member_handler (graduée) ; le chef n'en reçoit aucune.
+        await self._dissolve_common(
+            order_id, guild, indemnity_weeks=0, ban_chief=False,
+            tx_label="Indemnité de suppression d'ordre",
+            member_text="",  # non utilisé : member_handler prend en charge indemnité + DM des membres
+            chef_text=("❌ Ton ordre **{name}** a été définitivement supprimé, le délai de restauration "
+                       "de 15 jours étant écoulé."),
+            member_handler=member_handler)
+        # Édite le message de logs : retire le bouton, ajoute la mention de suppression définitive.
+        ref = db.get_bot_state(f"order_del_msg:{order_id}")
+        if ref:
+            try:
+                ch_id, msg_id = (int(x) for x in ref.split(":"))
+                logs_ch = guild.get_channel(ch_id)
+                if logs_ch is not None:
+                    msg = await logs_ch.fetch_message(msg_id)
+                    emb = msg.embeds[0] if msg.embeds else discord.Embed()
+                    emb.add_field(
+                        name="​",
+                        value=f"❌ Supprimé définitivement le {_fmt_date(_now())}, délai de restauration écoulé.",
+                        inline=False)
+                    await msg.edit(embed=emb, view=None)
+            except (discord.HTTPException, ValueError):
+                pass
+            db.set_bot_state(f"order_del_msg:{order_id}", "")
 
     async def handle_staff_mute(self, interaction, cid):
         order_id = int(cid.split(":")[1])
@@ -3342,6 +3637,8 @@ class Ordre(commands.Cog):
         for guild in self.bot.guilds:
             # Dissolution des ordres dont le chef a quitté (à chacun des 4 créneaux, comme avant).
             await self._dissolve_absent_chiefs(guild)
+            # Suppression définitive des ordres dont la période de grâce est écoulée (idem, chaque créneau).
+            await self._finalize_pending_deletions(guild)
             # Présence des disciples sous contrat : à CHAQUE créneau (4-5x/jour), pas seulement à minuit.
             await self._check_contract_disciples_presence(guild)
 
@@ -3380,6 +3677,11 @@ class Ordre(commands.Cog):
     async def _dissolve_absent_chiefs(self, guild):
         """Dissout les ordres du serveur dont le chef a quitté le serveur Discord."""
         for order in db.get_orders_in_guild_full(guild.id):
+            # Un ordre déjà en attente de suppression est géré par la suppression différée, pas ici
+            # (évite qu'il soit dissous et supprimé deux fois par des chemins différents).
+            full = db.get_order(order["id"])
+            if full and full["status"] == "pending_deletion":
+                continue
             owner_user_id = order["owner_user_id"]
             member = guild.get_member(owner_user_id)
             if member is None:
@@ -3669,10 +3971,16 @@ class Ordre(commands.Cog):
             delete_chief_character=True)  # on supprime enfin son personnage (sauté à son départ)
 
     async def _dissolve_common(self, order_id, guild, *, indemnity_weeks, ban_chief,
-                               tx_label, member_text, chef_text, delete_chief_character=False):
+                               tx_label, member_text, chef_text, delete_chief_character=False,
+                               member_handler=None):
         """Logique commune de dissolution. IMPORTANT : les libérations croisées (salons/contrats liés à
         d'AUTRES ordres), les résolutions de noms, les indemnités et les annonces se font AVANT toute
-        suppression, pendant que les données existent encore."""
+        suppression, pendant que les données existent encore.
+
+        member_handler : coroutine optionnelle `async fn(member_row, order_name)` qui prend en charge
+        INTÉGRALEMENT l'indemnité + le DM d'un membre (hors chef). Utilisé par la suppression définitive
+        pour une indemnité graduée selon l'ancienneté individuelle ; si None, on applique l'indemnité
+        uniforme (indemnity_weeks) historique."""
         order = db.get_order(order_id)
         if order is None:
             return
@@ -3683,6 +3991,9 @@ class Ordre(commands.Cog):
         for m in db.get_order_members(order_id):
             cid = m["character_id"]
             if cid == chef_cid:
+                continue
+            if member_handler is not None:
+                await member_handler(m, order_name)
                 continue
             sal = db.get_salary(order_id, cid)
             indemnite = sal["montant"] * indemnity_weeks if sal else 0

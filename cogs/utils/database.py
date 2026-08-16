@@ -294,6 +294,10 @@ CREATE TABLE IF NOT EXISTS orders (
     negative_since TEXT,            -- date ISO de bascule dans le négatif (NULL si à l'équilibre)
     lock_grace_until TEXT,          -- fin des 2 mois de grâce si le chef choisit de garder le verrou
     warning_sent INTEGER DEFAULT 0, -- 1 = avertissement « 1 mois de négatif » déjà envoyé
+    status TEXT DEFAULT 'active',    -- 'active' | 'pending_deletion' (période de grâce avant suppression définitive)
+    deletion_reason TEXT,           -- raison de la suppression (rempli uniquement pendant la période de grâce)
+    deleted_at TEXT,                -- date ISO de mise en attente de suppression (NULL sinon)
+    restore_deadline TEXT,          -- date ISO limite de restauration = deleted_at + 15 jours (NULL sinon)
     created_at TEXT
 );
 
@@ -331,7 +335,8 @@ CREATE TABLE IF NOT EXISTS order_members (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     order_id INTEGER,
     character_id INTEGER,
-    role_label TEXT                 -- 'Sous-chef', 'Formateur', 'Chef d''équipe', 'Membre d''équipe', 'Corps administratif'
+    role_label TEXT,                -- 'Sous-chef', 'Formateur', 'Chef d''équipe', 'Membre d''équipe', 'Corps administratif'
+    joined_at TEXT                  -- date ISO d'entrée effective dans l'ordre (ancienneté -> indemnité graduée)
 );
 
 CREATE TABLE IF NOT EXISTS order_salons (
@@ -556,6 +561,30 @@ def _ensure_order_columns(conn):
         conn.execute("ALTER TABLE orders ADD COLUMN lock_grace_until TEXT")
     if "warning_sent" not in cols:
         conn.execute("ALTER TABLE orders ADD COLUMN warning_sent INTEGER DEFAULT 0")
+    # Système de suppression avec période de grâce de 15 jours (soft delete puis suppression différée).
+    if "status" not in cols:
+        conn.execute("ALTER TABLE orders ADD COLUMN status TEXT DEFAULT 'active'")
+    if "deletion_reason" not in cols:
+        conn.execute("ALTER TABLE orders ADD COLUMN deletion_reason TEXT")
+    if "deleted_at" not in cols:
+        conn.execute("ALTER TABLE orders ADD COLUMN deleted_at TEXT")
+    if "restore_deadline" not in cols:
+        conn.execute("ALTER TABLE orders ADD COLUMN restore_deadline TEXT")
+
+
+def _ensure_order_members_columns(conn):
+    """Ajoute joined_at (ancienneté individuelle) à une table order_members préexistante, et
+    rétro-remplit les lignes déjà créées avant cet ajout par la date de création de leur ordre
+    (approximation raisonnable : on les suppose présents depuis la création de l'ordre)."""
+    cols = _column_names(conn, "order_members")
+    if not cols:
+        return
+    if "joined_at" not in cols:
+        conn.execute("ALTER TABLE order_members ADD COLUMN joined_at TEXT")
+    conn.execute(
+        "UPDATE order_members SET joined_at = "
+        "(SELECT created_at FROM orders WHERE orders.id = order_members.order_id) "
+        "WHERE joined_at IS NULL")
 
 
 def _ensure_salary_columns(conn):
@@ -582,6 +611,7 @@ def init_db():
         _ensure_bank_columns(conn)
         _ensure_bank_transactions_columns(conn)
         _ensure_order_columns(conn)
+        _ensure_order_members_columns(conn)
         _ensure_salary_columns(conn)
         # Unicité de l'IBAN d'ordre (fonctionne aussi sur une base migrée ; NULL multiples autorisés).
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_iban ON orders(iban)")
@@ -1299,6 +1329,44 @@ def get_order_by_chief(chef_character_id: int):
         ).fetchone()
 
 
+# ---------- Suppression d'ordre avec période de grâce (soft delete) ----------
+def set_order_pending_deletion(order_id: int, reason: str, deleted_at: str, restore_deadline: str):
+    """Place un ordre en attente de suppression : rien n'est purgé, tout reste intact en base. L'ordre
+    reste bloquant pour la règle « un seul ordre par personnage » tant qu'il n'est pas restauré ou
+    définitivement supprimé (get_order_by_chief le renvoie toujours)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE orders SET status = 'pending_deletion', deletion_reason = ?, deleted_at = ?, "
+            "restore_deadline = ? WHERE id = ?",
+            (reason, deleted_at, restore_deadline, order_id),
+        )
+
+
+def restore_order(order_id: int) -> int:
+    """Annule ATOMIQUEMENT une suppression en attente : la condition `status = 'pending_deletion'` est
+    dans l'UPDATE lui-même, donc une seule restauration peut réussir même si deux clics quasi simultanés
+    arrivent. Retourne le nombre de lignes affectées (1 = c'est CE clic qui a restauré, 0 = déjà fait /
+    plus en attente). Tout redevient comme avant (aucune donnée n'ayant été touchée pendant la grâce)."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE orders SET status = 'active', deletion_reason = NULL, deleted_at = NULL, "
+            "restore_deadline = NULL WHERE id = ? AND status = 'pending_deletion'",
+            (order_id,),
+        )
+        return cur.rowcount
+
+
+def get_orders_pending_deletion_due(guild_id: int, now_iso: str):
+    """Ordres du serveur en attente de suppression dont le délai de restauration est écoulé (à purger)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT o.* FROM orders o JOIN validated_characters v ON v.id = o.chef_character_id "
+            "WHERE v.guild_id = ? AND o.status = 'pending_deletion' AND o.restore_deadline IS NOT NULL "
+            "AND o.restore_deadline <= ? ORDER BY o.id ASC",
+            (guild_id, now_iso),
+        ).fetchall()
+
+
 def create_order(chef_character_id: int, type_: str, name: str, created_at: str) -> int:
     with get_connection() as conn:
         cur = conn.execute(
@@ -1340,8 +1408,8 @@ def get_order_members(order_id: int):
     """Membres de l'ordre (hors chef) avec les infos du personnage."""
     with get_connection() as conn:
         return conn.execute(
-            "SELECT m.id, m.character_id, m.role_label, v.character_name, v.user_id, v.slot_number "
-            "FROM order_members m LEFT JOIN validated_characters v ON v.id = m.character_id "
+            "SELECT m.id, m.character_id, m.role_label, m.joined_at, v.character_name, v.user_id, "
+            "v.slot_number FROM order_members m LEFT JOIN validated_characters v ON v.id = m.character_id "
             "WHERE m.order_id = ? ORDER BY m.id ASC",
             (order_id,),
         ).fetchall()
@@ -1355,11 +1423,14 @@ def get_order_member(order_id: int, character_id: int):
         ).fetchone()
 
 
-def add_order_member(order_id: int, character_id: int, role_label: str):
+def add_order_member(order_id: int, character_id: int, role_label: str, joined_at: str = None):
+    """Ajoute un membre à l'ordre. joined_at = date d'entrée effective (défaut : maintenant) ; elle sert
+    au calcul de l'indemnité graduée à la suppression. Tout appelant DOIT laisser le défaut ou passer la
+    vraie date d'ajout."""
     with get_connection() as conn:
         conn.execute(
-            "INSERT INTO order_members (order_id, character_id, role_label) VALUES (?, ?, ?)",
-            (order_id, character_id, role_label),
+            "INSERT INTO order_members (order_id, character_id, role_label, joined_at) VALUES (?, ?, ?, ?)",
+            (order_id, character_id, role_label, joined_at or datetime.utcnow().isoformat()),
         )
 
 
