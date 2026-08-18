@@ -258,7 +258,23 @@ CREATE TABLE IF NOT EXISTS character_stats (
     sorts_pts INTEGER DEFAULT 0,
     armes_maudites_pts INTEGER DEFAULT 0,
     energie_occulte_pts INTEGER DEFAULT 0,
-    points_restants INTEGER DEFAULT 0
+    points_restants INTEGER DEFAULT 0,
+    points_debt INTEGER DEFAULT 0
+);
+
+-- Barème : points de stats accordés par rôle (camp / clan / grade).
+CREATE TABLE IF NOT EXISTS role_point_values (
+    role_id INTEGER PRIMARY KEY,
+    category TEXT,       -- 'camp', 'clan', 'grade'
+    points INTEGER
+);
+
+-- Rôle de référence + points actuellement accordés par catégorie pour chaque personnage.
+CREATE TABLE IF NOT EXISTS character_role_point_grants (
+    character_id INTEGER PRIMARY KEY,
+    camp_role_id INTEGER, camp_points INTEGER DEFAULT 0,
+    clan_role_id INTEGER, clan_points INTEGER DEFAULT 0,
+    grade_role_id INTEGER, grade_points INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS character_buffs (
@@ -587,6 +603,51 @@ def _ensure_order_members_columns(conn):
         "WHERE joined_at IS NULL")
 
 
+def _ensure_character_stats_columns(conn):
+    """Ajoute points_debt (dette de points reprise sur les prochains gains) à une table
+    character_stats préexistante."""
+    cols = _column_names(conn, "character_stats")
+    if not cols:
+        return
+    if "points_debt" not in cols:
+        conn.execute("ALTER TABLE character_stats ADD COLUMN points_debt INTEGER DEFAULT 0")
+
+
+# Barème EXACT des points de stats par rôle (camp / clan / grade). INSERT OR REPLACE : relançable.
+ROLE_POINT_VALUES_SEED = [
+    # Camp
+    (1521961288618479829, "camp", 15),    # Exorciste
+    (1521961393614749707, "camp", 25),    # Hybride
+    (1521961499730645153, "camp", 10),    # Humain
+    # Clan (tous à 250, sauf Sans clan à 125)
+    (1521961746615504926, "clan", 250),   # Ryomen
+    (1521961744908550166, "clan", 250),   # Kashimo
+    (1521961753141841921, "clan", 250),   # Geto
+    (1521961741141934101, "clan", 250),   # Gojo
+    (1521961746196070400, "clan", 250),   # Inumaki
+    (1521961748838613143, "clan", 250),   # Kamo
+    (1521961743729819799, "clan", 250),   # Zenin
+    (1539169032324907048, "clan", 125),   # Sans clan
+    # Grade
+    (1521963027925172344, "grade", 250),  # Chef du clan
+    (1521963035898548455, "grade", 220),  # Héritier
+    (1521963034434601040, "grade", 190),  # Bras droit
+    (1521963034736726158, "grade", 190),  # Bras gauche
+    (1521963040155766835, "grade", 130),  # Bras droit héritier
+    (1521963040809943120, "grade", 130),  # Bras gauche héritier
+    (1521963104903233658, "grade", 55),   # Membre principal
+    (1521963107918807140, "grade", 30),   # Membre secondaire
+]
+
+
+def _seed_role_point_values(conn):
+    """Peuple role_point_values avec le barème exact (idempotent : INSERT OR REPLACE)."""
+    conn.executemany(
+        "INSERT OR REPLACE INTO role_point_values (role_id, category, points) VALUES (?, ?, ?)",
+        ROLE_POINT_VALUES_SEED,
+    )
+
+
 def _ensure_salary_columns(conn):
     """Ajoute is_external / expiry_date à une table order_salaries préexistante (salaires temporaires
     pour un IBAN externe à l'ordre)."""
@@ -612,6 +673,8 @@ def init_db():
         _ensure_bank_transactions_columns(conn)
         _ensure_order_columns(conn)
         _ensure_order_members_columns(conn)
+        _ensure_character_stats_columns(conn)
+        _seed_role_point_values(conn)
         _ensure_salary_columns(conn)
         # Unicité de l'IBAN d'ordre (fonctionne aussi sur une base migrée ; NULL multiples autorisés).
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_iban ON orders(iban)")
@@ -994,6 +1057,127 @@ def get_virtual_roles(character_id: int):
             "SELECT role_id FROM character_virtual_roles WHERE character_id = ?", (character_id,)
         ).fetchall()
     return [r["role_id"] for r in rows]
+
+
+def remove_virtual_role(character_id: int, role_id: int) -> bool:
+    """Retire un rôle virtuel d'un personnage (slot 2/3). Retourne True si une ligne a été supprimée."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "DELETE FROM character_virtual_roles WHERE character_id = ? AND role_id = ?",
+            (character_id, role_id),
+        )
+        return cur.rowcount > 0
+
+
+def get_validated_character_id(user_id: int, guild_id: int, slot_number: int):
+    """id du personnage validé pour ce (joueur, serveur, slot), ou None s'il n'est pas encore validé."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT id FROM validated_characters WHERE user_id = ? AND guild_id = ? AND slot_number = ?",
+            (user_id, guild_id, slot_number),
+        ).fetchone()
+    return row["id"] if row else None
+
+
+# ---------- Barème : points de stats liés aux rôles ----------
+_ROLE_POINT_CATEGORIES = ("camp", "clan", "grade")
+
+
+def get_role_point_value(role_id: int):
+    """Points accordés par un rôle selon le barème, ou None si le rôle n'y figure pas."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT points FROM role_point_values WHERE role_id = ?", (role_id,)
+        ).fetchone()
+    return row["points"] if row else None
+
+
+def get_role_point_grants(character_id: int):
+    """Ligne character_role_point_grants du personnage (ou None)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM character_role_point_grants WHERE character_id = ?", (character_id,)
+        ).fetchone()
+
+
+def sync_role_points(character_id: int, category: str, new_role_id):
+    """Recalcule les points d'UNE catégorie (camp/clan/grade) pour un personnage, applique le delta
+    (gain, ou reprise avec dette si les points étaient déjà répartis), et mémorise le nouveau rôle de
+    référence. Ne s'occupe QUE des rôles présents dans le barème (role_point_values) : si new_role_id
+    n'y figure pas, la fonction ne fait STRICTEMENT rien (aucun delta, aucun changement de référence),
+    puisque le delta doit toujours reposer sur des valeurs connues du barème. Tout en une transaction."""
+    if category not in _ROLE_POINT_CATEGORIES:
+        return
+    with get_connection() as conn:
+        npr = conn.execute(
+            "SELECT points FROM role_point_values WHERE role_id = ?", (new_role_id,)
+        ).fetchone()
+        if npr is None:
+            return  # rôle hors barème : on ne touche à rien
+        new_points = npr["points"]
+
+        grant = conn.execute(
+            f"SELECT {category}_points AS pts FROM character_role_point_grants WHERE character_id = ?",
+            (character_id,),
+        ).fetchone()
+        old_points = (grant["pts"] if grant and grant["pts"] is not None else 0)
+        delta = new_points - old_points
+
+        # Garantit l'existence de la ligne de stats.
+        conn.execute("INSERT OR IGNORE INTO character_stats (character_id) VALUES (?)", (character_id,))
+
+        if delta > 0:
+            row = conn.execute(
+                "SELECT points_debt FROM character_stats WHERE character_id = ?", (character_id,)
+            ).fetchone()
+            debt = (row["points_debt"] if row and row["points_debt"] else 0)
+            offset = min(debt, delta)          # une dette existante ampute d'abord le gain
+            debt -= offset
+            gain = delta - offset
+            conn.execute(
+                "UPDATE character_stats SET points_restants = points_restants + ?, points_debt = ? "
+                "WHERE character_id = ?",
+                (gain, debt, character_id),
+            )
+        elif delta < 0:
+            reclaim = -delta
+            row = conn.execute(
+                "SELECT points_restants FROM character_stats WHERE character_id = ?", (character_id,)
+            ).fetchone()
+            current = (row["points_restants"] if row and row["points_restants"] else 0)
+            if current >= reclaim:
+                conn.execute(
+                    "UPDATE character_stats SET points_restants = points_restants - ? WHERE character_id = ?",
+                    (reclaim, character_id),
+                )
+            else:
+                # Pas assez de points libres : le reste devient une dette reprise sur les prochains gains.
+                remaining_debt = reclaim - current
+                conn.execute(
+                    "UPDATE character_stats SET points_restants = 0, points_debt = points_debt + ? "
+                    "WHERE character_id = ?",
+                    (remaining_debt, character_id),
+                )
+
+        # Mémorise le nouveau rôle de référence + ses points, SANS toucher aux 2 autres catégories.
+        conn.execute(
+            "INSERT OR IGNORE INTO character_role_point_grants (character_id) VALUES (?)", (character_id,)
+        )
+        conn.execute(
+            f"UPDATE character_role_point_grants SET {category}_role_id = ?, {category}_points = ? "
+            "WHERE character_id = ?",
+            (new_role_id, new_points, character_id),
+        )
+
+
+def characters_without_role_point_grant():
+    """ids des personnages validés sans ligne dans character_role_point_grants (pour le rattrapage)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id FROM validated_characters WHERE id NOT IN "
+            "(SELECT character_id FROM character_role_point_grants)"
+        ).fetchall()
+    return [r["id"] for r in rows]
 
 
 # ---------- Profils de personnage (/profil) ----------

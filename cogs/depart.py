@@ -60,6 +60,7 @@ CAMP_ROLES = [ROLE_EXORCISTE, ROLE_HYBRIDE, ROLE_HUMAIN]
 CLAN_MEMBER_ROLE_ID = 1521961709517148220
 HERITIER_ROLE_ID = 1521963035898548455
 MEMBRES_PRINCIPAUX_ROLE_ID = 1521963104903233658  # Grade attribué d'office à l'hybride élevé chez les exorcistes
+SANS_CLAN_ROLE_ID = 1539169032324907048           # Rôle "Sans clan" (barème : clan à 125 points)
 
 # Rôles RCT attribués à la validation de la fiche (selon depart_character_progress.rct)
 RCT_POSSEDE_ROLE_ID = 1522181335337402408
@@ -1026,6 +1027,62 @@ def has_clan_from_progress(progress: dict) -> bool:
     return clan is not None and clan != "sans_clan"
 
 
+# =====================================================================
+# BARÈME : points de stats liés aux rôles (camp / clan / grade)
+# =====================================================================
+def resolve_role_point_ids(camp, clan, grade):
+    """Résout les role_id (camp, clan/sans-clan, grade) d'un personnage à partir de ses attributs de
+    fiche (camp, clan, grade) — mêmes valeurs que celles attribuées en rôles réels/virtuels. Un clan
+    absent ('sans_clan' ou None) donne le rôle Sans clan. grade None -> pas de grade."""
+    camp_role_id = {"exorciste": ROLE_EXORCISTE, "hybride": ROLE_HYBRIDE,
+                    "humain": ROLE_HUMAIN}.get((camp or "").lower())
+    if clan and clan != "sans_clan":
+        info = db.load_clan_state()["clans"].get(clan)
+        clan_role_id = info["role_id"] if info else None
+    else:
+        clan_role_id = SANS_CLAN_ROLE_ID
+    grade_role_id = GRADE_LABEL_TO_ROLE_ID.get(grade) if grade else None
+    return camp_role_id, clan_role_id, grade_role_id
+
+
+async def sync_role_points(character_id: int, category: str, new_role_id):
+    """Wrapper asynchrone de db.sync_role_points (les appels du projet utilisent `await`). La logique
+    (delta + dette + mémorisation du rôle de référence) est atomique côté base."""
+    db.sync_role_points(character_id, category, new_role_id)
+
+
+async def grant_initial_role_points(character_id: int, camp, clan, grade):
+    """Grant initial (ou re-synchronisation) des points de stats des 3 catégories pour un personnage,
+    d'après ses attributs. Ne fait rien pour un role_id absent du barème (cf. db.sync_role_points)."""
+    camp_rid, clan_rid, grade_rid = resolve_role_point_ids(camp, clan, grade)
+    if camp_rid:
+        await sync_role_points(character_id, "camp", camp_rid)
+    if clan_rid:
+        await sync_role_points(character_id, "clan", clan_rid)
+    if grade_rid:  # pas de grade pour un Humain / hybride sans clan
+        await sync_role_points(character_id, "grade", grade_rid)
+
+
+async def backfill_role_points(guild):
+    """Applique le grant initial à tous les personnages validés du serveur qui n'ont pas encore de
+    ligne dans character_role_point_grants, d'après leurs attributs actuels (camp/clan/grade en base,
+    qui sont la source de vérité de leurs rôles réels ou virtuels). Déclenché une fois au démarrage :
+    sans danger à relancer, il ne traite que les personnages absents de character_role_point_grants."""
+    to_grant = db.characters_without_role_point_grant()
+    if not to_grant:
+        return
+    for character_id in to_grant:
+        with db.get_connection() as conn:
+            row = conn.execute(
+                "SELECT guild_id, camp, clan, grade FROM validated_characters WHERE id = ?",
+                (character_id,),
+            ).fetchone()
+        if row is None or (guild is not None and row["guild_id"] != guild.id):
+            continue  # traité lors de l'itération de son propre serveur
+        await grant_initial_role_points(character_id, row["camp"], row["clan"], row["grade"])
+        print(f"🔍 [barème] Points de rôle rattrapés pour le personnage {character_id}.")
+
+
 def get_fiche_steps(progress: dict) -> list:
     """Étapes du questionnaire de fiche pour ce joueur.
     - "nom" seulement si pas de clan (avec clan, le nom = celui du clan).
@@ -1627,6 +1684,10 @@ async def assign_validation_roles(guild: discord.Guild, member: discord.Member, 
                     collect(grade_rid)
                 else:
                     print(f"[fiche] Grade inconnu, non attribué : {progress.get('grade_choisi')!r}")
+    else:
+        # Pas de clan (Humain, hybride chez les humains, ou clan 'sans_clan') : rôle "Sans clan",
+        # attribué exactement comme n'importe quel autre rôle de clan.
+        collect(SANS_CLAN_ROLE_ID)
 
     # 3) Rôle RCT
     collect(RCT_POSSEDE_ROLE_ID if progress.get("rct") else RCT_NON_POSSEDE_ROLE_ID)
@@ -1707,9 +1768,20 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
             (target_uid, progress.get("guild_id"), slot),
         ).fetchone()
     if prof_row is not None:
-        db.create_profile_from_fiche(prof_row["id"], progress.get("eo_value"))
+        character_id = prof_row["id"]
+        db.create_profile_from_fiche(character_id, progress.get("eo_value"))
         # Ligne de stats par défaut (tout à 0). Points de départ à définir (cf. TODO.md).
-        db.create_stats_default(prof_row["id"])
+        db.create_stats_default(character_id)
+
+        # Slots 2/3 sans clan : le rôle "Sans clan" est enregistré VIRTUELLEMENT (aucun rôle réel posé
+        # pour ces slots ; les slots 1 l'ont reçu en vrai rôle via assign_validation_roles).
+        if slot in (2, 3) and not has_clan:
+            db.add_virtual_role(character_id, SANS_CLAN_ROLE_ID)
+
+        # Grant initial des points de stats liés aux rôles (camp, clan/sans-clan, grade), une fois tous
+        # les rôles attribués (réels pour le slot 1, virtuels/enregistrés pour les slots 2/3).
+        await grant_initial_role_points(
+            character_id, progress.get("camp"), progress.get("clan"), effective_grade)
 
     # 3 bis) Place de clan : comptage basé sur la base (TOUS les personnages du clan, slots réels ET
     # virtuels), APRÈS l'insertion pour inclure ce nouveau personnage. Ferme / redistribue si le cap
@@ -2049,6 +2121,13 @@ async def reward_reroll_clan(interaction, progress):
     update_progress(uid, **fields)
     # TODO: cas limite si le nouveau clan ne permet pas le sort déjà obtenu (ex: sort héréditaire
     # partiel sur un clan qui ne le propose pas), à vérifier manuellement pour l'instant.
+
+    # Points de stats liés au rôle de clan : si ce joueur a DÉJÀ un personnage validé sur ce slot,
+    # resynchronise ses points (gain/reprise). Avant validation, le grant initial s'en chargera.
+    char_id = db.get_validated_character_id(uid, progress.get("guild_id"), progress.get("slot_number"))
+    if char_id:
+        _, new_clan_role_id, _ = resolve_role_point_ids(None, new_clan, None)
+        await sync_role_points(char_id, "clan", new_clan_role_id)
 
     state = load_clan_state()
     spell_data = build_result_spell_data(state, new_clan, sort_key, path, guild)

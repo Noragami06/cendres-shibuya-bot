@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 import os
 
 from cogs.clans import build_clans_report
-from cogs.depart import retroactive_departure_check
+from cogs.depart import retroactive_departure_check, backfill_role_points
 from cogs.utils.database import init_db
 
 load_dotenv()
@@ -40,6 +40,10 @@ async def on_ready():
     # Rattrapage des joueurs partis avant l'ajout du listener on_member_remove (sans risque de
     # le relancer à chaque démarrage : ne touche que les joueurs encore présents en base).
     await retroactive_departure_check(bot)
+    # Rattrapage du barème de points de rôle pour les personnages validés avant ce système (sans
+    # risque à relancer : ne traite que ceux sans ligne dans character_role_point_grants).
+    for guild in bot.guilds:
+        await backfill_role_points(guild)
     if not status_loop.is_running():
         status_loop.start()
 

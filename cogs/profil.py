@@ -14,6 +14,7 @@ from cogs.banque import get_characters, get_character, PHOENIX_COLOR
 # Réutilise la validation + téléchargement + compression d'image du parcours /depart, et le rôle staff.
 from cogs.depart import (
     FICHE_STAFF_ROLE_ID, PORTRAIT_DIR, compress_portrait, _download_image_bytes, _resolve_portrait_url,
+    SANS_CLAN_ROLE_ID, GRADE_LABEL_TO_ROLE_ID, GRADE_ROLES, resolve_role_point_ids, sync_role_points,
 )
 
 # ---------- Constantes ----------
@@ -567,6 +568,12 @@ class Profil(commands.Cog):
             os.remove(path)
         except OSError:
             pass
+        # Dette de points : le prochain gain lié à un rôle sera amputé de ce montant. Affichée en texte
+        # sous l'image (près du badge "Points restants").
+        # TODO: intégrer directement cette mention dans le pillow generate_stats_image plutôt qu'en texte.
+        debt = db.get_or_create_stats(character_id)["points_debt"]
+        if debt and debt > 0:
+            await channel.send(f"⚠️ Dette de points : **-{debt}** sur le prochain gain.")
 
     # ---------- commande ----------
     @app_commands.command(name="profil", description="Consulte un profil de personnage")
@@ -1340,6 +1347,12 @@ class Profil(commands.Cog):
         if param == "buff":
             return await self._edit_buff(channel, staff, character_id)
 
+        # Clan / rang : changer aussi le VRAI rôle (réel ou virtuel) + resynchroniser les points de stats.
+        if param == "clan":
+            return await self._edit_clan(channel, staff, character_id)
+        if param == "rang":
+            return await self._edit_rang(channel, staff, character_id)
+
         # Paramètres à valeur textuelle / numérique.
         await channel.send(f"Nouvelle valeur pour **{param}** ({PARAM_ALIASES[param][0]}) ?")
         while True:
@@ -1450,6 +1463,95 @@ class Profil(commands.Cog):
         await self.send_profile(channel, character_id, staff.id)
         return True
 
+    # ---------- clan / rang (change le vrai rôle + resynchronise les points) ----------
+    async def _swap_role(self, guild, character_id, slot, owner_uid, old_role_id, new_role_id):
+        """Retire l'ancien rôle et attribue le nouveau : rôle RÉEL Discord pour le slot 1, rôle VIRTUEL
+        (character_virtual_roles) pour les slots 2/3. Silencieux si permissions manquantes."""
+        if old_role_id == new_role_id:
+            return
+        if slot == 1:
+            member = guild.get_member(owner_uid) if guild else None
+            if member is None:
+                return
+            try:
+                if old_role_id:
+                    r = guild.get_role(old_role_id)
+                    if r and r in member.roles:
+                        await member.remove_roles(r, reason="Modification staff /profil")
+                if new_role_id:
+                    r = guild.get_role(new_role_id)
+                    if r and r not in member.roles:
+                        await member.add_roles(r, reason="Modification staff /profil")
+            except discord.Forbidden:
+                print(f"[profil] Permission manquante pour changer le rôle de {owner_uid}.")
+        else:
+            if old_role_id:
+                db.remove_virtual_role(character_id, old_role_id)
+            if new_role_id:
+                db.add_virtual_role(character_id, new_role_id)
+
+    async def _edit_clan(self, channel, staff, character_id):
+        char = get_character(character_id)
+        if char is None:
+            await channel.send("❌ Personnage introuvable.")
+            return True
+        valid = set(db.load_clan_state()["clans"].keys()) | {"sans_clan"}
+        await channel.send("Nouveau clan ? (nom du clan, ou `sans_clan`)")
+        m = await self.wait_message(channel, staff)
+        if m is None:
+            return None
+        key = m.content.strip().lower()
+        if key not in valid:
+            await channel.send(f"❌ Clan inconnu. Clans valides : {', '.join(sorted(valid))}.")
+            return True
+        old_role_id = resolve_role_point_ids(None, char["clan"], None)[1]
+        new_role_id = resolve_role_point_ids(None, key, None)[1]
+        # 1) Change le vrai rôle (réel/virtuel) AVANT l'UPDATE en base.
+        await self._swap_role(channel.guild, character_id, char["slot_number"], char["user_id"],
+                              old_role_id, new_role_id)
+        # 2) Met à jour la fiche.
+        with db.get_connection() as conn:
+            conn.execute("UPDATE validated_characters SET clan = ? WHERE id = ?", (key, character_id))
+        # 3) Resynchronise les points de stats de la catégorie clan.
+        await sync_role_points(character_id, "clan", new_role_id)
+        await channel.send(f"✅ Clan = {key.capitalize() if key != 'sans_clan' else 'Sans clan'} "
+                           "(rôle et points de stats mis à jour).")
+        await self.send_profile(channel, character_id, staff.id)
+        await self.send_stats(channel, character_id, staff.id)
+        return True
+
+    async def _edit_rang(self, channel, staff, character_id):
+        char = get_character(character_id)
+        if char is None:
+            await channel.send("❌ Personnage introuvable.")
+            return True
+        noms = ", ".join(name for name, _ in GRADE_ROLES)
+        await channel.send(f"Nouveau rang / grade ? (grades du barème : {noms})")
+        m = await self.wait_message(channel, staff)
+        if m is None:
+            return None
+        val = m.content.strip()
+        if not val:
+            await channel.send("❌ Le rang ne peut pas être vide.")
+            return True
+        new_role_id = GRADE_LABEL_TO_ROLE_ID.get(val)
+        old_role_id = GRADE_LABEL_TO_ROLE_ID.get(char["grade"]) if char["grade"] else None
+        if new_role_id is not None:
+            # Grade reconnu du barème : change le vrai rôle + resynchronise les points.
+            await self._swap_role(channel.guild, character_id, char["slot_number"], char["user_id"],
+                                  old_role_id, new_role_id)
+        with db.get_connection() as conn:
+            conn.execute("UPDATE validated_characters SET grade = ? WHERE id = ?", (val, character_id))
+        if new_role_id is not None:
+            await sync_role_points(character_id, "grade", new_role_id)
+            await channel.send(f"✅ Rang = {val} (rôle et points de stats mis à jour).")
+        else:
+            # Grade libre hors barème : on met à jour le texte sans toucher aux rôles ni aux points.
+            await channel.send(f"✅ Rang = {val} (grade hors barème : rôle et points inchangés).")
+        await self.send_profile(channel, character_id, staff.id)
+        await self.send_stats(channel, character_id, staff.id)
+        return True
+
     # ---------- application d'un paramètre scalaire ----------
     def _apply_scalar(self, character_id, param, raw):
         """Valide + applique un paramètre non-image/non-buff. Retourne (ok: bool, message)."""
@@ -1542,25 +1644,8 @@ class Profil(commands.Cog):
             db.update_profile(character_id, maitrise_eo_level=v)
             return True, f"✅ Niveau de Maîtrise EO = {v}."
 
-        # --- Clan ---
-        if param == "clan":
-            key = raw.strip().lower()
-            valid = set(db.load_clan_state()["clans"].keys()) | {"sans_clan"}
-            if key not in valid:
-                return False, f"❌ Clan inconnu. Clans valides : {', '.join(sorted(valid))}."
-            with db.get_connection() as conn:
-                conn.execute("UPDATE validated_characters SET clan = ? WHERE id = ?", (key, character_id))
-            return True, f"✅ Clan = {key.capitalize() if key != 'sans_clan' else 'Sans clan'}."
-
-        # --- Rang / grade (texte libre) ---
-        if param == "rang":
-            val = raw.strip()
-            if not val:
-                return False, "❌ Le rang ne peut pas être vide."
-            with db.get_connection() as conn:
-                conn.execute("UPDATE validated_characters SET grade = ? WHERE id = ?", (val, character_id))
-            return True, f"✅ Rang = {val}."
-
+        # NB : "clan" et "rang" ne passent plus par ici : ils sont traités par _edit_clan / _edit_rang
+        # (méthodes async) car ils modifient aussi le vrai rôle Discord et resynchronisent les points.
         return False, "❌ Paramètre non pris en charge."
 
 
