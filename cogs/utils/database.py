@@ -1092,6 +1092,15 @@ def get_role_point_value(role_id: int):
     return row["points"] if row else None
 
 
+def get_role_point_category(role_id: int):
+    """Catégorie ('camp'/'clan'/'grade') d'un rôle du barème, ou None s'il n'y figure pas."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT category FROM role_point_values WHERE role_id = ?", (role_id,)
+        ).fetchone()
+    return row["category"] if row else None
+
+
 def get_role_point_grants(character_id: int):
     """Ligne character_role_point_grants du personnage (ou None)."""
     with get_connection() as conn:
@@ -1100,21 +1109,28 @@ def get_role_point_grants(character_id: int):
         ).fetchone()
 
 
-def sync_role_points(character_id: int, category: str, new_role_id):
+def sync_role_points(character_id: int, category: str, new_role_id: int = None):
     """Recalcule les points d'UNE catégorie (camp/clan/grade) pour un personnage, applique le delta
     (gain, ou reprise avec dette si les points étaient déjà répartis), et mémorise le nouveau rôle de
-    référence. Ne s'occupe QUE des rôles présents dans le barème (role_point_values) : si new_role_id
-    n'y figure pas, la fonction ne fait STRICTEMENT rien (aucun delta, aucun changement de référence),
-    puisque le delta doit toujours reposer sur des valeurs connues du barème. Tout en une transaction."""
+    référence.
+
+    - new_role_id présent dans le barème : new_points = sa valeur, rôle de référence = new_role_id.
+    - new_role_id == None : RETRAIT complet des points de la catégorie (new_points = 0, sans lookup),
+      rôle de référence remis à NULL — même mécanique de dette si les points étaient déjà répartis.
+    - new_role_id NON None mais absent du barème : la fonction ne fait STRICTEMENT rien (le delta doit
+      toujours reposer sur des valeurs connues du barème). Tout en une transaction."""
     if category not in _ROLE_POINT_CATEGORIES:
         return
     with get_connection() as conn:
-        npr = conn.execute(
-            "SELECT points FROM role_point_values WHERE role_id = ?", (new_role_id,)
-        ).fetchone()
-        if npr is None:
-            return  # rôle hors barème : on ne touche à rien
-        new_points = npr["points"]
+        if new_role_id is None:
+            new_points = 0  # retrait sans remplacement : aucun lookup, la référence passera à NULL
+        else:
+            npr = conn.execute(
+                "SELECT points FROM role_point_values WHERE role_id = ?", (new_role_id,)
+            ).fetchone()
+            if npr is None:
+                return  # rôle hors barème : on ne touche à rien
+            new_points = npr["points"]
 
         grant = conn.execute(
             f"SELECT {category}_points AS pts FROM character_role_point_grants WHERE character_id = ?",

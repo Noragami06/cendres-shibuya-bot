@@ -187,6 +187,9 @@ PARAM_ALIASES = {
     "stats_energie_occulte": ["stats energie occulte"],
     "buff": ["buff"],
     "points_stats": ["points de stats", "points restants"],
+    # --- Rôles (réels slot 1 / virtuels slot 2-3, avec synchro du barème de points) ---
+    "roles_ajouter": ["ajouter des roles", "ajouter roles", "roles ajouter"],
+    "roles_retirer": ["retirer des roles", "retirer roles", "roles retirer"],
 }
 
 # "stats_X" -> clé de stat (écriture ABSOLUE dans character_stats).
@@ -234,6 +237,11 @@ def _parse_any_int(raw: str):
     if c not in ("", "-") and c.lstrip("-").isdigit():
         return int(c)
     return None
+
+
+def _is_cancel(text: str) -> bool:
+    """Vrai si le staff a écrit exactement « cancel » (casse et espaces ignorés) : annulation du flux."""
+    return (text or "").strip().lower() == "cancel"
 
 
 # =====================================================================
@@ -451,6 +459,9 @@ class Profil(commands.Cog):
         # Flux de liens en cours, clés (user_id, character_id) : anti double clic sur les boutons
         # "➕ Créer un lien" / "➖ Retirer un lien" (même principe que /shop et Répartir les points).
         self._relation_lock = set()
+        # Flux "Ajouter/Retirer des rôles" en cours, clés (user_id, character_id) : empêche deux membres
+        # du staff de modifier EN MÊME TEMPS les rôles du MÊME personnage (verrou par personnage).
+        self._role_flow_locks = set()
 
     # ---------- verrou de flux ----------
     def _acquire(self, *user_ids) -> bool:
@@ -1283,6 +1294,8 @@ class Profil(commands.Cog):
             "**STATS :**\n"
             "Stats Force, Stats Vitesse, Stats Endurance, Stats Armes maudites, Stats RCT, "
             "Stats Territoire, Stats Sorts, Stats Énergie occulte, Buff, Points de stats\n\n"
+            "**RÔLES :**\n"
+            "Ajouter des rôles, Retirer des rôles\n\n"
             "Écris le nom du paramètre à modifier."
         )
         return discord.Embed(title="Paramètres modifiables", description=desc, color=PHOENIX_COLOR)
@@ -1352,6 +1365,10 @@ class Profil(commands.Cog):
             return await self._edit_clan(channel, staff, character_id)
         if param == "rang":
             return await self._edit_rang(channel, staff, character_id)
+
+        # Rôles : ajout / retrait en masse (réels slot 1 / virtuels slot 2-3) + synchro du barème.
+        if param in ("roles_ajouter", "roles_retirer"):
+            return await self._edit_roles(channel, staff, character_id, add=(param == "roles_ajouter"))
 
         # Paramètres à valeur textuelle / numérique.
         await channel.send(f"Nouvelle valeur pour **{param}** ({PARAM_ALIASES[param][0]}) ?")
@@ -1489,6 +1506,166 @@ class Profil(commands.Cog):
                 db.remove_virtual_role(character_id, old_role_id)
             if new_role_id:
                 db.add_virtual_role(character_id, new_role_id)
+
+    # ---------- rôles (ajout / retrait en masse) ----------
+    async def _apply_single_role(self, character_id, slot, member, role, add):
+        """Applique l'ajout OU le retrait d'UN rôle : rôle RÉEL Discord pour le slot 1, rôle VIRTUEL
+        (character_virtual_roles) pour les slots 2/3. Retourne True si un changement réel a eu lieu,
+        False si l'état était déjà celui voulu (ignoré silencieusement) ou si l'action a échoué."""
+        if slot == 1:
+            if member is None:
+                return False
+            has = any(r.id == role.id for r in member.roles)
+            try:
+                if add and not has:
+                    await member.add_roles(role, reason="Modification staff /profil (rôles)")
+                    return True
+                if not add and has:
+                    await member.remove_roles(role, reason="Modification staff /profil (rôles)")
+                    return True
+            except discord.Forbidden:
+                print(f"[profil] Permission manquante pour modifier le rôle {role.id} de {member.id}.")
+            return False
+        # Slots 2/3 : rôle virtuel en base (add_virtual_role/remove_virtual_role renvoient True si la
+        # ligne a réellement été insérée / supprimée, False si l'état était déjà celui voulu).
+        if add:
+            return db.add_virtual_role(character_id, role.id)
+        return db.remove_virtual_role(character_id, role.id)
+
+    async def _edit_roles(self, channel, staff, character_id, add: bool):
+        char = get_character(character_id)
+        if char is None:
+            await channel.send("❌ Personnage introuvable.")
+            return True
+
+        # §1) Verrou par (staff, personnage) pour TOUTE la durée du flux. Si un AUTRE membre du staff
+        # modifie déjà les rôles de CE personnage, on refuse (évite deux flux concurrents sur la même
+        # cible). Le même (staff, personnage) « ne devrait pas arriver » (un seul flux par staff, garanti
+        # par _active_users) : set.add étant idempotent, on l'ignore simplement.
+        if any(cid == character_id and uid != staff.id for (uid, cid) in self._role_flow_locks):
+            await channel.send(
+                "Un autre membre du staff est déjà en train de modifier les rôles de ce personnage, "
+                "réessaie dans un instant.")
+            return True
+        lock_key = (staff.id, character_id)
+        self._role_flow_locks.add(lock_key)
+        # try/finally : le verrou est TOUJOURS libéré à la fin — succès, cancel, timeout ou exception.
+        try:
+            return await self._edit_roles_locked(channel, staff, character_id, char, add)
+        finally:
+            self._role_flow_locks.discard(lock_key)
+
+    async def _edit_roles_locked(self, channel, staff, character_id, char, add: bool):
+        """Corps du flux « Ajouter/Retirer des rôles », exécuté SOUS le verrou (staff, personnage).
+        Toutes les attentes de réponse passent par self.wait_message, déjà filtré sur CE staff ET CE
+        salon (isolation standard du bot)."""
+        slot = char["slot_number"]
+        verbe = "ajouter" if add else "retirer"
+
+        # 1) Nombre de rôles (entier strictement positif). Annulable via « cancel ».
+        await channel.send(f"Combien de rôles veux tu {verbe} ? (ou écris `cancel` pour annuler)")
+        n = None
+        while n is None:
+            m = await self.wait_message(channel, staff)
+            if m is None:
+                return None
+            if _is_cancel(m.content):
+                await channel.send("❌ Opération annulée.")
+                return True
+            n = _parse_int(m.content, minimum=1)
+            if n is None:
+                await channel.send("Entre un entier positif (au moins 1), ou `cancel` pour annuler.")
+
+        # 2-3) Collecte de N rôles UNIQUES : déduplication (1re occurrence, ordre préservé) et complétion
+        # INCRÉMENTALE des rôles manquants (le staff n'a pas à tout recommencer). AUCUNE modification en
+        # base ni sur Discord tant que la collecte n'est pas complète -> annuler à n'importe quelle étape
+        # ne laisse jamais d'état partiel.
+        await channel.send(f"Mentionne les {n} rôles en un seul message. (ou `cancel` pour annuler)")
+        collected, collected_ids = [], set()
+        while True:
+            m = await self.wait_message(channel, staff)
+            if m is None:
+                return None
+            if _is_cancel(m.content):
+                await channel.send("❌ Opération annulée.")
+                return True
+            raw = list(m.role_mentions)  # ordre d'apparition, doublons éventuels
+            if not raw:
+                await channel.send("Aucune mention de rôle détectée. Mentionne au moins un rôle "
+                                   "(ou `cancel`).")
+                continue
+            # Comptage par rôle DANS ce message (pour signaler précisément les doublons).
+            counts = {}
+            for r in raw:
+                counts[r.id] = counts.get(r.id, 0) + 1
+            # Déduplication 1re occurrence (dict.fromkeys) + accumulation, en ignorant ce qui est déjà
+            # collecté lors d'un message précédent (dédoublonnage aussi entre messages, par role_id).
+            for r in dict.fromkeys(raw):
+                if r.id not in collected_ids:
+                    collected_ids.add(r.id)
+                    collected.append(r)
+            if len(collected) > n:
+                # Trop de rôles distincts : on repart proprement de la sélection (rien n'a été modifié).
+                collected, collected_ids = [], set()
+                await channel.send(
+                    f"Tu as mentionné plus de {n} rôle(s) distinct(s). Recommence : mentionne "
+                    f"EXACTEMENT les {n} rôles voulus (ou `cancel`).")
+                continue
+            if len(collected) < n:
+                manque = n - len(collected)
+                dups = [(rid, c) for rid, c in counts.items() if c > 1]
+                if dups:
+                    details = ", ".join(f"<@&{rid}> {c} fois" for rid, c in dups)
+                    await channel.send(
+                        f"Il manque {manque} rôle(s) : tu as mentionné {details}. "
+                        "Mentionne les rôles manquants (ou `cancel`).")
+                else:
+                    await channel.send(
+                        f"Il manque {manque} rôle(s). Mentionne les rôles manquants (ou `cancel`).")
+                continue
+            break  # len(collected) == n : collecte complète
+
+        # §2) Revérification de l'existence du personnage JUSTE avant l'écriture (il a pu être supprimé
+        # pendant la collecte, qui attend des messages du staff). character_id étant constant pour tous
+        # les rôles, un seul contrôle avant TOUTE écriture garantit le « tout ou rien » : si le personnage
+        # n'existe plus, on n'applique AUCUNE modification de la liste.
+        if get_character(character_id) is None:
+            await channel.send("❌ Ce personnage n'existe plus, l'opération a été annulée.")
+            return True
+
+        # 4-5) Application rôle par rôle, chacun de façon TOTALEMENT INDÉPENDANTE : AUCUN effet de cascade
+        # entre clan et grade (ni ailleurs). Le rôle est ajouté/retiré (réel slot 1 / virtuel slot 2-3)
+        # et sync_role_points est appelé UNIQUEMENT pour CE rôle et SA propre catégorie, sans aucune
+        # propagation vers les autres. Une incohérence visuelle temporaire (ex: Héritier sans clan) est
+        # un état accepté, à corriger par un retrait explicite et séparé si le staff le souhaite.
+        guild = channel.guild
+        member = guild.get_member(char["user_id"]) if guild else None
+        done, ignored = [], []
+        for role in collected:
+            changed = await self._apply_single_role(character_id, slot, member, role, add)
+            (done if changed else ignored).append(role.name)
+            category = db.get_role_point_category(role.id)
+            if category:
+                if add:
+                    # Rôle du barème ajouté : (re)synchronise CETTE catégorie sur CE rôle (idempotent).
+                    await sync_role_points(character_id, category, role.id)
+                elif changed:
+                    # Retrait effectif d'un rôle du barème : reprise complète des points de CETTE
+                    # catégorie (new_role_id=None). Conditionné à `changed` pour ne PAS remettre à zéro
+                    # une catégorie quand le rôle retiré n'appartenait pas réellement au personnage.
+                    await sync_role_points(character_id, category, None)
+
+        # 6) Récapitulatif (mentionne les rôles ignorés car déjà dans l'état voulu).
+        verbe_pp = "ajouté(s)" if add else "retiré(s)"
+        recap = f"✅ {len(done)} rôle(s) {verbe_pp}" + (f" : {', '.join(done)}" if done else "")
+        recap += "." if not ignored else ""
+        if ignored:
+            etat = "déjà présents" if add else "déjà absents"
+            recap += f".\nℹ️ {len(ignored)} ignoré(s) ({etat}) : {', '.join(ignored)}"
+        await channel.send(recap)
+        await self.send_profile(channel, character_id, staff.id)
+        await self.send_stats(channel, character_id, staff.id)
+        return True
 
     async def _edit_clan(self, channel, staff, character_id):
         char = get_character(character_id)
