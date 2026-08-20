@@ -1,6 +1,8 @@
 import discord
 from discord.ext import commands
 
+from cogs.utils.coherence_check import run_coherence_check
+
 # ---------- IDs ----------
 # Rôle marqueur : indique qu'un membre appartient à un clan
 CLAN_MEMBER_ROLE_ID = 1521961709517148220
@@ -102,6 +104,23 @@ def build_clans_report(guild) -> str:
             lines.append("")  # ligne vide entre chaque grade
 
         lines.append(SEPARATOR)
+
+    # Rapport d'incohérences intégré au status_loop (imprimé toutes les 120 s après le rapport clans).
+    # La détection est déléguée au module partagé (même code que le script check_coherence.py, jamais
+    # dupliqué). Enveloppée dans un try/except : une panne de la vérification (base inaccessible, import
+    # manquant…) ne doit JAMAIS empêcher l'affichage du rapport des clans.
+    try:
+        lignes_incoherence = run_coherence_check()
+    except Exception as e:
+        lignes_incoherence = [f"❌ Erreur lors de la vérification de cohérence : {e}"]
+
+    lines.append("")
+    lines.append("=== INCOHÉRENCES ===")
+    if lignes_incoherence:
+        lines.extend(lignes_incoherence)
+    else:
+        lines.append("Aucune incohérence détectée.")
+    lines.append("=" * 50)
 
     return "\n".join(lines)
 

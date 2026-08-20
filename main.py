@@ -81,8 +81,9 @@ async def status_loop():
     print(f"⚡ Commandes slash (/) — {len(slash_commands)}")
     for c in slash_commands:
         print(f"   {c}")
+    # build_clans_report se termine désormais par la section « === INCOHÉRENCES === » et son propre
+    # séparateur de clôture ("=" * 50) : plus besoin d'en imprimer un second ici.
     print(build_clans_report(guild))
-    print("=" * 50)
 
 
 bot.run(TOKEN)
