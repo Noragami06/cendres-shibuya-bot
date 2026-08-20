@@ -10,6 +10,9 @@ from discord.ext import commands
 
 from cogs.utils import database as db
 from cogs.banque import PHOENIX_COLOR
+# Réutilise EXACTEMENT le compresseur des portraits de fiche (redimensionnement + JPEG) pour les images
+# statiques, afin d'avoir un traitement cohérent partout dans le bot.
+from cogs.depart import compress_portrait
 
 # =====================================================================
 # CONSTANTES
@@ -41,16 +44,6 @@ def is_similar(name_a: str, name_b: str, threshold: float = 0.85) -> bool:
 
 def _is_fiche_staff(member) -> bool:
     return any(r.id == FICHE_STAFF_ROLE_ID for r in getattr(member, "roles", []))
-
-
-def _image_extension(attachment: discord.Attachment) -> str:
-    """Extension d'origine (sans point), déduite du nom de fichier puis du content_type. 'png' par défaut."""
-    ext = os.path.splitext(attachment.filename or "")[1].lower().lstrip(".")
-    if ext:
-        return ext
-    ctype = (attachment.content_type or "").split(";")[0].strip().lower()  # ex : "image/gif"
-    sub = ctype.split("/")[-1] if "/" in ctype else ""
-    return sub or "png"
 
 
 def _available_slots(user_id: int, guild_id: int):
@@ -244,29 +237,57 @@ class Reservation(commands.Cog):
                 f"{restants}.", ephemeral=True)
             return
 
-        # 5) Validation + téléchargement de l'image (TOUS formats image, GIF inclus, SANS recompression).
-        if not (image.content_type or "").startswith("image/"):
+        # 5) Validation + traitement de l'image selon son TYPE :
+        #    - GIF ("image/gif") : jamais recompressé (préserve l'animation), rejeté au-delà de 8 Mo.
+        #    - Image statique (jpeg/png/webp/…) : compressée EXACTEMENT comme les portraits de fiche
+        #      (redimensionnement à 1600 px max + JPEG qualité 85), puis sauvegardée en .jpg.
+        ctype = (image.content_type or "").split(";")[0].strip().lower()  # ex : "image/gif"
+        if not ctype.startswith("image/"):
             await interaction.followup.send(
                 "❌ Le fichier fourni n'est pas une image. Envoie une image (PNG, JPG, GIF, WebP…).",
                 ephemeral=True)
             return
-        if image.size and image.size > MAX_IMAGE_BYTES:
-            await interaction.followup.send(
-                "❌ Image trop lourde (max 8 Mo). Envoie une version plus légère.", ephemeral=True)
-            return
-        try:
-            data = await image.read()  # bytes bruts, sans recompression (un GIF garde son animation)
-        except discord.HTTPException:
-            await interaction.followup.send(
-                "❌ Le téléchargement de l'image a échoué, réessaie.", ephemeral=True)
-            return
-        if len(data) > MAX_IMAGE_BYTES:
-            await interaction.followup.send(
-                "❌ Image trop lourde (max 8 Mo). Envoie une version plus légère.", ephemeral=True)
-            return
 
         os.makedirs(RESERVATION_DIR, exist_ok=True)
-        filename = f"{character_id}_{uuid.uuid4().hex}.{_image_extension(image)}"
+
+        if ctype == "image/gif":
+            # GIF : contrôle STRICT de la taille (aucune recompression possible sans casser l'animation).
+            if image.size and image.size > MAX_IMAGE_BYTES:
+                taille_mo = round(image.size / (1024 * 1024), 2)
+                await interaction.followup.send(
+                    f"❌ Ce GIF dépasse la limite de 8 Mo ({taille_mo} Mo). Réduis sa taille avant de le "
+                    "renvoyer.", ephemeral=True)
+                return
+            try:
+                data = await image.read()  # bytes bruts : le GIF garde intégralement son animation
+            except discord.HTTPException:
+                await interaction.followup.send(
+                    "❌ Le téléchargement de l'image a échoué, réessaie.", ephemeral=True)
+                return
+            if len(data) > MAX_IMAGE_BYTES:  # revérification sur les octets réellement téléchargés
+                taille_mo = round(len(data) / (1024 * 1024), 2)
+                await interaction.followup.send(
+                    f"❌ Ce GIF dépasse la limite de 8 Mo ({taille_mo} Mo). Réduis sa taille avant de le "
+                    "renvoyer.", ephemeral=True)
+                return
+            filename = f"{character_id}_{uuid.uuid4().hex}.gif"  # GIF conservé tel quel
+        else:
+            # Image statique : téléchargement puis compression (même fonction que les portraits de fiche).
+            try:
+                raw = await image.read()
+            except discord.HTTPException:
+                await interaction.followup.send(
+                    "❌ Le téléchargement de l'image a échoué, réessaie.", ephemeral=True)
+                return
+            try:
+                data = compress_portrait(raw, max_dimension=1600, quality=85)
+            except Exception:
+                await interaction.followup.send(
+                    "❌ Impossible de traiter cette image (format non pris en charge ou fichier corrompu). "
+                    "Réessaie avec une autre image.", ephemeral=True)
+                return
+            filename = f"{character_id}_{uuid.uuid4().hex}.jpg"  # toujours .jpg après compression
+
         image_path = os.path.join(RESERVATION_DIR, filename)
         try:
             with open(image_path, "wb") as f:

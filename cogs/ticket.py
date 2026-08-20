@@ -3,6 +3,8 @@ from discord.ext import commands
 from discord import app_commands
 import os
 import uuid
+import random
+import string
 from datetime import datetime
 
 from cogs.utils import database as db
@@ -25,6 +27,23 @@ REASONS = {
 
 def has_staff_role(member: discord.Member) -> bool:
     return any(role.id == STAFF_ROLE_ID for role in member.roles)
+
+
+def generate_ticket_uid() -> str:
+    """Identifiant permanent à 15 chiffres, unique en base (permet de rouvrir un ticket même longtemps
+    après la suppression de son salon)."""
+    while True:
+        uid = "".join(random.choices(string.digits, k=15))
+        if not db.ticket_uid_exists(uid):
+            return uid
+
+
+def backfill_ticket_uids():
+    """Rattrapage : attribue un ticket_uid aux tickets créés avant l'ajout de cette colonne. Sans danger
+    à relancer (ne traite que les lignes dont ticket_uid est NULL)."""
+    for ticket_id in db.get_ticket_ids_without_uid():
+        db.set_ticket_uid(ticket_id, generate_ticket_uid())
+        print(f"🔍 [ticket] ticket_uid rattrapé pour le ticket #{ticket_id}.")
 
 
 async def save_transcript(channel: discord.TextChannel, ticket_id: str) -> str:
@@ -136,32 +155,47 @@ class FicheStartView(discord.ui.View):
         await interaction.response.send_message(embed=embed)
 
 
+def build_ticket_overwrites(guild, requester):
+    """Permissions standard d'un salon de ticket : personne par défaut, l'ouvreur (s'il est présent),
+    le rôle d'accès staff, et le bot. Partagé entre la création normale et /reopen pour garantir des
+    permissions IDENTIQUES. `requester` peut être None (l'ouvreur a quitté le serveur) : dans ce cas,
+    seuls le rôle d'accès et le bot voient le salon."""
+    access_role = guild.get_role(TICKET_ACCESS_ROLE_ID)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        access_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True),
+    }
+    if requester is not None:
+        overwrites[requester] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True
+        )
+        # Les joueurs "départ" (fiche pas encore validée) peuvent uploader images/embeds dans CE ticket.
+        if any(role.id == DEPART_ROLE_ID for role in requester.roles):
+            overwrites[requester] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True,
+                attach_files=True, embed_links=True
+            )
+    return overwrites
+
+
 async def create_ticket_channel(interaction, requester, ticket_type, reason_text):
     global_id, type_number = db.next_ticket_numbers(ticket_type)
 
     guild = interaction.guild
     category = guild.get_channel(TICKET_CATEGORY_ID)
-    access_role = guild.get_role(TICKET_ACCESS_ROLE_ID)
 
     safe_name = requester.name.lower().replace(" ", "-")
     channel_name = f"{ticket_type}-{safe_name}-{type_number}"
 
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        requester: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-        access_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True),
-    }
-
-    # Les joueurs "départ" (fiche pas encore validée) peuvent uploader images/embeds dans CE ticket uniquement.
-    if any(role.id == DEPART_ROLE_ID for role in requester.roles):
-        overwrites[requester] = discord.PermissionOverwrite(
-            view_channel=True, send_messages=True, read_message_history=True,
-            attach_files=True, embed_links=True
-        )
+    overwrites = build_ticket_overwrites(guild, requester)
 
     channel = await category.create_text_channel(name=channel_name, overwrites=overwrites)
 
+    # Identifiant permanent unique, stocké dès l'INSERT initial (survivra à la suppression du salon).
+    # base_channel_name = nom d'origine du salon, figé ici et JAMAIS modifié : sert de base stable au nom
+    # des salons rouverts (toujours UN seul suffixe "-reopened", quel que soit le nombre de réouvertures).
+    ticket_uid = generate_ticket_uid()
     db.insert_ticket(
         ticket_id=global_id,
         channel_id=channel.id,
@@ -170,6 +204,8 @@ async def create_ticket_channel(interaction, requester, ticket_type, reason_text
         reason=reason_text,
         status="open",
         created_at=datetime.utcnow().isoformat(),
+        ticket_uid=ticket_uid,
+        base_channel_name=channel_name,
     )
 
     info = REASONS[ticket_type]
@@ -236,7 +272,15 @@ class TicketControlView(discord.ui.View):
             content="Suppression en cours, sauvegarde de la discussion...", embed=None, view=None
         )
 
+        # Le ticket_uid est permanent : la LIGNE en base n'est jamais supprimée (seul le salon Discord
+        # l'est). On garde donc l'identifiant pour permettre une réouverture ultérieure via /reopen.
+        # Défensif : si un ancien ticket n'avait pas encore d'uid (avant rattrapage), on en génère un.
+        ticket_uid = ticket["ticket_uid"] or generate_ticket_uid()
+        if not ticket["ticket_uid"]:
+            db.set_ticket_uid(ticket_id, ticket_uid)
+
         transcript_path = await save_transcript(interaction.channel, ticket_id)
+        # La ligne tickets N'EST PAS supprimée : on met juste status='deleted' + le chemin du transcript.
         db.update_ticket_transcript(ticket_id, "deleted", transcript_path)
 
         owner = interaction.client.get_user(OWNER_DM_ID)
@@ -244,11 +288,35 @@ class TicketControlView(discord.ui.View):
             info = REASONS[ticket["type"]]
             embed = discord.Embed(
                 title=f"Ticket #{ticket_id} supprimé",
-                description=f"Type : {info['label']}\nOuvert par : <@{ticket['user_id']}>\nSupprimé par : {interaction.user.mention}",
+                description=(
+                    f"Type : {info['label']}\nOuvert par : <@{ticket['user_id']}>\n"
+                    f"Supprimé par : {interaction.user.mention}\n"
+                    f"🎫 Numéro de ticket (pour une réouverture éventuelle) : `{ticket_uid}`"
+                ),
                 color=discord.Color.dark_grey(),
             )
             try:
                 await owner.send(embed=embed, file=discord.File(transcript_path))
+            except discord.Forbidden:
+                pass
+
+        # DM à l'utilisateur d'origine, avec son transcript ET son numéro de ticket, pour qu'il en garde
+        # une trace (nécessaire s'il souhaite demander une réouverture plus tard).
+        opener = interaction.client.get_user(ticket["user_id"])
+        if opener is None:
+            try:
+                opener = await interaction.client.fetch_user(ticket["user_id"])
+            except discord.HTTPException:
+                opener = None
+        if opener:
+            try:
+                await opener.send(
+                    content=(
+                        "🔒 Ton ticket a été supprimé. Voici la sauvegarde de la discussion.\n"
+                        f"🎫 Numéro de ticket (pour une réouverture éventuelle) : `{ticket_uid}`"
+                    ),
+                    file=discord.File(transcript_path),
+                )
             except discord.Forbidden:
                 pass
 
@@ -263,6 +331,8 @@ class Ticket(commands.Cog):
         self.bot.add_view(TicketOpenView())
         self.bot.add_view(TicketControlView())
         self.bot.add_view(FicheStartView())
+        # Rattrapage des tickets créés avant l'ajout de ticket_uid (une fois au démarrage, idempotent).
+        backfill_ticket_uids()
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
@@ -331,6 +401,96 @@ class Ticket(commands.Cog):
 
         await channel.send(embed=embed, view=TicketOpenView())
         await interaction.response.send_message(f"Panel envoyé dans {channel.mention} ✅", ephemeral=True)
+
+    @app_commands.command(name="reopen", description="Rouvre un ticket fermé via son identifiant")
+    @app_commands.describe(id="Le numéro à 15 chiffres du ticket à rouvrir")
+    async def reopen(self, interaction: discord.Interaction, id: str):
+        # 1) Staff uniquement (même rôle que /ticket).
+        if not has_staff_role(interaction.user):
+            await interaction.response.send_message(
+                "Tu n'as pas la permission d'utiliser cette commande.", ephemeral=True)
+            return
+
+        # La suite prend du temps (création de salon, envoi de fichier, DM) : on diffère la réponse.
+        await interaction.response.defer(ephemeral=True)
+
+        ticket_uid = (id or "").strip()
+
+        # 2) Ticket existant ?
+        ticket = db.get_ticket_by_uid(ticket_uid)
+        if ticket is None:
+            await interaction.followup.send("Aucun ticket trouvé avec cet identifiant.", ephemeral=True)
+            return
+
+        # 3) Doit être fermé (status 'deleted').
+        if ticket["status"] != "deleted":
+            await interaction.followup.send(
+                "Ce ticket n'est pas fermé, impossible de le rouvrir.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        ticket_type = ticket["type"]
+        user_id = ticket["user_id"]
+
+        # 4) Résolution du membre d'origine : cache d'abord, puis fetch_member (cache éventuellement
+        #    désynchronisé). Si toujours None après ça, le joueur a réellement quitté le serveur.
+        member = guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except (discord.NotFound, discord.HTTPException):
+                member = None
+        on_server = member is not None
+
+        # 5) Nouveau salon : MÊME catégorie et MÊMES permissions que la création normale. Le nom est
+        #    construit à partir du nom de BASE d'origine figé en base (jamais du nom du salon précédent) :
+        #    toujours UN seul suffixe "-reopened", peu importe le nombre de réouvertures passées. Repli
+        #    pour les tickets créés avant l'ajout de base_channel_name (colonne NULL).
+        category = guild.get_channel(TICKET_CATEGORY_ID)
+        base_name = ticket["base_channel_name"] or f"{ticket_type}-{ticket['id']}"
+        channel_name = f"{base_name}-reopened"
+        # build_ticket_overwrites gère member=None : salon créé quand même (staff + bot uniquement), sans
+        # overwrite pour un joueur qui n'est plus sur le serveur — la création n'échoue jamais pour ça.
+        overwrites = build_ticket_overwrites(guild, member)
+        new_channel = await category.create_text_channel(name=channel_name, overwrites=overwrites)
+
+        # 6) Embed de réouverture + transcript existant en pièce jointe (sans reposter message par message).
+        reopen_embed = discord.Embed(
+            description=(
+                f"🔄 Ce ticket a été rouvert par {interaction.user.mention} le "
+                f"{datetime.utcnow().strftime('%d/%m/%Y à %H:%M')} (UTC). "
+                f"Ticket original : #{ticket_uid}."
+            ),
+            color=discord.Color.blurple(),
+        )
+        transcript_path = ticket["transcript_path"]
+        if transcript_path and os.path.exists(transcript_path):
+            await new_channel.send(
+                content=f"<@{user_id}>", embed=reopen_embed, file=discord.File(transcript_path),
+                view=TicketControlView())
+        else:
+            await new_channel.send(content=f"<@{user_id}>", embed=reopen_embed, view=TicketControlView())
+
+        # 7) Réouverture en base : MÊME ticket_uid conservé, statut 'open' + nouveau salon.
+        db.reopen_ticket(ticket_uid, new_channel.id)
+
+        # 8) DM à l'utilisateur d'origine : tenté même s'il a quitté LE SERVEUR (fetch_user peut aboutir
+        #    tant qu'il n'a pas bloqué le bot / fermé ses DMs). Échec ignoré silencieusement.
+        try:
+            opener_user = await self.bot.fetch_user(user_id)
+            await opener_user.send(
+                f"🔄 Ton ticket a été rouvert par le staff, rendez vous dans {new_channel.mention}.")
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
+
+        # 9) Confirmation ephemeral au staff, en signalant le cas d'un joueur parti du serveur.
+        if on_server:
+            await interaction.followup.send(
+                f"✅ Ticket rouvert avec succès : {new_channel.mention}.", ephemeral=True)
+        else:
+            await interaction.followup.send(
+                f"✅ Ticket rouvert avec succès : {new_channel.mention}. ⚠️ Le joueur d'origine ne semble "
+                "plus être sur le serveur, il n'a pas pu recevoir de permission ni de DM.", ephemeral=True)
 
 
 async def setup(bot):

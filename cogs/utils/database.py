@@ -14,7 +14,9 @@ CREATE TABLE IF NOT EXISTS tickets (
     reason TEXT,
     status TEXT,
     created_at TEXT,
-    transcript_path TEXT
+    transcript_path TEXT,
+    ticket_uid TEXT UNIQUE,         -- identifiant permanent à 15 chiffres (survit à la suppression du salon)
+    base_channel_name TEXT          -- nom d'origine du salon, figé à la création (nom stable des réouvertures)
 );
 
 CREATE TABLE IF NOT EXISTS ticket_counters (
@@ -660,6 +662,19 @@ def _ensure_salary_columns(conn):
         conn.execute("ALTER TABLE order_salaries ADD COLUMN expiry_date TEXT")
 
 
+def _ensure_tickets_columns(conn):
+    """Ajoute ticket_uid à une table tickets préexistante. SQLite interdit d'ajouter une colonne UNIQUE
+    via ALTER : l'unicité est assurée par un index unique créé juste après (les NULL multiples restent
+    autorisés jusqu'au rattrapage rétroactif)."""
+    cols = _column_names(conn, "tickets")
+    if not cols:
+        return
+    if "ticket_uid" not in cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN ticket_uid TEXT")
+    if "base_channel_name" not in cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN base_channel_name TEXT")
+
+
 def init_db():
     """Crée les tables manquantes et applique les migrations légères. N'efface jamais de données."""
     with get_connection() as conn:
@@ -676,8 +691,11 @@ def init_db():
         _ensure_character_stats_columns(conn)
         _seed_role_point_values(conn)
         _ensure_salary_columns(conn)
+        _ensure_tickets_columns(conn)
         # Unicité de l'IBAN d'ordre (fonctionne aussi sur une base migrée ; NULL multiples autorisés).
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_iban ON orders(iban)")
+        # Unicité du ticket_uid (fonctionne aussi sur une base migrée ; NULL multiples autorisés).
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_uid ON tickets(ticket_uid)")
         _migrate_item_categorie_id(conn)
 
 
@@ -708,12 +726,53 @@ def next_ticket_numbers(ticket_type: str):
     return global_id, type_number
 
 
-def insert_ticket(ticket_id, channel_id, user_id, ticket_type, reason, status, created_at):
+def insert_ticket(ticket_id, channel_id, user_id, ticket_type, reason, status, created_at,
+                  ticket_uid=None, base_channel_name=None):
     with get_connection() as conn:
         conn.execute(
-            """INSERT INTO tickets (id, channel_id, user_id, type, reason, status, created_at, transcript_path)
-               VALUES (?, ?, ?, ?, ?, ?, ?, NULL)""",
-            (ticket_id, channel_id, user_id, ticket_type, reason, status, created_at),
+            """INSERT INTO tickets (id, channel_id, user_id, type, reason, status, created_at,
+                                    transcript_path, ticket_uid, base_channel_name)
+               VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
+            (ticket_id, channel_id, user_id, ticket_type, reason, status, created_at,
+             ticket_uid, base_channel_name),
+        )
+
+
+def ticket_uid_exists(ticket_uid: str) -> bool:
+    """Vrai si un ticket porte déjà cet identifiant permanent (unicité à la génération)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT 1 FROM tickets WHERE ticket_uid = ?", (ticket_uid,)
+        ).fetchone() is not None
+
+
+def get_ticket_by_uid(ticket_uid: str):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM tickets WHERE ticket_uid = ?", (ticket_uid,)
+        ).fetchone()
+
+
+def get_ticket_ids_without_uid():
+    """ids des tickets créés avant l'ajout de ticket_uid (pour le rattrapage rétroactif)."""
+    with get_connection() as conn:
+        rows = conn.execute("SELECT id FROM tickets WHERE ticket_uid IS NULL").fetchall()
+    return [r["id"] for r in rows]
+
+
+def set_ticket_uid(ticket_id: int, ticket_uid: str):
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE tickets SET ticket_uid = ? WHERE id = ?", (ticket_uid, ticket_id)
+        )
+
+
+def reopen_ticket(ticket_uid: str, new_channel_id: int):
+    """Rouvre un ticket fermé : statut 'open' + nouveau salon, en conservant le MÊME ticket_uid."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE tickets SET status = 'open', channel_id = ? WHERE ticket_uid = ?",
+            (new_channel_id, ticket_uid),
         )
 
 
