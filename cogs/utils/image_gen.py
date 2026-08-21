@@ -1895,3 +1895,250 @@ def generate_salons_ordre_image(order_name: str, salons: list, page: int, out_pa
 
     img.save(out_path)
     return out_path, total_pages
+
+
+# =====================================================================
+# TECHNIQUES OCCULTES (/profil → bouton ⚡ Technique)
+# =====================================================================
+TECH_BG = (10, 9, 15, 255)
+TECH_TEXT = (235, 235, 240, 255)
+TECH_SUB = (150, 148, 160, 255)
+TECH_GOLD = (232, 197, 121, 255)
+TECH_HEADER_COLOR = (255, 200, 60, 255)
+TECH_LOCKED_COLOR = (70, 68, 80)
+
+def _tech_frame(d, xy, gold, width=3, radius=14):
+    d.rounded_rectangle(xy, radius=radius, outline=gold, width=width)
+
+def _tech_hex_gauge(d, cx, cy, r, pct, color, bg, width=9):
+    pts = [(cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a))) for a in range(-90, 271, 60)]
+    for i in range(6):
+        d.line((pts[i], pts[(i + 1) % 6]), fill=bg, width=width)
+    edge_len = 2 * r * math.sin(math.radians(30))
+    total_dist = pct / 100 * (6 * edge_len)
+    remaining = total_dist
+    for i in range(6):
+        if remaining <= 0:
+            break
+        p0, p1 = pts[i], pts[(i + 1) % 6]
+        seg = min(edge_len, remaining)
+        t = seg / edge_len
+        mx = p0[0] + (p1[0] - p0[0]) * t
+        my = p0[1] + (p1[1] - p0[1]) * t
+        d.line((p0, (mx, my)), fill=color, width=width)
+        remaining -= edge_len
+
+def _tech_sort_card(d, x, y, w, h, name, level, color, locked=False):
+    _tech_frame(d, (x, y, x + w, y + h), color, width=3, radius=12)
+    if locked:
+        qw = text_w(d, "???", font(20, True))
+        d.text((x + w / 2 - qw / 2, y + h / 2 - 30), "???", font=font(20, True), fill=TECH_SUB)
+        lock_txt = "Verrouillé"
+        lw = text_w(d, lock_txt, font(11))
+        d.rounded_rectangle((x + w / 2 - lw / 2 - 10, y + h - 40, x + w / 2 + lw / 2 + 10, y + h - 16), radius=8, outline=TECH_SUB, width=1)
+        d.text((x + w / 2 - lw / 2, y + h - 35), lock_txt, font=font(11), fill=TECH_SUB)
+        return
+    d.text((x + 18, y + 16), name, font=font(16, True), fill=color)
+    badge_txt = f"Lv{level}"
+    bw = text_w(d, badge_txt, font(12, True))
+    d.rounded_rectangle((x + w - bw - 26, y + 14, x + w - 14, y + 34), radius=10, fill=color)
+    d.text((x + w - bw - 20, y + 17), badge_txt, font=font(12, True), fill=(15, 15, 18, 255))
+    d.text((x + 18, y + h - 30), "Sorts : actifs", font=font(10), fill=TECH_SUB)
+
+def _tech_maitrise_hex(d, cx, cy, name, level, xp_cur, xp_max, color):
+    r = 62
+    if level is None:
+        _tech_hex_gauge(d, cx, cy, r, 0, TECH_LOCKED_COLOR, (60, 58, 70, 255), width=3)
+        qw = text_w(d, "???", font(22, True))
+        d.text((cx - qw / 2, cy - 14), "???", font=font(22, True), fill=TECH_SUB)
+        return
+    pct = (xp_cur / xp_max) * 100 if xp_max else 0
+    _tech_hex_gauge(d, cx, cy, r, pct, color, (35, 33, 42, 255), width=9)
+    lvl_txt = f"Lv{level}"
+    lw = text_w(d, lvl_txt, font(24, True))
+    d.text((cx - lw / 2, cy - 28), lvl_txt, font=font(24, True), fill=color)
+    xp_txt = f"{xp_cur}/{xp_max}"
+    xw = text_w(d, xp_txt, font(11))
+    d.text((cx - xw / 2, cy + 6), xp_txt, font=font(11), fill=TECH_SUB)
+    nw = text_w(d, name, font(14, True))
+    d.text((cx - nw / 2, cy + r + 14), name, font=font(14, True), fill=TECH_TEXT)
+
+def _tech_maximum_box(d, xy, gold):
+    x0, y0, x1, y1 = xy
+    _tech_frame(d, xy, gold, width=3, radius=14)
+    title = "TECHNIQUE MAXIMUM"
+    tw = text_w(d, title, font(16, True))
+    d.text(((x0 + x1) / 2 - tw / 2, y0 + 14), title, font=font(16, True), fill=gold)
+
+
+def generate_technique_image(name: str, camp: str, sorts: list, out_path: str, portrait_path=None, background_path=None):
+    """
+    sorts : liste de jusqu'à 4 tuples (nom, niveau, couleur_rgb, xp_actuel, xp_max).
+            Un slot verrouillé/vide est représenté par (None, None, None, None, None).
+    """
+    W, H = 1400, 950
+    if background_path and os.path.exists(background_path):
+        try:
+            bg = ImageOps.fit(Image.open(background_path).convert("RGB"), (W, H), method=Image.LANCZOS)
+            bg = bg.filter(ImageFilter.GaussianBlur(radius=8)).convert("RGBA")
+            img = Image.alpha_composite(bg, Image.new("RGBA", (W, H), (0, 0, 0, 140)))
+        except Exception:
+            img = Image.new("RGBA", (W, H), TECH_BG)
+    else:
+        img = Image.new("RGBA", (W, H), TECH_BG)
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, W, H), outline=TECH_GOLD, width=2)
+
+    cx, cy, r = W - 110, 90, 60
+    pts = [(cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a))) for a in range(-90, 271, 60)]
+    portrait_filled = False
+    if portrait_path and os.path.exists(portrait_path):
+        try:
+            xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+            x0, y0, x1, y1 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+            bw, bh = x1 - x0, y1 - y0
+            photo = ImageOps.fit(Image.open(portrait_path).convert("RGBA"), (bw, bh), method=Image.LANCZOS)
+            hex_mask = Image.new("L", (bw, bh), 0)
+            ImageDraw.Draw(hex_mask).polygon([(px - x0, py - y0) for px, py in pts], fill=255)
+            img.paste(photo, (x0, y0), hex_mask)
+            portrait_filled = True
+        except Exception:
+            portrait_filled = False
+    if portrait_filled:
+        d.polygon(pts, outline=TECH_GOLD, width=3)
+    else:
+        d.polygon(pts, outline=TECH_GOLD, width=3, fill=(20, 20, 28, 255))
+
+    title = "TECHNIQUES OCCULTES"
+    d.text((40, 30), title, font=font(26, True), fill=TECH_HEADER_COLOR)
+    sub = f"{name}  ·  {camp}"
+    d.text((40, 64), sub, font=font(13, True), fill=TECH_GOLD)
+    d.line((40, 150, W - 40, 150), fill=(55, 52, 65, 255), width=2)
+
+    d.text((40, 168), "GRANDES CATÉGORIES", font=font(13, True), fill=TECH_HEADER_COLOR)
+    gap = 20
+    card_w = (W - 40 * 2 - gap * 3) // 4
+    y0 = 198
+    padded_sorts = (sorts + [(None, None, None, None, None)] * 4)[:4]
+    for i, (sname, lvl, color, xp_cur, xp_max) in enumerate(padded_sorts):
+        x = 40 + i * (card_w + gap)
+        _tech_sort_card(d, x, y0, card_w, 150, sname, lvl, color if color else TECH_LOCKED_COLOR, locked=(sname is None))
+
+    my = y0 + 190
+    d.text((40, my), "MAÎTRISE", font=font(13, True), fill=TECH_HEADER_COLOR)
+    for i, (sname, lvl, color, xp_cur, xp_max) in enumerate(padded_sorts):
+        px = 40 + card_w / 2 + i * (card_w + gap)
+        _tech_maitrise_hex(d, px, my + 120, sname, lvl, xp_cur, xp_max, color if color else TECH_LOCKED_COLOR)
+
+    tm_y = my + 250
+    _tech_maximum_box(d, (40, tm_y, W - 40, H - 40), TECH_GOLD)
+
+    img.save(out_path)
+    return out_path
+
+
+# =====================================================================
+# TECHNIQUE — VUE DÉTAILLÉE D'UN SORT PRINCIPAL (ses 8 sorts secondaires)
+# =====================================================================
+TECHDET_BG = (10, 9, 15, 255)
+TECHDET_TEXT = (235, 235, 240, 255)
+TECHDET_SUB = (150, 148, 160, 255)
+TECHDET_GOLD = (232, 197, 121, 255)
+TECHDET_HEADER_COLOR = (255, 200, 60, 255)
+
+TECHDET_CLASS_COLORS = {
+    "S": (255, 165, 0),
+    "1": (235, 60, 100),
+    "2": (170, 80, 240),
+    "3": (60, 130, 240),
+    "4": (40, 200, 150),
+}
+TECHDET_CLASS_LABELS = {"S": "Ultime", "1": "Avancé", "2": "Normal", "3": "Passif"}
+
+def _techdet_hexagon(d, cx, cy, r, gold, fill=(20, 20, 28, 255)):
+    pts = [(cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a))) for a in range(-90, 271, 60)]
+    d.polygon(pts, outline=gold, width=3, fill=fill)
+
+def _techdet_class_badge(d, x, y, classe, size=30):
+    color = TECHDET_CLASS_COLORS.get(classe, (100, 100, 110))
+    d.ellipse((x, y, x + size, y + size), fill=color)
+    label = classe if classe else "?"
+    f = font(13, True)
+    lw = text_w(d, label, f)
+    d.text((x + size / 2 - lw / 2, y + size / 2 - 8), label, font=f, fill=(15, 15, 18, 255))
+
+def _techdet_secondary_card(d, x, y, w, h, name, classe, niveau_requis, debloque, principal_level):
+    locked = not debloque or (principal_level < niveau_requis)
+    color = TECHDET_CLASS_COLORS.get(classe, (90, 88, 100)) if not locked else (70, 68, 80)
+    d.rounded_rectangle((x, y, x + w, y + h), radius=10, fill=(22, 20, 28, 255))
+    d.rectangle((x, y, x + 5, y + h), fill=color)
+
+    if locked:
+        txt = f"??? (niveau requis {niveau_requis})"
+        tw = text_w(d, txt, font(13, True))
+        d.text((x + w / 2 - tw / 2, y + h / 2 - 9), txt, font=font(13, True), fill=TECHDET_SUB)
+        return
+
+    _techdet_class_badge(d, x + w - 46, y + 16, classe, size=30)
+    display_name = name
+    max_w = w - 70
+    if text_w(d, display_name, font(13, True)) > max_w:
+        while text_w(d, display_name + "...", font(13, True)) > max_w and len(display_name) > 1:
+            display_name = display_name[:-1]
+        display_name = display_name + "..."
+    d.text((x + 18, y + 18), display_name, font=font(13, True), fill=TECHDET_TEXT)
+    d.text((x + 18, y + 44), f"Niveau requis : {niveau_requis}", font=font(13), fill=TECHDET_SUB)
+    d.text((x + 18, y + h - 56), "Coût EO : —", font=font(13), fill=TECHDET_SUB)
+    d.text((x + 18, y + h - 30), "Dégâts : —", font=font(13), fill=TECHDET_SUB)
+
+
+def generate_technique_detail_image(sort_principal_name: str, sort_principal_level: int, sort_principal_color: tuple,
+                                     sorts_secondaires: list, out_path: str, background_path=None):
+    """
+    sorts_secondaires : liste de jusqu'à 8 tuples (nom, classe, niveau_requis, debloque)
+                         classe est une chaîne parmi "S", "1", "2", "3", "4", ou None si le slot est vide.
+                         nom est None si le slot n'a pas encore de sort assigné (vide, même déverrouillable).
+    """
+    W, H = 1300, 1300
+    if background_path and os.path.exists(background_path):
+        try:
+            bg = ImageOps.fit(Image.open(background_path).convert("RGB"), (W, H), method=Image.LANCZOS)
+            bg = bg.filter(ImageFilter.GaussianBlur(radius=8)).convert("RGBA")
+            img = Image.alpha_composite(bg, Image.new("RGBA", (W, H), (0, 0, 0, 140)))
+        except Exception:
+            img = Image.new("RGBA", (W, H), TECHDET_BG)
+    else:
+        img = Image.new("RGBA", (W, H), TECHDET_BG)
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, W, H), outline=TECHDET_GOLD, width=2)
+    d.rectangle((0, 0, 280, H), fill=(16, 15, 20, 255))
+
+    _techdet_hexagon(d, 140, 100, 60, TECHDET_GOLD)
+    tw = text_w(d, sort_principal_name, font(18, True))
+    d.text((140 - tw / 2, 176), sort_principal_name, font=font(18, True), fill=sort_principal_color)
+    lvl_txt = f"Niveau {sort_principal_level}"
+    lw = text_w(d, lvl_txt, font(13, True))
+    d.text((140 - lw / 2, 202), lvl_txt, font=font(13, True), fill=TECHDET_GOLD)
+    d.line((24, 234, 256, 234), fill=(45, 42, 52, 255), width=1)
+    d.text((24, 254), "LÉGENDE", font=font(13, True), fill=TECHDET_HEADER_COLOR)
+    yy = 282
+    for cl, label in [("S", "Ultime"), ("1", "Avancé"), ("2", "Normal"), ("3", "Passif")]:
+        _techdet_class_badge(d, 24, yy, cl, size=26)
+        d.text((60, yy + 5), label, font=font(13), fill=TECHDET_TEXT)
+        yy += 40
+
+    d.text((300, 30), "SORTS SECONDAIRES", font=font(20, True), fill=TECHDET_HEADER_COLOR)
+    d.line((300, 70, W - 40, 70), fill=(55, 52, 65, 255), width=2)
+    col_w = (W - 300 - 40 - 20) // 2
+    row_h = 150
+    gap = 20
+    y0 = 90
+    padded = (sorts_secondaires + [(None, None, 999, False)] * 8)[:8]
+    for i, (name, classe, niveau, debloque) in enumerate(padded):
+        col, row = i % 2, i // 2
+        x = 300 + col * (col_w + gap)
+        y = y0 + row * (row_h + gap)
+        _techdet_secondary_card(d, x, y, col_w, row_h, name, classe, niveau, debloque, sort_principal_level)
+
+    img.save(out_path)
+    return out_path

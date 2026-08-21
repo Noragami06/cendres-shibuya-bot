@@ -264,6 +264,34 @@ CREATE TABLE IF NOT EXISTS character_stats (
     points_debt INTEGER DEFAULT 0
 );
 
+-- Techniques Occultes d'un personnage (/profil → ⚡ Technique). Jusqu'à 4 slots (slot_index 0..3).
+-- TODO : reste VIDE par défaut — aucun moyen de la remplir depuis le bot pour l'instant. Le système
+-- d'XP des techniques, les seuils de niveau/maîtrise pour la promotion en « Technique Maximum » et les
+-- buffs de dégâts par niveau ne sont PAS encore définis (points non abordés).
+CREATE TABLE IF NOT EXISTS character_sorts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id INTEGER,
+    slot_index INTEGER,       -- 0 à 3
+    name TEXT,
+    level INTEGER DEFAULT 1,
+    xp_actuel INTEGER DEFAULT 0,
+    xp_max INTEGER DEFAULT 100,
+    color_r INTEGER, color_g INTEGER, color_b INTEGER
+);
+
+-- Sorts secondaires d'un sort principal (vue détaillée /profil → ⚡ Technique → 🔍). Jusqu'à 8 slots.
+-- TODO : reste VIDE par défaut — aucun moyen de la remplir depuis le bot pour l'instant. L'attribution
+-- d'un nom/classe à un slot, le coût EO et les dégâts par sort ne sont PAS encore définis (points non
+-- abordés). Tous les slots s'affichent donc verrouillés/vides.
+CREATE TABLE IF NOT EXISTS character_secondary_sorts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sort_id INTEGER,          -- référence character_sorts.id (le sort principal parent)
+    slot_index INTEGER,       -- 0 à 7
+    name TEXT,
+    classe TEXT,              -- 'S', '1', '2', '3', '4', ou NULL si slot vide
+    niveau_requis INTEGER
+);
+
 -- Barème : points de stats accordés par rôle (camp / clan / grade).
 CREATE TABLE IF NOT EXISTS role_point_values (
     role_id INTEGER PRIMARY KEY,
@@ -1330,6 +1358,38 @@ def get_background(character_id: int):
             "SELECT image_path, uploaded_at FROM character_backgrounds WHERE character_id = ?",
             (character_id,),
         ).fetchone()
+
+
+def get_character_sorts(character_id: int):
+    """Techniques Occultes d'un personnage (/profil → ⚡ Technique), triées par slot_index (0..3).
+    Retourne une liste de lignes (name, level, xp_actuel, xp_max, color_r/g/b). Vide par défaut :
+    aucun moyen de la remplir depuis le bot pour l'instant (système d'XP des techniques non défini)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT id, slot_index, name, level, xp_actuel, xp_max, color_r, color_g, color_b "
+            "FROM character_sorts WHERE character_id = ? ORDER BY slot_index",
+            (character_id,),
+        ).fetchall()
+
+
+def get_character_sort(sort_id: int):
+    """Un sort PRINCIPAL par son id (character_sorts.id), ou None. Sert à la vue détaillée : on vérifie
+    aussi via character_id que le sort appartient bien au personnage du panneau."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM character_sorts WHERE id = ?", (sort_id,)
+        ).fetchone()
+
+
+def get_secondary_sorts(sort_id: int):
+    """Sorts SECONDAIRES d'un sort principal (character_secondary_sorts), triés par slot_index (0..7).
+    Vide par défaut : aucun moyen de la remplir depuis le bot pour l'instant (règles non définies)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT slot_index, name, classe, niveau_requis "
+            "FROM character_secondary_sorts WHERE sort_id = ? ORDER BY slot_index",
+            (sort_id,),
+        ).fetchall()
 
 
 def set_background(character_id: int, image_path: str, uploaded_at: str):

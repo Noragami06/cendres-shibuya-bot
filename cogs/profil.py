@@ -8,7 +8,10 @@ from discord import app_commands
 from discord.ext import commands
 
 from cogs.utils import database as db
-from cogs.utils.image_gen import generate_profil_image, generate_stats_image, generate_relations_image
+from cogs.utils.image_gen import (
+    generate_profil_image, generate_stats_image, generate_relations_image, generate_technique_image,
+    generate_technique_detail_image,
+)
 # Réutilise les helpers déjà en place (personnages / comptes / couleur).
 from cogs.banque import get_characters, get_character, PHOENIX_COLOR
 # Réutilise la validation + téléchargement + compression d'image du parcours /depart, et le rôle staff.
@@ -31,6 +34,10 @@ TODO_SECTIONS = [
     ("sorts", "📜 Sorts"),
     ("armes", "🗡️ Armes maudites"),
 ]
+
+
+# Couleur de repli d'un sort principal sans couleur enregistrée (or, cohérent avec le pillow Technique).
+TECHNIQUE_DEFAULT_COLOR = (232, 197, 121)
 
 
 def _is_staff(member) -> bool:
@@ -349,6 +356,30 @@ class StatsPageView(discord.ui.View):
             custom_id=f"stats_repartir:{character_id}:{user_id}"))
 
 
+class TechniqueOverviewView(discord.ui.View):
+    """Boutons '🔍 {nom}' sous le pillow d'ensemble ⚡ Technique : un par sort principal REMPLI (max 4),
+    menant à la vue détaillée de ses 8 sorts secondaires. Aucun bouton pour un slot vide/verrouillé."""
+
+    def __init__(self, character_id: int, user_id: int, principals: list):
+        super().__init__(timeout=None)
+        # principals : liste de (sort_id, nom) des slots principaux réellement présents en base.
+        for sort_id, name in principals[:4]:
+            label = name if len(name) <= 40 else name[:37] + "..."
+            self.add_item(discord.ui.Button(
+                label=label, emoji="🔍", style=discord.ButtonStyle.secondary,
+                custom_id=f"tech_detail:{character_id}:{user_id}:{sort_id}"))
+
+
+class TechniqueDetailView(discord.ui.View):
+    """Bouton '◀️ Retour' sous le pillow détaillé : régénère et renvoie la vue d'ensemble ⚡ Technique."""
+
+    def __init__(self, character_id: int, user_id: int):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Retour", emoji="◀️", style=discord.ButtonStyle.secondary,
+            custom_id=f"tech_back:{character_id}:{user_id}"))
+
+
 class RelationsPageView(discord.ui.View):
     """Boutons persistants sous l'image Relations :
     - ligne 0 : pagination (uniquement si plusieurs pages ; page courante encodée dans le custom_id) ;
@@ -586,6 +617,115 @@ class Profil(commands.Cog):
         if debt and debt > 0:
             await channel.send(f"⚠️ Dette de points : **-{debt}** sur le prochain gain.")
 
+    # ---------- écran Techniques Occultes (⚡ Technique) ----------
+    # TODO (points NON abordés) : aucun bouton de gestion pour l'instant (ajouter un sort, monter de
+    # niveau...). Le système d'XP des techniques, les seuils de niveau/maîtrise pour la promotion en
+    # « Technique Maximum » et les buffs de dégâts par niveau ne sont pas encore définis. La table
+    # character_sorts reste donc VIDE par défaut (tous les slots affichés « verrouillés »), sans aucun
+    # moyen de la remplir depuis le bot. À compléter quand ces règles seront décidées.
+    async def _render_technique(self, character_id):
+        """Rend le pillow d'ensemble et retourne (chemin, principals) où principals est la liste des
+        (sort_id, nom) des slots principaux réellement remplis — sert à construire les boutons 🔍."""
+        char = get_character(character_id)
+        name = char["character_name"] if char else "?"
+        camp = (char["camp"] if char else None) or "—"
+        portrait_path = char["portrait_path"] if char else None
+        # Slots existants -> tuples (nom, niveau, couleur_rgb, xp_actuel, xp_max) ; l'image complète
+        # elle-même jusqu'à 4 slots avec des tuples verrouillés (None, ...).
+        sorts = []
+        principals = []
+        for row in db.get_character_sorts(character_id):
+            color = (row["color_r"], row["color_g"], row["color_b"]) \
+                if row["color_r"] is not None else None
+            sorts.append((row["name"], row["level"], color, row["xp_actuel"], row["xp_max"]))
+            principals.append((row["id"], row["name"]))
+        bg = db.get_background(character_id)
+        background_path = bg["image_path"] if bg else None
+        path = _tmp_profile("technique")
+        generate_technique_image(
+            name, camp, sorts, path,
+            portrait_path=portrait_path, background_path=background_path,
+        )
+        return path, principals
+
+    async def send_technique(self, channel, character_id, user_id):
+        path, principals = await self._render_technique(character_id)
+        # Un bouton 🔍 par sort principal rempli (vers la vue détaillée). Aucun bouton de GESTION
+        # (cf. TODO ci-dessus) : on ne peut ni ajouter ni éditer un sort depuis le bot pour l'instant.
+        view = TechniqueOverviewView(character_id, user_id, principals) if principals else None
+        await channel.send(file=discord.File(path, filename="technique.png"), view=view)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    async def handle_technique(self, interaction, cid):
+        _, character_id, user_id = cid.split(":")  # profil_todo_technique:{cid}:{uid}
+        character_id, user_id = int(character_id), int(user_id)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self.send_technique(interaction.channel, character_id, user_id)
+
+    # ---------- écran détaillé d'un sort principal (⚡ Technique → 🔍) ----------
+    # TODO (points NON abordés) : aucun bouton de gestion (attribuer nom/classe à un slot secondaire,
+    # coût EO, dégâts). Ces valeurs et leurs règles ne sont pas définies. character_secondary_sorts reste
+    # VIDE par défaut (les 8 slots s'affichent verrouillés/vides), sans moyen de la remplir depuis le bot.
+    async def _render_technique_detail(self, character_id, principal):
+        """principal : ligne character_sorts (le sort principal). Retourne le chemin de l'image détaillée."""
+        color = (principal["color_r"], principal["color_g"], principal["color_b"]) \
+            if principal["color_r"] is not None else TECHNIQUE_DEFAULT_COLOR
+        # Slots secondaires -> tuples (nom, classe, niveau_requis, debloque). L'image complète elle-même
+        # jusqu'à 8 slots (None, None, 999, False). Un slot sans nom est considéré verrouillé/vide.
+        secondaires = []
+        for row in db.get_secondary_sorts(principal["id"]):
+            debloque = row["name"] is not None
+            niveau = row["niveau_requis"] if row["niveau_requis"] is not None else 999
+            secondaires.append((row["name"], row["classe"], niveau, debloque))
+        bg = db.get_background(character_id)
+        background_path = bg["image_path"] if bg else None
+        path = _tmp_profile("technique_detail")
+        generate_technique_detail_image(
+            principal["name"], principal["level"], color, secondaires, path,
+            background_path=background_path,
+        )
+        return path
+
+    async def send_technique_detail(self, channel, character_id, user_id, sort_id):
+        principal = db.get_character_sort(sort_id)
+        # Sécurité : le sort doit exister ET appartenir au personnage de ce panneau.
+        if principal is None or principal["character_id"] != character_id:
+            await channel.send("Ce sort n'existe plus.")
+            return
+        path = await self._render_technique_detail(character_id, principal)
+        await channel.send(
+            file=discord.File(path, filename="technique_detail.png"),
+            view=TechniqueDetailView(character_id, user_id),
+        )
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    async def handle_technique_detail(self, interaction, cid):
+        _, character_id, user_id, sort_id = cid.split(":")  # tech_detail:{cid}:{uid}:{sort_id}
+        character_id, user_id, sort_id = int(character_id), int(user_id), int(sort_id)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self.send_technique_detail(interaction.channel, character_id, user_id, sort_id)
+
+    async def handle_technique_back(self, interaction, cid):
+        _, character_id, user_id = cid.split(":")  # tech_back:{cid}:{uid}
+        character_id, user_id = int(character_id), int(user_id)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self.send_technique(interaction.channel, character_id, user_id)
+
     # ---------- commande ----------
     @app_commands.command(name="profil", description="Consulte un profil de personnage")
     async def profil(self, interaction: discord.Interaction):
@@ -618,6 +758,12 @@ class Profil(commands.Cog):
             await self.handle_fond(interaction, cid)
         elif cid.startswith("profil_edit:"):
             await self.handle_edit(interaction, cid)
+        elif cid.startswith("profil_todo_technique:"):
+            await self.handle_technique(interaction, cid)
+        elif cid.startswith("tech_detail:"):
+            await self.handle_technique_detail(interaction, cid)
+        elif cid.startswith("tech_back:"):
+            await self.handle_technique_back(interaction, cid)
         elif cid.startswith("profil_todo_stats:"):
             await self.handle_stats(interaction, cid)
         elif cid.startswith("stats_repartir:"):

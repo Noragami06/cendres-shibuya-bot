@@ -2947,6 +2947,14 @@ def delete_character_cascade(character_id):
         # Profil (/profil) et fond d'écran propres au personnage
         conn.execute("DELETE FROM character_profiles WHERE character_id = ?", (character_id,))
         conn.execute("DELETE FROM character_backgrounds WHERE character_id = ?", (character_id,))
+        # Techniques Occultes (/profil → ⚡ Technique) propres au personnage : sorts secondaires d'abord
+        # (référencent character_sorts.id), puis les sorts principaux.
+        conn.execute(
+            "DELETE FROM character_secondary_sorts WHERE sort_id IN "
+            "(SELECT id FROM character_sorts WHERE character_id = ?)",
+            (character_id,),
+        )
+        conn.execute("DELETE FROM character_sorts WHERE character_id = ?", (character_id,))
         # Statistiques + buffs (et effets de buffs via sous requête sur buff_id)
         conn.execute("DELETE FROM character_stats WHERE character_id = ?", (character_id,))
         conn.execute(
