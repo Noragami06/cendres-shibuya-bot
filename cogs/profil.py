@@ -1,5 +1,7 @@
 import asyncio
+import math
 import os
+import random
 import uuid
 from datetime import datetime
 
@@ -10,8 +12,10 @@ from discord.ext import commands
 from cogs.utils import database as db
 from cogs.utils.image_gen import (
     generate_profil_image, generate_stats_image, generate_relations_image, generate_technique_image,
-    generate_technique_detail_image,
+    generate_technique_detail_image, TECHDET_CLASS_COLORS,
 )
+# Barème validé des classes de sorts (coût EO en %), source unique partagée avec le check de cohérence.
+from cogs.utils.coherence_check import SPELL_CLASS_VALUES
 # Réutilise les helpers déjà en place (personnages / comptes / couleur).
 from cogs.banque import get_characters, get_character, PHOENIX_COLOR
 # Réutilise la validation + téléchargement + compression d'image du parcours /depart, et le rôle staff.
@@ -38,6 +42,20 @@ TODO_SECTIONS = [
 
 # Couleur de repli d'un sort principal sans couleur enregistrée (or, cohérent avec le pillow Technique).
 TECHNIQUE_DEFAULT_COLOR = (232, 197, 121)
+# Palette de couleurs distinctes attribuées automatiquement aux sorts principaux (1 par slot, max 4),
+# pour rester cohérent avec le pillow d'ensemble generate_technique_image.
+TECHNIQUE_SORT_PALETTE = [
+    (220, 90, 60),    # braise
+    (90, 150, 240),   # azur
+    (170, 90, 240),   # améthyste
+    (60, 200, 150),   # jade
+]
+# Les 5 classes de sorts valides (saisies par le joueur lors du flux guidé).
+TECHNIQUE_VALID_CLASSES = ("4", "3", "2", "1", "S")
+# Limites de longueur des champs texte libres du flux de création guidée des techniques.
+TECHNIQUE_NAME_MAX = 50        # nom d'un sort principal OU secondaire
+TECHNIQUE_DESC_MAX = 300       # description d'un sort secondaire
+TECHNIQUE_FAIBLESSE_MAX = 300  # faiblesse d'un sort secondaire
 
 
 def _is_staff(member) -> bool:
@@ -56,9 +74,17 @@ def _now() -> str:
 # =====================================================================
 # RÈGLES TEMPORAIRES DE NIVEAU / XP (niveau GÉNÉRAL du profil, inchangé)
 # =====================================================================
-# TODO TEMPORAIRE : cette formule sera remplacée par le vrai système de niveaux plus tard.
 def compute_xp_max_for_level(level: int) -> int:
-    return level * 1000
+    # Formule exponentielle partagée (source unique : database.xp_required_for_level).
+    return db.xp_required_for_level(level)
+
+
+def _level_from_xp_max(xp_max: int) -> int:
+    """Inverse (approché) de compute_xp_max_for_level : retrouve le niveau dont l'xp_max se rapproche
+    le plus de la valeur donnée. Utilisé quand le staff fixe directement xp_max dans « Modifier le profil »."""
+    if xp_max <= db.XP_BASE:
+        return 1
+    return max(1, round(1 + math.log(xp_max / db.XP_BASE) / math.log(db.XP_GROWTH)))
 
 
 def sync_level_and_xp(level=None, xp_actuel=None, xp_max=None,
@@ -72,7 +98,7 @@ def sync_level_and_xp(level=None, xp_actuel=None, xp_max=None,
         return level, max(0, min(base, new_max)), new_max
     if xp_max is not None:
         new_max = max(1, int(xp_max))
-        new_level = max(1, round(new_max / 1000))
+        new_level = _level_from_xp_max(new_max)
         base = cur_xp_actuel if xp_actuel is None else int(xp_actuel)
         return new_level, max(0, min(base, new_max)), new_max
     if xp_actuel is not None:
@@ -370,14 +396,30 @@ class TechniqueOverviewView(discord.ui.View):
                 custom_id=f"tech_detail:{character_id}:{user_id}:{sort_id}"))
 
 
-class TechniqueDetailView(discord.ui.View):
-    """Bouton '◀️ Retour' sous le pillow détaillé : régénère et renvoie la vue d'ensemble ⚡ Technique."""
+class TechniqueCreationRequestView(discord.ui.View):
+    """Bouton '✅ Confirmer' persistant sous la demande de création de techniques, publiée DANS LE SALON
+    DU JOUEUR (avec ping staff). Cliquable UNIQUEMENT par un membre ayant FICHE_STAFF_ROLE_ID — jamais
+    le joueur lui même. Le custom_id porte le personnage ciblé et le user_id du joueur d'origine."""
 
-    def __init__(self, character_id: int, user_id: int):
+    def __init__(self, character_id: int, player_user_id: int):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Confirmer", emoji="✅", style=discord.ButtonStyle.success,
+            custom_id=f"tech_create_confirm:{character_id}:{player_user_id}"))
+
+
+class TechniqueDetailView(discord.ui.View):
+    """Boutons sous le pillow détaillé : '◀️ Retour' (revient à la vue d'ensemble ⚡ Technique) et
+    '🔍 Afficher plus' (détail texte complet d'un sort secondaire choisi par numéro)."""
+
+    def __init__(self, character_id: int, user_id: int, sort_id: int):
         super().__init__(timeout=None)
         self.add_item(discord.ui.Button(
             label="Retour", emoji="◀️", style=discord.ButtonStyle.secondary,
             custom_id=f"tech_back:{character_id}:{user_id}"))
+        self.add_item(discord.ui.Button(
+            label="Afficher plus", emoji="🔍", style=discord.ButtonStyle.primary,
+            custom_id=f"tech_more:{sort_id}:{user_id}"))
 
 
 class RelationsPageView(discord.ui.View):
@@ -632,9 +674,15 @@ class Profil(commands.Cog):
         portrait_path = char["portrait_path"] if char else None
         # Slots existants -> tuples (nom, niveau, couleur_rgb, xp_actuel, xp_max) ; l'image complète
         # elle-même jusqu'à 4 slots avec des tuples verrouillés (None, ...).
+        # Séparation grille / Technique Maximum : les sorts promus (is_technique_maximum) quittent la
+        # grille « GRANDES CATÉGORIES » et sont listés dans l'encadré du bas.
         sorts = []
         principals = []
+        technique_maximum_list = []
         for row in db.get_character_sorts(character_id):
+            if row["is_technique_maximum"]:
+                technique_maximum_list.append(row["name"])
+                continue
             color = (row["color_r"], row["color_g"], row["color_b"]) \
                 if row["color_r"] is not None else None
             sorts.append((row["name"], row["level"], color, row["xp_actuel"], row["xp_max"]))
@@ -645,6 +693,7 @@ class Profil(commands.Cog):
         generate_technique_image(
             name, camp, sorts, path,
             portrait_path=portrait_path, background_path=background_path,
+            technique_maximum_list=technique_maximum_list,
         )
         return path, principals
 
@@ -665,13 +714,275 @@ class Profil(commands.Cog):
         if interaction.user.id != user_id:
             await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
             return
+        # À l'entrée : si le personnage a déjà au moins un sort principal, on affiche le pillow d'ensemble.
+        # Sinon, on lance le flux de CRÉATION guidée (validation staff préalable).
+        if db.count_character_sorts(character_id) > 0:
+            await interaction.response.defer()
+            await self.send_technique(interaction.channel, character_id, user_id)
+            return
         await interaction.response.defer()
-        await self.send_technique(interaction.channel, character_id, user_id)
+        await self._request_technique_creation(interaction, character_id, user_id)
+
+    # =================================================================
+    # CRÉATION GUIDÉE DES TECHNIQUES (validation staff préalable puis flux guidé côté joueur)
+    # =================================================================
+    async def _request_technique_creation(self, interaction, character_id, player_user_id):
+        """Publie la demande de création DANS LE SALON DU JOUEUR (le même où il a cliqué ⚡ Technique),
+        avec un ping du rôle staff et un bouton ✅ Confirmer réservé au staff. Un seul message, visible
+        du joueur ET du staff."""
+        char = get_character(character_id)
+        character_name = char["character_name"] if char else "?"
+        player_mention = f"<@{player_user_id}>"
+        embed = discord.Embed(
+            title="📋 Demande de création de techniques",
+            description=(
+                f"📋 Demande de création de techniques — {player_mention}\n\n"
+                "Le joueur va être guidé pour créer :\n"
+                "- 1 à 4 **Sorts Principaux** (les grandes catégories de sa technique, ex: « Katon » dans Naruto)\n"
+                "- Pour chaque Sort Principal : 1 à 8 **Sorts Secondaires** (les compétences précises qui en "
+                "découlent, ex: « Katon : Boule de feu suprême »), chacun avec nom, description, faiblesse, "
+                "et classe (4/3/2/1/S)\n\n"
+                "⚠️ Un membre du staff doit cliquer sur **Confirmer** ci dessous pour lancer le processus."
+            ),
+            color=PHOENIX_COLOR,
+        )
+        embed.add_field(name="Personnage", value=character_name, inline=True)
+        # Ping du rôle staff dans le CONTENU (pas seulement l'embed) pour notifier même le staff absent du salon.
+        await interaction.channel.send(
+            content=f"<@&{FICHE_STAFF_ROLE_ID}>",
+            embed=embed,
+            view=TechniqueCreationRequestView(character_id, player_user_id),
+        )
+        await interaction.followup.send(
+            "📋 Ta demande de création de techniques a été envoyée au staff pour validation.",
+            ephemeral=True,
+        )
+
+    async def handle_technique_create_confirm(self, interaction, cid):
+        # tech_create_confirm:{character_id}:{player_user_id}
+        _, character_id, player_user_id = cid.split(":")
+        character_id, player_user_id = int(character_id), int(player_user_id)
+        # Seul un membre STAFF peut confirmer ; le joueur lui même ne peut jamais déclencher, même s'il a
+        # par ailleurs un rôle staff (on refuse explicitement l'auteur de la demande).
+        if interaction.user.id == player_user_id or not _is_staff(interaction.user):
+            await interaction.response.send_message(
+                "Seul un membre du staff (autre que le joueur) peut confirmer cette demande.",
+                ephemeral=True,
+            )
+            return
+        # Le joueur d'origine doit toujours être présent sur le serveur pour être guidé.
+        player = interaction.guild.get_member(player_user_id) if interaction.guild else None
+        if player is None:
+            await interaction.response.edit_message(
+                content="❌ Le joueur a quitté le serveur, création annulée.", embed=None, view=None
+            )
+            return
+        # Verrou d'isolation standard : refuse si le joueur a déjà un flux textuel en cours.
+        if not self._acquire(player_user_id):
+            await interaction.response.send_message(
+                "Ce joueur a déjà une action en cours, réessaie quand elle sera terminée.", ephemeral=True
+            )
+            return
+        # Retire le bouton et marque la demande comme confirmée.
+        try:
+            await interaction.response.edit_message(
+                content=f"✅ Confirmé par {interaction.user.mention}, création en cours.", view=None
+            )
+        except discord.HTTPException:
+            pass
+        # Le flux se déroule dans LE SALON DU JOUEUR (celui de la demande = interaction.channel), avec le
+        # JOUEUR D'ORIGINE comme interlocuteur (jamais le staff qui vient de cliquer).
+        try:
+            await self._run_technique_creation(interaction.channel, player, character_id)
+        finally:
+            self._release(player_user_id)
+
+    async def _run_technique_creation(self, channel, player, character_id):
+        """Flux guidé : N sorts principaux (1-4), leurs noms, puis pour chacun ses M sorts secondaires
+        (1-8) avec nom/description/faiblesse/classe. Écrit tout en base à la fin (tout ou rien), puis
+        affiche le pillow d'ensemble. Isolation par utilisateur déjà posée par l'appelant."""
+        await channel.send(
+            f"{player.mention} — la création de tes techniques commence ! Réponds ici, une question à la fois."
+        )
+
+        # --- Étape 1 : nombre de sorts principaux (1-4) ---
+        nb_principaux = await self._ask_bounded_int(
+            channel, player,
+            "Combien de **Sorts Principaux** veux tu créer ? Un Sort Principal est la grande catégorie de "
+            "ta technique occulte (par exemple, dans Naruto, « Katon » serait un Sort Principal). "
+            "Minimum 1, maximum 4.",
+            1, 4,
+        )
+        if nb_principaux is None:
+            await channel.send("⏳ Création annulée (aucune réponse).")
+            return
+
+        # --- Noms des sorts principaux ---
+        principaux = []  # liste de noms
+        for i in range(1, nb_principaux + 1):
+            nom = await self._ask_bounded_text(
+                channel, player, f"Quel est le nom du Sort Principal n°{i} ?", TECHNIQUE_NAME_MAX
+            )
+            if nom is None:
+                await channel.send("⏳ Création annulée (aucune réponse).")
+                return
+            principaux.append(nom)
+
+        # --- Pour chaque sort principal : ses sorts secondaires ---
+        # Structure collectée avant tout écrit : [{"name":..., "secondaires":[{name,description,faiblesse,classe}]}]
+        plan = []
+        for nom_principal in principaux:
+            nb_secondaires = await self._ask_bounded_int(
+                channel, player,
+                f"Combien de **Sorts Secondaires** veux tu pour « {nom_principal} » ? Un Sort Secondaire "
+                "est une compétence précise qui découle de ce Sort Principal (par exemple, dans Naruto, "
+                "« Katon : Boule de feu suprême » serait un Sort Secondaire de « Katon »). Minimum 1, maximum 8.",
+                1, 8,
+            )
+            if nb_secondaires is None:
+                await channel.send("⏳ Création annulée (aucune réponse).")
+                return
+
+            secondaires = []
+            for j in range(1, nb_secondaires + 1):
+                nom_sec = await self._ask_bounded_text(
+                    channel, player,
+                    f"Nom de la technique {j}/{nb_secondaires} pour « {nom_principal} » :",
+                    TECHNIQUE_NAME_MAX,
+                )
+                if nom_sec is None:
+                    await channel.send("⏳ Création annulée (aucune réponse).")
+                    return
+
+                description = await self._ask_bounded_text(
+                    channel, player, f"Description de « {nom_sec} » :", TECHNIQUE_DESC_MAX
+                )
+                if description is None:
+                    await channel.send("⏳ Création annulée (aucune réponse).")
+                    return
+
+                faiblesse = await self._ask_bounded_text(
+                    channel, player, f"Faiblesse de « {nom_sec} » :", TECHNIQUE_FAIBLESSE_MAX
+                )
+                if faiblesse is None:
+                    await channel.send("⏳ Création annulée (aucune réponse).")
+                    return
+
+                classe = await self._ask_spell_class(channel, player, nom_sec)
+                if classe is None:
+                    await channel.send("⏳ Création annulée (aucune réponse).")
+                    return
+
+                secondaires.append({
+                    "name": nom_sec, "description": description,
+                    "faiblesse": faiblesse, "classe": classe,
+                })
+            plan.append({"name": nom_principal, "secondaires": secondaires})
+
+        # --- Répartition automatique des seuils de déblocage (niveau_requis) et du niveau de déblocage
+        # du sort principal (unlock_level), calculée avant l'écriture. running_level enchaîne les paliers
+        # d'un sort principal au suivant ; max_niveau_requis est conservé LOCALEMENT à chaque principal
+        # (seuil de fin de Phase 1 = max_level_threshold). ---
+        LEVEL_STEP = 5
+        running_level = 1
+        for principal in plan:
+            principal["unlock_level"] = running_level
+            secondaires = principal["secondaires"]
+            total_secondaires = len(secondaires)
+            default_unlocked = max(1, total_secondaires // 4)
+            locked_index = 0
+            max_niveau_requis = running_level
+            for j, sec in enumerate(secondaires):
+                if j < default_unlocked:
+                    sec["niveau_requis"] = running_level
+                else:
+                    locked_index += 1
+                    sec["niveau_requis"] = running_level + LEVEL_STEP * locked_index
+                max_niveau_requis = max(max_niveau_requis, sec["niveau_requis"])
+            # Seuil de fin de Phase 1 propre à CE sort principal (max local, pas la variable de chaînage).
+            principal["max_level_threshold"] = max_niveau_requis
+            running_level = max_niveau_requis + LEVEL_STEP
+
+        # --- Écriture en base (une fois tout le flux terminé) ---
+        for slot_index, principal in enumerate(plan):
+            color = TECHNIQUE_SORT_PALETTE[slot_index % len(TECHNIQUE_SORT_PALETTE)]
+            sort_id = db.insert_principal_sort(
+                character_id, slot_index, principal["name"], color,
+                level=1, xp_actuel=0, xp_max=db.xp_required_for_level(1),
+                unlock_level=principal["unlock_level"],
+                max_level_threshold=principal["max_level_threshold"],
+            )
+            for sec_index, sec in enumerate(principal["secondaires"]):
+                # Coût en % résolu depuis le barème validé (source unique SPELL_CLASS_VALUES).
+                cout_pct = SPELL_CLASS_VALUES[sec["classe"]]["cout_pct"]
+                # Ce tirage donne la valeur de dégâts DE BASE pour ce sort précis, fixée une seule fois à
+                # la création. La progression de dégâts par niveau (+55/niveau via grant_sort_xp) s'ajoute
+                # ensuite. La conversion du coût % en EO fixe au premier usage réel reste un point non
+                # abordé (aucun système de combat existant pour le déclencher).
+                degats_min = SPELL_CLASS_VALUES[sec["classe"]]["degats_min"]
+                degats_max = SPELL_CLASS_VALUES[sec["classe"]]["degats_max"]
+                degats = random.randint(degats_min, degats_max)
+                # TODO : le seuil des 40% de réserve minimum pour pouvoir déclencher une technique encore
+                # en % n'est pas implémenté (aucun système de combat pour le vérifier).
+                db.insert_secondary_sort(
+                    sort_id, sec_index, sec["name"], sec["classe"], cout_pct,
+                    sec["description"], sec["faiblesse"], degats=degats,
+                    niveau_requis=sec["niveau_requis"],
+                )
+
+        await channel.send("✅ Tes techniques ont été créées avec succès !")
+        # Affiche directement le pillow d'ensemble (comme un re-clic sur ⚡ Technique).
+        await self.send_technique(channel, character_id, player.id)
+
+    async def _ask_bounded_text(self, channel, player, question, max_len):
+        """Pose `question`, renvoie la réponse (nettoyée) tant qu'elle ne dépasse pas `max_len`
+        caractères ; sinon message clair et redemande la même question sans avancer. None si le joueur
+        ne répond plus (timeout)."""
+        await channel.send(question)
+        while True:
+            m = await self.wait_message(channel, player)
+            if m is None:
+                return None
+            reponse = m.content.strip()
+            if len(reponse) > max_len:
+                await channel.send(
+                    f"❌ Ce champ ne doit pas dépasser {max_len} caractères "
+                    f"(tu en as écrit {len(reponse)})."
+                )
+                await channel.send(question)
+                continue
+            return reponse
+
+    async def _ask_bounded_int(self, channel, player, question, minimum, maximum):
+        """Pose `question`, valide un entier dans [minimum, maximum], redemande sinon. Retourne None si
+        le joueur ne répond plus (timeout)."""
+        await channel.send(question)
+        while True:
+            m = await self.wait_message(channel, player)
+            if m is None:
+                return None
+            n = _parse_int(m.content, minimum=minimum)
+            if n is None or n > maximum:
+                await channel.send(f"Entre un nombre entier entre {minimum} et {maximum}.")
+                continue
+            return n
+
+    async def _ask_spell_class(self, channel, player, nom_sec):
+        """Valide strictement une classe parmi 4/3/2/1/S, redemande sinon. None si plus de réponse."""
+        await channel.send(f"Classe de « {nom_sec} » ? (4, 3, 2, 1, ou S)")
+        while True:
+            m = await self.wait_message(channel, player)
+            if m is None:
+                return None
+            choix = m.content.strip().upper()
+            if choix in TECHNIQUE_VALID_CLASSES:
+                return choix
+            await channel.send("Classe invalide. Réponds exactement par 4, 3, 2, 1 ou S.")
 
     # ---------- écran détaillé d'un sort principal (⚡ Technique → 🔍) ----------
-    # TODO (points NON abordés) : aucun bouton de gestion (attribuer nom/classe à un slot secondaire,
-    # coût EO, dégâts). Ces valeurs et leurs règles ne sont pas définies. character_secondary_sorts reste
-    # VIDE par défaut (les 8 slots s'affichent verrouillés/vides), sans moyen de la remplir depuis le bot.
+    # Les sorts secondaires sont désormais renseignés par le flux de création guidée (_run_technique_
+    # creation). TODO (points NON abordés) : aucun bouton de GESTION ultérieure ici (rééditer un sort,
+    # convertir le coût % en coût EO fixe, calculer les dégâts) — ces règles ne sont pas encore définies.
     async def _render_technique_detail(self, character_id, principal):
         """principal : ligne character_sorts (le sort principal). Retourne le chemin de l'image détaillée."""
         color = (principal["color_r"], principal["color_g"], principal["color_b"]) \
@@ -701,7 +1012,7 @@ class Profil(commands.Cog):
         path = await self._render_technique_detail(character_id, principal)
         await channel.send(
             file=discord.File(path, filename="technique_detail.png"),
-            view=TechniqueDetailView(character_id, user_id),
+            view=TechniqueDetailView(character_id, user_id, sort_id),
         )
         try:
             os.remove(path)
@@ -725,6 +1036,85 @@ class Profil(commands.Cog):
             return
         await interaction.response.defer()
         await self.send_technique(interaction.channel, character_id, user_id)
+
+    # ---------- '🔍 Afficher plus' : détail texte complet d'un sort secondaire ----------
+    async def handle_technique_more(self, interaction, cid):
+        _, sort_id, user_id = cid.split(":")  # tech_more:{sort_id}:{uid}
+        sort_id, user_id = int(sort_id), int(user_id)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
+            return
+        principal = db.get_character_sort(sort_id)
+        if principal is None:
+            await interaction.response.send_message("Ce sort n'existe plus.", ephemeral=True)
+            return
+        # Uniquement les slots secondaires réellement nommés (on ignore les slots vides).
+        named = [r for r in db.get_secondary_sorts(sort_id) if r["name"]]
+        if not named:
+            await interaction.response.send_message(
+                "Aucun sort secondaire à afficher pour l'instant.", ephemeral=True
+            )
+            return
+        # Isolation par utilisateur standardisée (comme les autres flux textuels).
+        if not self._acquire(user_id):
+            await interaction.response.send_message(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True
+            )
+            return
+        try:
+            await interaction.response.defer()
+            channel = interaction.channel
+            listing = "\n".join(f"{i}. {r['name']}" for i, r in enumerate(named, 1))
+            await channel.send(embed=discord.Embed(
+                title=f"🔍 Sorts secondaires de « {principal['name']} »",
+                description=listing + "\n\nRéponds avec le **numéro** du sort à afficher.",
+                color=PHOENIX_COLOR,
+            ))
+            choix = None
+            while choix is None:
+                m = await self.wait_message(channel, interaction.user)
+                if m is None:
+                    await channel.send("⏳ Affichage annulé.")
+                    return
+                c = m.content.strip()
+                if c.isdigit() and 1 <= int(c) <= len(named):
+                    choix = named[int(c) - 1]
+                else:
+                    await channel.send(f"Réponds avec un numéro entre 1 et {len(named)}.")
+            await channel.send(embed=self._build_secondary_sort_embed(choix, principal))
+        finally:
+            self._release(user_id)
+
+    def _build_secondary_sort_embed(self, sec, principal):
+        """Embed structuré et complet d'un sort secondaire (classe, coût EO, dégâts, point faible,
+        maîtrise du sort principal parent). Couleur = couleur de la classe (cohérente avec le pillow)."""
+        classe = sec["classe"]
+        info = SPELL_CLASS_VALUES.get(classe, {})
+        label = info.get("label", "?")
+        rgb = TECHDET_CLASS_COLORS.get(classe, (150, 148, 160))
+        embed = discord.Embed(
+            title=sec["name"],
+            description=sec["description"] or "—",
+            color=discord.Color.from_rgb(*rgb),
+        )
+        embed.add_field(name="Classe", value=f"{classe} ({label})", inline=True)
+        # Coût : le complément « converti en X points d'EO fixes… » n'apparaît que si la conversion a eu
+        # lieu (cout_eo_fixe non NULL) — ce qui n'arrive jamais tant qu'aucun système de combat n'existe.
+        cout = f"{sec['cout_pct']}% de la réserve"
+        if sec["cout_eo_fixe"] is not None:
+            cout += (f", converti en {sec['cout_eo_fixe']} points d'EO fixes une fois utilisé pour la "
+                     "première fois")
+        embed.add_field(name="Coût en énergie occulte", value=cout, inline=True)
+        degats = f"{sec['degats']} pts" if sec["degats"] is not None else "—"
+        embed.add_field(name="Dégâts", value=degats, inline=True)
+        embed.add_field(name="Point faible", value=sec["faiblesse"] or "—", inline=False)
+        embed.add_field(
+            name="Maîtrise du Sort Principal",
+            value=(f"{principal['name']} — Niveau {principal['level']} "
+                   f"({principal['xp_actuel']}/{principal['xp_max']} XP)"),
+            inline=False,
+        )
+        return embed
 
     # ---------- commande ----------
     @app_commands.command(name="profil", description="Consulte un profil de personnage")
@@ -760,10 +1150,14 @@ class Profil(commands.Cog):
             await self.handle_edit(interaction, cid)
         elif cid.startswith("profil_todo_technique:"):
             await self.handle_technique(interaction, cid)
+        elif cid.startswith("tech_create_confirm:"):
+            await self.handle_technique_create_confirm(interaction, cid)
         elif cid.startswith("tech_detail:"):
             await self.handle_technique_detail(interaction, cid)
         elif cid.startswith("tech_back:"):
             await self.handle_technique_back(interaction, cid)
+        elif cid.startswith("tech_more:"):
+            await self.handle_technique_more(interaction, cid)
         elif cid.startswith("profil_todo_stats:"):
             await self.handle_stats(interaction, cid)
         elif cid.startswith("stats_repartir:"):

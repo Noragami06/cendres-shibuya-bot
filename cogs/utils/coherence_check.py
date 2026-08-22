@@ -30,6 +30,19 @@ PCT_TOLERANCE = 0.05  # tolérance d'arrondi pour les sommes de pourcentages
 # Types de rôles « sémantiques » attendus dans le barème (role_point_values).
 SEMANTIC_KINDS = {"camp", "clan", "grade"}
 
+# Valeurs validées le 2026-08-21 : coût en % de la réserve d'énergie occulte du joueur (jamais sous 5%,
+# jamais au dessus de 40%), fourchette de dégâts par classe. La progression de niveau (+50 à +100 dégâts
+# par niveau, pas encore figée) s'applique EN PLUS de cette fourchette de base, à l'intérieur d'un même sort.
+SPELL_CLASS_VALUES = {
+    "4": {"label": "Passif", "cout_pct": 5, "degats_min": 10, "degats_max": 50},
+    "3": {"label": "Normal", "cout_pct": 13, "degats_min": 50, "degats_max": 200},
+    "2": {"label": "Avancé", "cout_pct": 21, "degats_min": 200, "degats_max": 600},
+    "1": {"label": "Avancé+", "cout_pct": 29, "degats_min": 600, "degats_max": 1500},
+    "S": {"label": "Ultime", "cout_pct": 40, "degats_min": 1500, "degats_max": 5000},
+}
+# Ordre croissant de puissance des classes de sorts (4 = plus faible … S = ultime).
+SPELL_CLASS_ORDER = ["4", "3", "2", "1", "S"]
+
 
 # =====================================================================
 # PRIMITIVES PARTAGÉES
@@ -195,6 +208,30 @@ def _check_clan_base(depart, errors):
         errors.append(f"Pourcentages de base des clans (+ sans_clan) : somme = {total:.2f} (attendu 100).")
 
 
+def _check_spell_classes(errors):
+    """Classes de sorts (technique) : bornes du coût EO, progression stricte du coût, et enchaînement
+    des fourchettes de dégâts (même logique que _check_eo). Basé sur la constante SPELL_CLASS_VALUES."""
+    ordered = [(cle, SPELL_CLASS_VALUES[cle]) for cle in SPELL_CLASS_ORDER if cle in SPELL_CLASS_VALUES]
+
+    # 1. Chaque coût dans la plage autorisée 5-40 % inclus.
+    for cle, info in ordered:
+        cout = info["cout_pct"]
+        if not (5 <= cout <= 40):
+            errors.append(f"Classe {cle} : coût de {cout}% hors des bornes autorisées (5-40%).")
+
+    # 2. Coûts strictement croissants dans l'ordre 4 → 3 → 2 → 1 → S.
+    for (k1, i1), (k2, i2) in zip(ordered, ordered[1:]):
+        if i2["cout_pct"] <= i1["cout_pct"]:
+            errors.append(
+                f"Classe {k2} : coût de {i2['cout_pct']}% inférieur ou égal à la classe précédente, "
+                "la progression doit être strictement croissante.")
+
+    # 3. Fourchettes de dégâts sans trou ni chevauchement entre classes consécutives (max == min suivant).
+    for (k1, i1), (k2, i2) in zip(ordered, ordered[1:]):
+        if i1["degats_max"] != i2["degats_min"]:
+            errors.append(f"Fourchette de dégâts incohérente entre classe {k1} et {k2}.")
+
+
 def _check_barometer_presence(barometer, errors):
     if barometer is None:
         errors.append("La table role_point_values est introuvable dans la base.")
@@ -294,6 +331,7 @@ def run_coherence_check() -> list:
     _check_reward_tables(depart, errors)
     _check_eo(depart, errors)
     _check_clan_base(depart, errors)
+    _check_spell_classes(errors)
 
     # Vérifications barème <-> code.
     _check_barometer_presence(barometer, errors)

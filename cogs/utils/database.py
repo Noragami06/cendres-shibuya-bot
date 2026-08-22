@@ -5,6 +5,35 @@ from datetime import datetime
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "data", "bot.db")
 
+# =====================================================================
+# SYSTÈME D'XP EXPONENTIEL PARTAGÉ (niveau du personnage ET niveau de chaque sort principal)
+# =====================================================================
+XP_BASE = 1000
+XP_GROWTH = 1.15
+
+# TODO TEMPORAIRE : valeur provisoire en attendant le vrai système de gain d'XP en Phase 2 (mini-jeu ou
+# combat, pas encore développé). Cette constante n'est utilisée que pour calculer xp_max à afficher,
+# aucune source ne génère encore d'XP réelle pour la Phase 2 actuellement.
+PHASE2_XP_PER_LEVEL = 500
+
+
+def xp_required_for_level(level: int) -> int:
+    return round(XP_BASE * (XP_GROWTH ** (level - 1)))
+
+
+def apply_xp_gain(current_level: int, current_xp: int, xp_gained: int) -> tuple:
+    """Retourne (nouveau_level, nouveau_xp_actuel, nombre_de_level_ups). Gère les montées
+    multiples en une seule fois si le gain d'XP est important."""
+    level = current_level
+    xp = current_xp + xp_gained
+    level_ups = 0
+    while xp >= xp_required_for_level(level):
+        xp -= xp_required_for_level(level)
+        level += 1
+        level_ups += 1
+    return level, xp, level_ups
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tickets (
     id INTEGER PRIMARY KEY,
@@ -276,7 +305,11 @@ CREATE TABLE IF NOT EXISTS character_sorts (
     level INTEGER DEFAULT 1,
     xp_actuel INTEGER DEFAULT 0,
     xp_max INTEGER DEFAULT 100,
-    color_r INTEGER, color_g INTEGER, color_b INTEGER
+    color_r INTEGER, color_g INTEGER, color_b INTEGER,
+    unlock_level INTEGER DEFAULT 1,       -- niveau (global perso) auquel ce sort principal devient utilisable (déblocage staff à définir)
+    phase INTEGER DEFAULT 1,              -- 1 = progression normale, 2 = grinding post-max vers Technique Maximum
+    max_level_threshold INTEGER,          -- niveau_requis le plus haut parmi ses sorts secondaires (fin de Phase 1)
+    is_technique_maximum INTEGER DEFAULT 0
 );
 
 -- Sorts secondaires d'un sort principal (vue détaillée /profil → ⚡ Technique → 🔍). Jusqu'à 8 slots.
@@ -289,7 +322,16 @@ CREATE TABLE IF NOT EXISTS character_secondary_sorts (
     slot_index INTEGER,       -- 0 à 7
     name TEXT,
     classe TEXT,              -- 'S', '1', '2', '3', '4', ou NULL si slot vide
-    niveau_requis INTEGER
+    niveau_requis INTEGER,
+    description TEXT,
+    faiblesse TEXT,
+    cout_pct INTEGER,         -- coût en % de la réserve d'EO (résolu depuis SPELL_CLASS_VALUES[classe])
+    -- TODO : la conversion du coût en % vers un coût EO fixe (au premier usage réel de la technique en
+    -- combat) n'est pas encore implémentée, aucun système de combat n'existe pour la déclencher.
+    -- cout_eo_fixe et cout_converted_at restent NULL indéfiniment pour l'instant.
+    cout_eo_fixe INTEGER DEFAULT NULL,
+    cout_converted_at TEXT DEFAULT NULL,
+    degats INTEGER DEFAULT NULL  -- dégâts de BASE tirés une seule fois à la création (dans la fourchette de la classe)
 );
 
 -- Barème : points de stats accordés par rôle (camp / clan / grade).
@@ -643,6 +685,42 @@ def _ensure_character_stats_columns(conn):
         conn.execute("ALTER TABLE character_stats ADD COLUMN points_debt INTEGER DEFAULT 0")
 
 
+def _ensure_character_sorts_columns(conn):
+    """Ajoute les colonnes du système d'XP / progression 2 phases à une table character_sorts
+    préexistante (déblocage, phase, seuil max, technique maximum)."""
+    cols = _column_names(conn, "character_sorts")
+    if not cols:
+        return
+    if "unlock_level" not in cols:
+        conn.execute("ALTER TABLE character_sorts ADD COLUMN unlock_level INTEGER DEFAULT 1")
+    if "phase" not in cols:
+        conn.execute("ALTER TABLE character_sorts ADD COLUMN phase INTEGER DEFAULT 1")
+    if "max_level_threshold" not in cols:
+        conn.execute("ALTER TABLE character_sorts ADD COLUMN max_level_threshold INTEGER")
+    if "is_technique_maximum" not in cols:
+        conn.execute("ALTER TABLE character_sorts ADD COLUMN is_technique_maximum INTEGER DEFAULT 0")
+
+
+def _ensure_character_secondary_sorts_columns(conn):
+    """Ajoute les colonnes du flux de création guidée des techniques (description, faiblesse, coût EO)
+    à une table character_secondary_sorts préexistante."""
+    cols = _column_names(conn, "character_secondary_sorts")
+    if not cols:
+        return
+    if "description" not in cols:
+        conn.execute("ALTER TABLE character_secondary_sorts ADD COLUMN description TEXT")
+    if "faiblesse" not in cols:
+        conn.execute("ALTER TABLE character_secondary_sorts ADD COLUMN faiblesse TEXT")
+    if "cout_pct" not in cols:
+        conn.execute("ALTER TABLE character_secondary_sorts ADD COLUMN cout_pct INTEGER")
+    if "cout_eo_fixe" not in cols:
+        conn.execute("ALTER TABLE character_secondary_sorts ADD COLUMN cout_eo_fixe INTEGER DEFAULT NULL")
+    if "cout_converted_at" not in cols:
+        conn.execute("ALTER TABLE character_secondary_sorts ADD COLUMN cout_converted_at TEXT DEFAULT NULL")
+    if "degats" not in cols:
+        conn.execute("ALTER TABLE character_secondary_sorts ADD COLUMN degats INTEGER DEFAULT NULL")
+
+
 # Barème EXACT des points de stats par rôle (camp / clan / grade). INSERT OR REPLACE : relançable.
 ROLE_POINT_VALUES_SEED = [
     # Camp
@@ -717,6 +795,8 @@ def init_db():
         _ensure_order_columns(conn)
         _ensure_order_members_columns(conn)
         _ensure_character_stats_columns(conn)
+        _ensure_character_sorts_columns(conn)
+        _ensure_character_secondary_sorts_columns(conn)
         _seed_role_point_values(conn)
         _ensure_salary_columns(conn)
         _ensure_tickets_columns(conn)
@@ -1366,10 +1446,20 @@ def get_character_sorts(character_id: int):
     aucun moyen de la remplir depuis le bot pour l'instant (système d'XP des techniques non défini)."""
     with get_connection() as conn:
         return conn.execute(
-            "SELECT id, slot_index, name, level, xp_actuel, xp_max, color_r, color_g, color_b "
+            "SELECT id, slot_index, name, level, xp_actuel, xp_max, color_r, color_g, color_b, "
+            "unlock_level, phase, max_level_threshold, is_technique_maximum "
             "FROM character_sorts WHERE character_id = ? ORDER BY slot_index",
             (character_id,),
         ).fetchall()
+
+
+def count_character_sorts(character_id: int) -> int:
+    """Nombre de sorts PRINCIPAUX déjà créés pour ce personnage. 0 => le flux de création guidée doit
+    se déclencher à l'entrée du bouton ⚡ Technique ; > 0 => on affiche directement le pillow."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM character_sorts WHERE character_id = ?", (character_id,)
+        ).fetchone()["n"]
 
 
 def get_character_sort(sort_id: int):
@@ -1381,12 +1471,141 @@ def get_character_sort(sort_id: int):
         ).fetchone()
 
 
+def insert_principal_sort(character_id: int, slot_index: int, name: str,
+                          color, level: int = 1, xp_actuel: int = 0,
+                          xp_max: int = xp_required_for_level(1), unlock_level: int = 1,
+                          max_level_threshold=None) -> int:
+    """Crée un sort PRINCIPAL et retourne son id. color = (r, g, b). xp_max par défaut = xp requis pour
+    le niveau 1 (formule exponentielle), cohérent dès la création. unlock_level = niveau global auquel le
+    sort devient utilisable ; max_level_threshold = seuil de fin de Phase 1 (plus haut niveau_requis de
+    ses secondaires). phase (=1) et is_technique_maximum (=0) prennent leurs défauts de schéma."""
+    r, g, b = color
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO character_sorts (character_id, slot_index, name, level, xp_actuel, xp_max, "
+            "color_r, color_g, color_b, unlock_level, max_level_threshold) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (character_id, slot_index, name, level, xp_actuel, xp_max, r, g, b,
+             unlock_level, max_level_threshold),
+        )
+        return cur.lastrowid
+
+
+def insert_secondary_sort(sort_id: int, slot_index: int, name: str, classe: str, cout_pct,
+                          description: str, faiblesse: str, degats=None, niveau_requis: int = 1):
+    """Crée un sort SECONDAIRE rattaché au sort principal sort_id. cout_pct est résolu par l'appelant
+    depuis SPELL_CLASS_VALUES[classe] ; degats est tiré à la création dans la fourchette de la classe.
+    cout_eo_fixe / cout_converted_at restent NULL (non convertis)."""
+    # niveau_requis est désormais calculé à la création (répartition automatique des seuils, cf.
+    # _run_technique_creation). Il gate le déblocage d'un sort secondaire par le niveau PROPRE du sort
+    # principal parent. TODO : le déblocage du Sort Principal SUIVANT (le rendre réellement utilisable)
+    # reste une décision staff à définir — pour l'instant tous les principaux créés restent visibles.
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO character_secondary_sorts (sort_id, slot_index, name, classe, niveau_requis, "
+            "description, faiblesse, cout_pct, cout_eo_fixe, cout_converted_at, degats) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
+            (sort_id, slot_index, name, classe, niveau_requis, description, faiblesse, cout_pct, degats),
+        )
+
+
+async def grant_character_xp(character_id: int, xp_gained: int) -> int:
+    """Accorde de l'XP au NIVEAU GLOBAL du personnage. Chaque montée de niveau octroie +250 points de
+    stats à répartir. Retourne le nombre de montées de niveau.
+    # Aucune source d'XP n'existe encore dans le bot (combat, quêtes...). Cette fonction est prête à
+    # être appelée dès qu'un système de gain d'XP sera construit."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT level, xp_actuel FROM character_profiles WHERE character_id = ?", (character_id,)
+        ).fetchone()
+        if row is None:
+            return 0
+        new_level, new_xp, level_ups = apply_xp_gain(row["level"], row["xp_actuel"], xp_gained)
+        if level_ups > 0:
+            conn.execute("INSERT OR IGNORE INTO character_stats (character_id) VALUES (?)", (character_id,))
+            conn.execute(
+                "UPDATE character_stats SET points_restants = points_restants + ? WHERE character_id = ?",
+                (250 * level_ups, character_id),
+            )
+        conn.execute(
+            "UPDATE character_profiles SET level = ?, xp_actuel = ?, xp_max = ? WHERE character_id = ?",
+            (new_level, new_xp, xp_required_for_level(new_level), character_id),
+        )
+    return level_ups
+
+
+async def grant_sort_xp(sort_id: int, xp_gained: int) -> int:
+    """Accorde de l'XP à un SORT PRINCIPAL, en gérant les 2 phases de progression. Chaque montée de
+    niveau octroie +55 dégâts aux sorts secondaires déjà débloqués (déblocage basé sur le niveau PROPRE
+    du sort principal). Retourne le nombre de montées de niveau.
+    # Aucune source d'XP n'existe encore dans le bot (combat, quêtes...). Cette fonction est prête à
+    # être appelée dès qu'un système de gain d'XP sera construit."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT phase, level, xp_actuel, max_level_threshold, character_id "
+            "FROM character_sorts WHERE id = ?", (sort_id,)
+        ).fetchone()
+        if row is None:
+            return 0
+        phase = row["phase"]
+        threshold = row["max_level_threshold"]
+
+        def boost_unlocked(reference_level, mult):
+            # +55 * mult aux secondaires débloqués (niveau_requis <= niveau du sort principal). Le garde
+            # « degats IS NOT NULL » évite de transformer une valeur NULL héritée en NULL (NULL + x = NULL).
+            conn.execute(
+                "UPDATE character_secondary_sorts SET degats = degats + ? "
+                "WHERE sort_id = ? AND niveau_requis <= ? AND degats IS NOT NULL",
+                (55 * mult, sort_id, reference_level),
+            )
+
+        if phase == 1:
+            new_level, new_xp, level_ups = apply_xp_gain(row["level"], row["xp_actuel"], xp_gained)
+            if level_ups > 0:
+                boost_unlocked(new_level, level_ups)
+            if threshold is not None and new_level >= threshold:
+                # Transition vers la Phase 2 : reset complet, on repart sur la nouvelle échelle.
+                conn.execute(
+                    "UPDATE character_sorts SET phase = 2, level = 0, xp_actuel = 0, xp_max = ? WHERE id = ?",
+                    (PHASE2_XP_PER_LEVEL, sort_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE character_sorts SET level = ?, xp_actuel = ?, xp_max = ? WHERE id = ?",
+                    (new_level, new_xp, xp_required_for_level(new_level), sort_id),
+                )
+            return level_ups
+
+        # phase == 2 : formule temporaire plate (PHASE2_XP_PER_LEVEL par niveau), plafonnée à 100.
+        total = row["xp_actuel"] + xp_gained
+        reste_xp = total % PHASE2_XP_PER_LEVEL
+        new_level = min(100, row["level"] + total // PHASE2_XP_PER_LEVEL)
+        level_ups = new_level - row["level"]
+        if level_ups > 0:
+            # En Phase 2 tous les secondaires sont normalement débloqués : on référence le seuil de fin
+            # de Phase 1 (tous <= threshold) pour appliquer le boost par sécurité.
+            boost_unlocked(threshold if threshold is not None else 10 ** 9, level_ups)
+        if new_level >= 100:
+            conn.execute(
+                "UPDATE character_sorts SET level = 100, xp_actuel = ?, xp_max = ?, "
+                "is_technique_maximum = 1 WHERE id = ?",
+                (PHASE2_XP_PER_LEVEL, PHASE2_XP_PER_LEVEL, sort_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE character_sorts SET level = ?, xp_actuel = ? WHERE id = ?",
+                (new_level, reste_xp, sort_id),
+            )
+        return level_ups
+
+
 def get_secondary_sorts(sort_id: int):
     """Sorts SECONDAIRES d'un sort principal (character_secondary_sorts), triés par slot_index (0..7).
     Vide par défaut : aucun moyen de la remplir depuis le bot pour l'instant (règles non définies)."""
     with get_connection() as conn:
         return conn.execute(
-            "SELECT slot_index, name, classe, niveau_requis "
+            "SELECT slot_index, name, classe, niveau_requis, description, faiblesse, cout_pct, "
+            "cout_eo_fixe, cout_converted_at, degats "
             "FROM character_secondary_sorts WHERE sort_id = ? ORDER BY slot_index",
             (sort_id,),
         ).fetchall()

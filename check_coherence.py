@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cogs.utils.coherence_check import (  # noqa: E402  (import après ajustement de sys.path)
     open_db, load_role_point_values, import_cogs, collect_code_roles, group_roles_by_id,
-    pct_sum_ok, run_coherence_check, DB_PATH,
+    pct_sum_ok, run_coherence_check, DB_PATH, SPELL_CLASS_VALUES, SPELL_CLASS_ORDER,
 )
 
 
@@ -110,8 +110,22 @@ def section_clan_base(depart):
           f"[{'OK' if pct_sum_ok(total) else '≠ 100 !'}]")
 
 
+def section_spell_classes():
+    header("5. CLASSES DE SORTS (technique)")
+    print("  Coût = % de la réserve d'énergie occulte du joueur (borné 5-40 %). Dégâts = fourchette de")
+    print("  base par classe (la progression de niveau s'ajoute EN PLUS, à l'intérieur d'un même sort).")
+    print()
+    for cle in SPELL_CLASS_ORDER:
+        info = SPELL_CLASS_VALUES.get(cle)
+        if not info:
+            continue
+        label = info.get("label", "?")
+        print(f"  Classe {cle:>1s} ({label:8s}) : coût {info['cout_pct']:>2d} %"
+              f"   dégâts {info['degats_min']:>5d} → {info['degats_max']:>5d}")
+
+
 def section_code_roles(mods, barometer):
-    header("5. RÔLES UTILISÉS DANS LE CODE")
+    header("6. RÔLES UTILISÉS DANS LE CODE")
     by_id = group_roles_by_id(collect_code_roles(mods))
     if not by_id:
         print("  (aucun rôle codé en dur collecté — imports de cogs indisponibles ?)")
@@ -155,9 +169,13 @@ def main():
         except Exception as e:
             print(f"  ⚠️  Section ignorée : {e}")
     try:
-        section_code_roles(mods, barometer)
+        section_spell_classes()
     except Exception as e:
         print(f"  ⚠️  Section 5 ignorée : {e}")
+    try:
+        section_code_roles(mods, barometer)
+    except Exception as e:
+        print(f"  ⚠️  Section 6 ignorée : {e}")
 
     if conn is not None:
         conn.close()

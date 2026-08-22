@@ -1963,18 +1963,29 @@ def _tech_maitrise_hex(d, cx, cy, name, level, xp_cur, xp_max, color):
     nw = text_w(d, name, font(14, True))
     d.text((cx - nw / 2, cy + r + 14), name, font=font(14, True), fill=TECH_TEXT)
 
-def _tech_maximum_box(d, xy, gold):
+def _tech_maximum_box(d, xy, gold, names=None):
     x0, y0, x1, y1 = xy
     _tech_frame(d, xy, gold, width=3, radius=14)
     title = "TECHNIQUE MAXIMUM"
     tw = text_w(d, title, font(16, True))
     d.text(((x0 + x1) / 2 - tw / 2, y0 + 14), title, font=font(16, True), fill=gold)
+    # Liste des sorts principaux promus « Technique Maximum » (une ligne centrée par sort, en TECH_GOLD).
+    # Vide -> on garde uniquement le titre, comme avant.
+    if names:
+        yy = y0 + 52
+        for nm in names:
+            nw = text_w(d, nm, font(15, True))
+            d.text(((x0 + x1) / 2 - nw / 2, yy), nm, font=font(15, True), fill=gold)
+            yy += 30
 
 
-def generate_technique_image(name: str, camp: str, sorts: list, out_path: str, portrait_path=None, background_path=None):
+def generate_technique_image(name: str, camp: str, sorts: list, out_path: str, portrait_path=None,
+                             background_path=None, technique_maximum_list=None):
     """
     sorts : liste de jusqu'à 4 tuples (nom, niveau, couleur_rgb, xp_actuel, xp_max).
             Un slot verrouillé/vide est représenté par (None, None, None, None, None).
+    technique_maximum_list : noms des sorts principaux ayant atteint la Technique Maximum (affichés dans
+            l'encadré du bas). None/vide = aucun.
     """
     W, H = 1400, 950
     if background_path and os.path.exists(background_path):
@@ -2031,7 +2042,7 @@ def generate_technique_image(name: str, camp: str, sorts: list, out_path: str, p
         _tech_maitrise_hex(d, px, my + 120, sname, lvl, xp_cur, xp_max, color if color else TECH_LOCKED_COLOR)
 
     tm_y = my + 250
-    _tech_maximum_box(d, (40, tm_y, W - 40, H - 40), TECH_GOLD)
+    _tech_maximum_box(d, (40, tm_y, W - 40, H - 40), TECH_GOLD, technique_maximum_list)
 
     img.save(out_path)
     return out_path
