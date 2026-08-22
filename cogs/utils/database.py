@@ -251,8 +251,8 @@ CREATE TABLE IF NOT EXISTS character_virtual_roles (
 -- (force_pts/vitesse_pts/endurance_pts + buffs), calculées à la volée à chaque affichage.
 CREATE TABLE IF NOT EXISTS character_profiles (
     character_id INTEGER PRIMARY KEY,
-    pv_actuel INTEGER DEFAULT 100,
-    pv_max INTEGER DEFAULT 100,
+    pv_actuel INTEGER DEFAULT 5000,
+    pv_max INTEGER DEFAULT 5000,
     eo_actuel INTEGER DEFAULT 100,
     eo_max INTEGER DEFAULT 100,
     level INTEGER DEFAULT 1,
@@ -268,6 +268,14 @@ CREATE TABLE IF NOT EXISTS character_profiles (
     defense_xp_actuel INTEGER DEFAULT 0,
     defense_xp_max INTEGER DEFAULT 1000,
     maitrise_eo_level INTEGER DEFAULT 1,
+    -- Ces colonnes ne sont plus utilisées : les Maîtrises EO/Sort/RCT sont désormais dérivées à la volée
+    -- depuis character_stats (energie_occulte_pts, sorts_pts, rct_pts), exactement comme Force/Vitesse/
+    -- Défense. Conservées pour compatibilité SQLite (pas de DROP COLUMN). mastery_territoire jamais créé
+    -- (système Territoire différé). Seul rct_quest_available reste écrit (flag de quête RCT).
+    mastery_eo_level INTEGER DEFAULT 1,
+    mastery_sort_level INTEGER DEFAULT 1,
+    mastery_rct_level INTEGER DEFAULT 1,
+    rct_quest_available INTEGER DEFAULT 0,
     victoires INTEGER DEFAULT 0,
     defaites INTEGER DEFAULT 0,
     nuls INTEGER DEFAULT 0
@@ -675,6 +683,22 @@ def _ensure_order_members_columns(conn):
         "WHERE joined_at IS NULL")
 
 
+def _ensure_character_profiles_columns(conn):
+    """Ajoute les colonnes de maîtrise (EO / Sort / RCT + quête) à une table character_profiles
+    préexistante. TODO : mastery_territoire non ajouté (système Territoire différé)."""
+    cols = _column_names(conn, "character_profiles")
+    if not cols:
+        return
+    for name, decl in (
+        ("mastery_eo_level", "INTEGER DEFAULT 1"),
+        ("mastery_sort_level", "INTEGER DEFAULT 1"),
+        ("mastery_rct_level", "INTEGER DEFAULT 1"),
+        ("rct_quest_available", "INTEGER DEFAULT 0"),
+    ):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE character_profiles ADD COLUMN {name} {decl}")
+
+
 def _ensure_character_stats_columns(conn):
     """Ajoute points_debt (dette de points reprise sur les prochains gains) à une table
     character_stats préexistante."""
@@ -795,6 +819,7 @@ def init_db():
         _ensure_order_columns(conn)
         _ensure_order_members_columns(conn)
         _ensure_character_stats_columns(conn)
+        _ensure_character_profiles_columns(conn)
         _ensure_character_sorts_columns(conn)
         _ensure_character_secondary_sorts_columns(conn)
         _seed_role_point_values(conn)
@@ -1371,6 +1396,9 @@ _PROFILE_COLUMNS = frozenset({
     "vitesse_level", "vitesse_xp_actuel", "vitesse_xp_max",
     "defense_level", "defense_xp_actuel", "defense_xp_max",
     "maitrise_eo_level", "victoires", "defaites", "nuls",
+    # mastery_*_level ne sont plus modifiables (maîtrises dérivées des points de stats). Seul
+    # rct_quest_available reste écrit (flag de quête RCT, via get_mastery_rct).
+    "rct_quest_available",
 })
 
 
@@ -1409,8 +1437,7 @@ def create_profile_from_fiche(character_id: int, eo_value):
 
     - eo_actuel/eo_max = eo_value (réserve pleine au départ). Si eo_value est None (Humain / Hybride
       chez les humains, sans réserve tirée) : 0/0 au lieu de planter sur NULL.
-    - Le reste (PV, level/XP, Force/Vitesse/Défense, maîtrise, combats) reste neutre tant que les
-      systèmes correspondants ne sont pas développés (cf. TODO.md).
+    - PV de départ : 5000/5000 (base commune ; +500 PV par montée de niveau via grant_character_xp).
     INSERT OR REPLACE : idempotent si une ligne existait déjà (sécurité, pas d'erreur de PK)."""
     eo = int(eo_value) if eo_value is not None else 0
     with get_connection() as conn:
@@ -1425,7 +1452,7 @@ def create_profile_from_fiche(character_id: int, eo_value):
                    defense_level, defense_xp_actuel, defense_xp_max,
                    maitrise_eo_level,
                    victoires, defaites, nuls
-               ) VALUES (?, 100, 100, ?, ?, 1, 0, 1000,
+               ) VALUES (?, 5000, 5000, ?, ?, 1, 0, 1000,
                          1, 0, 1000, 1, 0, 1000, 1, 0, 1000, 1, 0, 0, 0)""",
             (character_id, eo, eo),
         )
@@ -1511,7 +1538,8 @@ def insert_secondary_sort(sort_id: int, slot_index: int, name: str, classe: str,
 
 async def grant_character_xp(character_id: int, xp_gained: int) -> int:
     """Accorde de l'XP au NIVEAU GLOBAL du personnage. Chaque montée de niveau octroie +250 points de
-    stats à répartir. Retourne le nombre de montées de niveau.
+    stats à répartir ET +500 PV (max ET actuel, du même montant : pas de soin complet, juste le nouveau
+    palier de vie ajouté tel quel). Retourne le nombre de montées de niveau.
     # Aucune source d'XP n'existe encore dans le bot (combat, quêtes...). Cette fonction est prête à
     # être appelée dès qu'un système de gain d'XP sera construit."""
     with get_connection() as conn:
@@ -1526,6 +1554,12 @@ async def grant_character_xp(character_id: int, xp_gained: int) -> int:
             conn.execute(
                 "UPDATE character_stats SET points_restants = points_restants + ? WHERE character_id = ?",
                 (250 * level_ups, character_id),
+            )
+            # +500 PV par niveau, sur le max ET l'actuel (le nouveau palier s'ajoute à la vie courante).
+            conn.execute(
+                "UPDATE character_profiles SET pv_max = pv_max + ?, pv_actuel = pv_actuel + ? "
+                "WHERE character_id = ?",
+                (500 * level_ups, 500 * level_ups, character_id),
             )
         conn.execute(
             "UPDATE character_profiles SET level = ?, xp_actuel = ?, xp_max = ? WHERE character_id = ?",

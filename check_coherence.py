@@ -22,6 +22,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cogs.utils.coherence_check import (  # noqa: E402  (import après ajustement de sys.path)
     open_db, load_role_point_values, import_cogs, collect_code_roles, group_roles_by_id,
     pct_sum_ok, run_coherence_check, DB_PATH, SPELL_CLASS_VALUES, SPELL_CLASS_ORDER,
+    MASTERY_EO_MAX_LEVEL, compute_mastery_eo_reduction,
+    MASTERY_SORT_MAX_LEVEL, compute_mastery_sort_bonus,
+    RCT_STAGES, compute_rct_pv_bonus,
 )
 
 
@@ -124,8 +127,41 @@ def section_spell_classes():
               f"   dégâts {info['degats_min']:>5d} → {info['degats_max']:>5d}")
 
 
+def section_masteries():
+    header("6. MAÎTRISES (EO / Sort / RCT)")
+
+    # Maîtrise EO : réduction du coût énergétique, -1%/niveau, plafond -30% à niveau 30.
+    print("  [Maîtrise EO] réduction du coût énergétique (-1 %/niveau)")
+    for lvl in range(1, MASTERY_EO_MAX_LEVEL + 1):
+        red = compute_mastery_eo_reduction(lvl)
+        marque = "  ← plafond" if lvl == MASTERY_EO_MAX_LEVEL else ""
+        print(f"      niveau {lvl:>2d} : -{red:g} %{marque}")
+    fin_eo = compute_mastery_eo_reduction(MASTERY_EO_MAX_LEVEL)
+    print(f"    Confirmation niveau max ({MASTERY_EO_MAX_LEVEL}) = -{fin_eo:g} % "
+          f"[{'OK' if fin_eo == 30.0 else '≠ -30 !'}]")
+
+    # Maîtrise Sort : bonus de dégâts linéaire vers +1000 à niveau 150 (échantillon de niveaux).
+    print("\n  [Maîtrise Sort] bonus de dégâts (linéaire vers +1000 à niveau 150)")
+    for lvl in (1, 10, 25, 50, 75, 100, 125, 150):
+        bonus = compute_mastery_sort_bonus(lvl)
+        marque = "  ← plafond" if lvl == MASTERY_SORT_MAX_LEVEL else ""
+        print(f"      niveau {lvl:>3d} : +{bonus} dégâts{marque}")
+    fin_sort = compute_mastery_sort_bonus(MASTERY_SORT_MAX_LEVEL)
+    print(f"    Confirmation niveau max ({MASTERY_SORT_MAX_LEVEL}) = +{fin_sort} "
+          f"[{'OK' if fin_sort == 1000 else '≠ +1000 !'}]")
+
+    # Maîtrise RCT : 3 stades, rôle dédié, PV/niveau, bonus total au niveau max.
+    print("\n  [Maîtrise RCT] 3 stades (rôle réel slot 1 / virtuel slot 2-3)")
+    for stage in ("moyenne", "bonne", "avancee"):
+        info = RCT_STAGES[stage]
+        total = compute_rct_pv_bonus(stage, info["max_level"])
+        suite = info["next"] if info["next"] else "— (sommet)"
+        print(f"      {stage:8s} : rôle {info['role_id']}  niveau max {info['max_level']:>2d}  "
+              f"+{info['pv_per_level']} PV/niveau  →  +{total} PV au max   (stade suivant : {suite})")
+
+
 def section_code_roles(mods, barometer):
-    header("6. RÔLES UTILISÉS DANS LE CODE")
+    header("7. RÔLES UTILISÉS DANS LE CODE")
     by_id = group_roles_by_id(collect_code_roles(mods))
     if not by_id:
         print("  (aucun rôle codé en dur collecté — imports de cogs indisponibles ?)")
@@ -173,9 +209,13 @@ def main():
     except Exception as e:
         print(f"  ⚠️  Section 5 ignorée : {e}")
     try:
-        section_code_roles(mods, barometer)
+        section_masteries()
     except Exception as e:
         print(f"  ⚠️  Section 6 ignorée : {e}")
+    try:
+        section_code_roles(mods, barometer)
+    except Exception as e:
+        print(f"  ⚠️  Section 7 ignorée : {e}")
 
     if conn is not None:
         conn.close()

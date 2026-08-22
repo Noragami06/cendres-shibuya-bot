@@ -43,6 +43,40 @@ SPELL_CLASS_VALUES = {
 # Ordre croissant de puissance des classes de sorts (4 = plus faible … S = ultime).
 SPELL_CLASS_ORDER = ["4", "3", "2", "1", "S"]
 
+# Valeurs validées le 2026-08-21. Maîtrise EO : -1%/niveau, plafond -30% à niveau 30 (réduction du coût
+# énergétique des techniques). Maîtrise Sort : progression linéaire vers +1000 dégâts max à niveau 150.
+# Maîtrise RCT : 3 stades avec rôle Discord dédié (réel slot 1 / virtuel slot 2-3), bonus PV linéaire par
+# stade, quête de progression déblocable au niveau max de chaque stade (sauf 'avancee' qui est le sommet).
+MASTERY_EO_MAX_LEVEL = 30
+MASTERY_EO_REDUCTION_PER_LEVEL = 1.0  # %, linéaire, plafond -30% à niveau 30
+
+
+def compute_mastery_eo_reduction(level: int) -> float:
+    level = min(level, MASTERY_EO_MAX_LEVEL)
+    return round(level * MASTERY_EO_REDUCTION_PER_LEVEL, 2)
+
+
+MASTERY_SORT_MAX_LEVEL = 150
+MASTERY_SORT_BONUS_TOTAL = 1000  # plafond, linéaire
+
+
+def compute_mastery_sort_bonus(level: int) -> int:
+    level = min(level, MASTERY_SORT_MAX_LEVEL)
+    return round(level * MASTERY_SORT_BONUS_TOTAL / MASTERY_SORT_MAX_LEVEL)
+
+
+RCT_STAGES = {
+    "moyenne": {"role_id": 1522181335337402408, "max_level": 20, "pv_per_level": 1, "next": "bonne"},
+    "bonne": {"role_id": 1522181335962091621, "max_level": 25, "pv_per_level": 3, "next": "avancee"},
+    "avancee": {"role_id": 1522181336834506894, "max_level": 50, "pv_per_level": 5, "next": None},
+}
+
+
+def compute_rct_pv_bonus(stage: str, level: int) -> int:
+    info = RCT_STAGES[stage]
+    level = min(level, info["max_level"])
+    return level * info["pv_per_level"]
+
 
 # =====================================================================
 # PRIMITIVES PARTAGÉES
@@ -232,6 +266,34 @@ def _check_spell_classes(errors):
             errors.append(f"Fourchette de dégâts incohérente entre classe {k1} et {k2}.")
 
 
+def _check_masteries(errors):
+    """Vérifie les valeurs plafonds des 3 maîtrises (EO / Sort / RCT). Basé sur les constantes ci-dessus."""
+    if compute_mastery_eo_reduction(MASTERY_EO_MAX_LEVEL) != 30.0:
+        errors.append("Maîtrise EO : le niveau max ne donne pas exactement -30%.")
+    if compute_mastery_sort_bonus(MASTERY_SORT_MAX_LEVEL) != 1000:
+        errors.append("Maîtrise Sort : le niveau max ne donne pas exactement +1000.")
+    if compute_rct_pv_bonus("avancee", RCT_STAGES["avancee"]["max_level"]) != 250:
+        errors.append("Maîtrise RCT (avancée) : le niveau max ne donne pas exactement +250 PV.")
+    if compute_rct_pv_bonus("bonne", RCT_STAGES["bonne"]["max_level"]) != 75:
+        errors.append("Maîtrise RCT (bonne) : le niveau max ne donne pas exactement +75 PV.")
+    if compute_rct_pv_bonus("moyenne", RCT_STAGES["moyenne"]["max_level"]) != 20:
+        errors.append("Maîtrise RCT (moyenne) : le niveau max ne donne pas exactement +20 PV.")
+
+
+def _check_rct_role_conflicts(barometer, errors):
+    """Aucun des 3 role_id RCT ne doit figurer dans role_point_values (barème camp/clan/grade) : ce
+    serait le même ID réutilisé avec une signification différente."""
+    if barometer is None:
+        return
+    for stage, info in RCT_STAGES.items():
+        role_id = info["role_id"]
+        if role_id in barometer:
+            cat, pts = barometer[role_id]
+            errors.append(
+                f"Rôle RCT ({stage}) {role_id} déjà présent dans role_point_values comme "
+                f"'{cat}' ({pts}pts) : conflit d'ID (même rôle, signification différente).")
+
+
 def _check_barometer_presence(barometer, errors):
     if barometer is None:
         errors.append("La table role_point_values est introuvable dans la base.")
@@ -332,9 +394,11 @@ def run_coherence_check() -> list:
     _check_eo(depart, errors)
     _check_clan_base(depart, errors)
     _check_spell_classes(errors)
+    _check_masteries(errors)
 
     # Vérifications barème <-> code.
     _check_barometer_presence(barometer, errors)
+    _check_rct_role_conflicts(barometer, errors)
     try:
         by_id = group_roles_by_id(collect_code_roles(mods))
     except Exception as e:

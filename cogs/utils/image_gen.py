@@ -697,7 +697,7 @@ def generate_profil_image(name, pv, eo, level, xp, stats, maitrises, clan, rang,
     """
     pv, eo, xp : tuples (valeur_actuelle, valeur_max)
     stats : liste de 3 tuples (nom, niveau, pourcentage, (xp_actuel, xp_max)) → Force, Vitesse, Défense dans cet ordre
-    maitrises : liste de 4 tuples (nom, niveau, pourcentage) → Maîtrise EO, Maîtrise Sort, Maîtrise Territoire, RCT dans cet ordre
+    maitrises : liste de 4 tuples (nom, niveau, pourcentage[, is_max]) → Maîtrise EO, Maîtrise Sort, Maîtrise Territoire, RCT dans cet ordre. is_max (optionnel) → affiche « MAX » au lieu du pourcentage.
     clan, rang : chaînes
     victoires, defaites, nuls : entiers
     portrait_path : photo du personnage, découpée à la forme de l'hexagone (cadre en haut à droite).
@@ -828,7 +828,9 @@ def generate_profil_image(name, pv, eo, level, xp, stats, maitrises, clan, rang,
         nw = text_w(d, sname, font(12, True))
         d.text((px - nw / 2, row_y + ring_r_stat + 12), sname, font=font(12, True), fill=col)
         lvl_txt = f"Lvl {slvl}"
-        xp_txt = f"{sxp[0]}/{sxp[1]} XP"
+        # « MAX » quand le plafond de niveau est atteint (les courbes ne rendent xp_actuel == xp_max
+        # QU'au plafond ; en dessous, xp_actuel < xp_max strictement).
+        xp_txt = "MAX" if (sxp[1] and sxp[0] >= sxp[1]) else f"{sxp[0]}/{sxp[1]} XP"
         lw = text_w(d, lvl_txt, font(11, True))
         xw = text_w(d, xp_txt, font(11))
         d.text((px - lw / 2, row_y + ring_r_stat + 32), lvl_txt, font=font(11, True), fill=TEXT)
@@ -843,10 +845,12 @@ def generate_profil_image(name, pv, eo, level, xp, stats, maitrises, clan, rang,
     ring_r_m = 46
     positions = [(f4[0] + half_w * 0.28, y + 74), (f4[0] + half_w * 0.72, y + 74),
                  (f4[0] + half_w * 0.28, y + 208), (f4[0] + half_w * 0.72, y + 208)]
-    for (mname, mlvl, mpct), (px, py), col in zip(maitrises, positions, maitrise_colors):
+    for md, (px, py), col in zip(maitrises, positions, maitrise_colors):
+        mname, mlvl, mpct = md[:3]
+        m_is_max = md[3] if len(md) > 3 else False  # 4e élément optionnel (rétro-compatible)
         _profil_ring_gauge(d, px, py, ring_r_m, mpct, col, (35, 33, 42, 255), width=8)
         lvl_txt = f"Lv{mlvl}"
-        pct_txt = f"{mpct}%"
+        pct_txt = "MAX" if m_is_max else f"{mpct}%"
         lw = text_w(d, lvl_txt, font(15, True))
         d.text((px - lw / 2, py - 20), lvl_txt, font=font(15, True), fill=TEXT)
         pw = text_w(d, pct_txt, font(11))
@@ -902,7 +906,7 @@ def _stats_hexagon(d, img, cx, cy, r, gold, portrait_path=None):
     d.polygon(pts, outline=gold, width=3)
 
 
-def _stats_row(d, x, y, w, name, color, base, total, pct, tranche):
+def _stats_row(d, x, y, w, name, color, base, total, pct, tranche, show_tranche_text=True):
     d.text((x, y), name.upper(), font=font(14, True), fill=color)
     ptxt = f"{base:,} pts ({total:,})".replace(",", " ") if total != base else f"{base:,} pts".replace(",", " ")
     pw = text_w(d, ptxt, font(12, True))
@@ -910,7 +914,10 @@ def _stats_row(d, x, y, w, name, color, base, total, pct, tranche):
     d.text((x + w - pw - pctw - 14, y), ptxt, font=font(12, True), fill=TEXT_STATS)
     d.text((x + w - pctw, y), f"{pct}%", font=font(12, True), fill=SUB_STATS)
     _stats_seg_bar(d, x, y + 22, x + w, y + 34, pct, color)
-    d.text((x, y + 40), tranche, font=font(12, True), fill=TRANCHE_COLOR)
+    # Ligne de texte sous la barre : tranche classique OU « X point(s) manquant(s) » / « MAX ». Masquée
+    # quand show_tranche_text est False (ex: Armes maudites, barre pleine sans progression affichée).
+    if show_tranche_text and tranche:
+        d.text((x, y + 40), tranche, font=font(12, True), fill=TRANCHE_COLOR)
 
 
 def _stats_buffs_frame(d, xy, gold, buffs):
@@ -967,11 +974,14 @@ def generate_stats_image(name, stats, buffs, points_restants, out_path, portrait
 
     col_w = (W - 40 * 2 - 30) // 2
     y0 = 258
-    for i, (sname, color, base, total, pct, tranche) in enumerate(stats[:8]):
+    for i, row_data in enumerate(stats[:8]):
+        sname, color, base, total, pct, tranche = row_data[:6]
+        show_tranche_text = row_data[6] if len(row_data) > 6 else True  # 7e élément optionnel (rétro-compatible)
         col, row = i % 2, i // 2
         x = 40 + col * (col_w + 30)
         y = y0 + row * 84
-        _stats_row(d, x, y, col_w, sname, color, base, total, pct, tranche)
+        _stats_row(d, x, y, col_w, sname, color, base, total, pct, tranche,
+                   show_tranche_text=show_tranche_text)
 
     buffs_y = y0 + 4 * 84 + 16
     _stats_buffs_frame(d, (40, buffs_y, W - 40, H - 88), GOLD_STATS, buffs)
@@ -1957,7 +1967,8 @@ def _tech_maitrise_hex(d, cx, cy, name, level, xp_cur, xp_max, color):
     lvl_txt = f"Lv{level}"
     lw = text_w(d, lvl_txt, font(24, True))
     d.text((cx - lw / 2, cy - 28), lvl_txt, font=font(24, True), fill=color)
-    xp_txt = f"{xp_cur}/{xp_max}"
+    # « MAX » au plafond (ex: Phase 2, niveau 100) : xp_cur == xp_max uniquement au sommet.
+    xp_txt = "MAX" if (xp_max and xp_cur >= xp_max) else f"{xp_cur}/{xp_max}"
     xw = text_w(d, xp_txt, font(11))
     d.text((cx - xw / 2, cy + 6), xp_txt, font=font(11), fill=TECH_SUB)
     nw = text_w(d, name, font(14, True))

@@ -14,8 +14,11 @@ from cogs.utils.image_gen import (
     generate_profil_image, generate_stats_image, generate_relations_image, generate_technique_image,
     generate_technique_detail_image, TECHDET_CLASS_COLORS,
 )
-# Barème validé des classes de sorts (coût EO en %), source unique partagée avec le check de cohérence.
-from cogs.utils.coherence_check import SPELL_CLASS_VALUES
+# Barème validé des classes de sorts + stades de Maîtrise RCT + plafonds de maîtrise (source unique
+# partagée avec le check de cohérence).
+from cogs.utils.coherence_check import (
+    SPELL_CLASS_VALUES, RCT_STAGES, MASTERY_EO_MAX_LEVEL, MASTERY_SORT_MAX_LEVEL,
+)
 # Réutilise les helpers déjà en place (personnages / comptes / couleur).
 from cogs.banque import get_characters, get_character, PHOENIX_COLOR
 # Réutilise la validation + téléchargement + compression d'image du parcours /depart, et le rôle staff.
@@ -126,14 +129,66 @@ STAT_COLORS = {
 }
 
 
-def points_to_level_xp(total_points: int):
-    level = total_points // 1000 + 1
-    xp_actuel = total_points % 1000
-    return level, xp_actuel, 1000
+# =====================================================================
+# CONVERSION POINTS <-> NIVEAU/XP DES STATS Force / Vitesse / Défense (Endurance)
+# Courbe exponentielle partagée (db.xp_required_for_level), avec ratio de conversion et plafond dur.
+# Remplace l'ancien modèle plat (1000 pts/niveau). Les 5 autres stats (RCT, Territoire, Sorts, Armes
+# maudites, Énergie occulte) NE passent pas par ici.
+# =====================================================================
+STAT_XP_RATIO = 25                 # 1 point de Stats = 25 XP
+STAT_MAX_LEVEL = 150               # plafond dur
+STAT_LEVEL_BONUS_MULTIPLIER = 50   # Option B validée : bonus = niveau * 50
+# Seules ces 3 stats utilisent la courbe exponentielle + bonus de niveau (Défense = Endurance).
+STAT_LEVEL_BONUS_KEYS = ("force", "vitesse", "endurance")
 
 
-def level_xp_to_points(level: int, xp_actuel: int) -> int:
-    return (level - 1) * 1000 + xp_actuel
+def points_to_level_xp_capped(total_points: int, max_level: int, ratio: int = STAT_XP_RATIO) -> tuple:
+    """Convertit un total de points en (level, xp_actuel, xp_max) sur la courbe exponentielle partagée,
+    plafonné à `max_level`. Générique : sert aux stats (plafond 150) ET aux Maîtrises EO/Sort/RCT
+    (plafonds propres)."""
+    total_xp = total_points * ratio
+    level = 1
+    remaining = total_xp
+    while level < max_level and remaining >= db.xp_required_for_level(level):
+        remaining -= db.xp_required_for_level(level)
+        level += 1
+    if level >= max_level:
+        level = max_level
+        xp_max = db.xp_required_for_level(max_level)
+        xp_actuel = xp_max  # barre pleine, plafond atteint
+    else:
+        xp_actuel = remaining
+        xp_max = db.xp_required_for_level(level)
+    return level, xp_actuel, xp_max
+
+
+def points_to_level_xp_stat(total_points: int) -> tuple:
+    """Force / Vitesse / Défense : conversion plafonnée à STAT_MAX_LEVEL (wrapper générique)."""
+    return points_to_level_xp_capped(total_points, STAT_MAX_LEVEL)
+
+
+def compute_points_manquants(xp_actuel: int, xp_max: int, level: int, max_level: int,
+                             ratio: int = STAT_XP_RATIO) -> str:
+    """Retourne le texte à afficher sous la jauge : 'MAX' si le plafond est atteint,
+    sinon 'X point(s) manquant(s)' calculé depuis l'XP manquant converti en points."""
+    if level >= max_level:
+        return "MAX"
+    xp_manquant = xp_max - xp_actuel
+    points_manquants = max(1, -(-xp_manquant // ratio))  # arrondi au point supérieur, jamais 0 tant que ce n'est pas MAX
+    return f"{points_manquants} point{'s' if points_manquants > 1 else ''} manquant{'s' if points_manquants > 1 else ''}"
+
+
+def level_xp_to_points_stat(level: int, xp_actuel: int) -> int:
+    """Conversion inverse (utilisée quand le staff édite Level/XP force directement)."""
+    level = min(level, STAT_MAX_LEVEL)
+    total_xp = xp_actuel
+    for lvl in range(1, level):
+        total_xp += db.xp_required_for_level(lvl)
+    return round(total_xp / STAT_XP_RATIO)
+
+
+def compute_stat_level_bonus(level: int) -> int:
+    return level * STAT_LEVEL_BONUS_MULTIPLIER
 
 
 def compute_tranche(base_pts: int):
@@ -176,6 +231,54 @@ async def character_has_role(guild, member, character_id, role_id) -> bool:
             (character_id, role_id),
         ).fetchone()
     return vr is not None
+
+
+async def get_current_rct_stage(guild, character_id):
+    """Retourne 'avancee', 'bonne', 'moyenne', ou None si aucun rôle RCT détecté. Vérifie du stade le
+    plus haut au plus bas (un joueur en 'avancee' pourrait techniquement avoir gardé un ancien rôle
+    'moyenne', on privilégie le plus haut). Réutilise character_has_role (réel slot 1 / virtuel slot 2-3)."""
+    # Résout le membre Discord propriétaire (nécessaire pour un personnage slot 1 : vrais rôles Discord).
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT user_id FROM validated_characters WHERE id = ?", (character_id,)
+        ).fetchone()
+    member = None
+    if row is not None and guild is not None:
+        member = guild.get_member(row["user_id"])
+    for stage in ("avancee", "bonne", "moyenne"):
+        role_id = RCT_STAGES[stage]["role_id"]
+        if await character_has_role(guild, member, character_id, role_id):
+            return stage
+    return None
+
+
+# =====================================================================
+# MAÎTRISES EO / Sort / RCT — DÉRIVÉES À LA VOLÉE DES POINTS DE STATS
+# (energie_occulte_pts / sorts_pts / rct_pts), exactement comme Force/Vitesse/Défense.
+# Plus aucun niveau de maîtrise n'est stocké séparément (colonnes mastery_*_level obsolètes).
+# =====================================================================
+async def get_mastery_eo(character_id) -> tuple:
+    total = await get_stat_total(character_id, "energie_occulte")
+    return points_to_level_xp_capped(total, MASTERY_EO_MAX_LEVEL)
+
+
+async def get_mastery_sort(character_id) -> tuple:
+    total = await get_stat_total(character_id, "sorts")
+    return points_to_level_xp_capped(total, MASTERY_SORT_MAX_LEVEL)
+
+
+async def get_mastery_rct(guild, character_id) -> tuple:
+    stage = await get_current_rct_stage(guild, character_id)
+    if stage is None:
+        return 1, 0, db.xp_required_for_level(1)  # aucun rôle RCT détecté, comme avant
+    total = await get_stat_total(character_id, "rct")
+    max_level = RCT_STAGES[stage]["max_level"]
+    level, xp_actuel, xp_max = points_to_level_xp_capped(total, max_level)
+    # Quête de progression débloquée au niveau max du stade (sauf 'avancee', le sommet). Simple flag
+    # stocké : AUCUNE notification/DM n'est envoyée — le staff consulte l'info manuellement (RP).
+    if level >= max_level and RCT_STAGES[stage]["next"] is not None:
+        db.update_profile(character_id, rct_quest_available=1)
+    return level, xp_actuel, xp_max
 
 
 # =====================================================================
@@ -570,7 +673,7 @@ class Profil(commands.Cog):
         return view.result
 
     # ---------- rendu de l'image de profil ----------
-    async def _render_profile(self, character_id) -> str:
+    async def _render_profile(self, character_id, guild=None) -> str:
         p = db.get_or_create_profile(character_id)
         char = get_character(character_id)
         name = char["character_name"] if char else "?"
@@ -582,17 +685,31 @@ class Profil(commands.Cog):
         background_path = bg["image_path"] if bg else None
 
         # Force / Vitesse / Défense sont DÉRIVÉES de character_stats (Défense = Endurance).
+        # Level/pct via la courbe exponentielle des stats (points_to_level_xp_stat) : les cercles du
+        # pillow principal reflètent donc mécaniquement le nouveau système.
         stats = []
         for stat_key, display_name in [("force", "Force"), ("vitesse", "Vitesse"), ("endurance", "Défense")]:
             total = await get_stat_total(character_id, stat_key)
-            level, xp_actuel, xp_max = points_to_level_xp(total)
+            level, xp_actuel, xp_max = points_to_level_xp_stat(total)
             pct = round(xp_actuel / xp_max * 100)
             stats.append((display_name, level, pct, (xp_actuel, xp_max)))
 
-        # Les 4 maîtrises restent à niveau 1 / 0 % pour tout le monde tant que leur système n'existe pas.
+        # Maîtrises EO / Sort / RCT : DÉRIVÉES à la volée des points de stats (energie_occulte / sorts /
+        # rct), comme Force/Vitesse/Défense. « MAX » (is_max) au plafond, sinon le pourcentage d'XP.
+        # Territoire reste à 1 / 0 % (système différé).
+        def _maitrise(nom, level, xp_actuel, xp_max):
+            is_max = xp_max and xp_actuel >= xp_max
+            pct = 0 if is_max else round(xp_actuel / xp_max * 100) if xp_max else 0
+            return (nom, level, pct, bool(is_max))
+
+        eo_lvl, eo_xa, eo_xm = await get_mastery_eo(character_id)
+        sort_lvl, sort_xa, sort_xm = await get_mastery_sort(character_id)
+        rct_lvl, rct_xa, rct_xm = await get_mastery_rct(guild, character_id)
         maitrises = [
-            ("Maîtrise EO", 1, 0), ("Maîtrise Sort", 1, 0),
-            ("Maîtrise Territoire", 1, 0), ("RCT", 1, 0),
+            _maitrise("Maîtrise EO", eo_lvl, eo_xa, eo_xm),
+            _maitrise("Maîtrise Sort", sort_lvl, sort_xa, sort_xm),
+            ("Maîtrise Territoire", 1, 0, False),  # TODO : système Territoire différé
+            _maitrise("RCT", rct_lvl, rct_xa, rct_xm),
         ]
         path = _tmp_profile("profil")
         generate_profil_image(
@@ -606,7 +723,7 @@ class Profil(commands.Cog):
     async def send_profile(self, channel, character_id, user_id):
         char = get_character(character_id)
         slot = char["slot_number"] if char else 1
-        path = await self._render_profile(character_id)
+        path = await self._render_profile(character_id, getattr(channel, "guild", None))
         await channel.send(
             file=discord.File(path, filename="profil.png"),
             view=ProfileView(character_id, user_id, slot),
@@ -617,7 +734,7 @@ class Profil(commands.Cog):
             pass
 
     # ---------- rendu de l'image Stats ----------
-    async def _render_stats(self, character_id):
+    async def _render_stats(self, character_id, guild=None):
         """Retourne (chemin_image, points_restants)."""
         s = db.get_or_create_stats(character_id)
         char = get_character(character_id)
@@ -626,9 +743,47 @@ class Profil(commands.Cog):
         stats = []
         for key in STAT_KEYS:
             base = s[f"{key}_pts"]
-            total = await get_stat_total(character_id, key)
-            _num, pct, tranche = compute_tranche(base)
-            stats.append((STAT_DISPLAY_NAMES[key], STAT_COLORS[key], base, total, pct, tranche))
+            total = await get_stat_total(character_id, key)  # base + buffs
+            show_tranche_text = True  # armes_maudites le passera à False (barre pleine, aucun texte)
+
+            if key in STAT_LEVEL_BONUS_KEYS:
+                # Force / Vitesse / Défense (Endurance) : courbe de stats, plafond STAT_MAX_LEVEL.
+                # Texte « X point(s) manquant(s) » / « MAX » ; le total affiché inclut le bonus de niveau.
+                level, xp_actuel, xp_max = points_to_level_xp_stat(total)
+                tranche = compute_points_manquants(xp_actuel, xp_max, level, STAT_MAX_LEVEL)
+                pct = round(xp_actuel / xp_max * 100) if level < STAT_MAX_LEVEL else 100
+                total = total + compute_stat_level_bonus(level)
+
+            elif key == "energie_occulte":
+                level, xp_actuel, xp_max = await get_mastery_eo(character_id)
+                tranche = compute_points_manquants(xp_actuel, xp_max, level, MASTERY_EO_MAX_LEVEL)
+                pct = round(xp_actuel / xp_max * 100) if level < MASTERY_EO_MAX_LEVEL else 100
+
+            elif key == "sorts":
+                level, xp_actuel, xp_max = await get_mastery_sort(character_id)
+                tranche = compute_points_manquants(xp_actuel, xp_max, level, MASTERY_SORT_MAX_LEVEL)
+                pct = round(xp_actuel / xp_max * 100) if level < MASTERY_SORT_MAX_LEVEL else 100
+
+            elif key == "rct":
+                # Plafond = max du stade RCT actuel ; sans rôle RCT, aucun plafond atteint (jamais « MAX »).
+                stage = await get_current_rct_stage(guild, character_id)
+                level, xp_actuel, xp_max = await get_mastery_rct(guild, character_id)
+                max_level = RCT_STAGES[stage]["max_level"] if stage else level + 1
+                tranche = compute_points_manquants(xp_actuel, xp_max, level, max_level)
+                pct = round(xp_actuel / xp_max * 100) if level < max_level else 100
+
+            elif key == "armes_maudites":
+                # Jauge fixe pleine, aucun texte sous la barre (système à définir plus tard).
+                pct = 100
+                tranche = ""
+                show_tranche_text = False
+
+            else:
+                # Territoire : système de tranches par palier x10 inchangé.
+                _num, pct, tranche = compute_tranche(base)
+
+            stats.append((STAT_DISPLAY_NAMES[key], STAT_COLORS[key], base, total, pct, tranche,
+                          show_tranche_text))
         buffs = []
         for bname, effects in db.get_buffs_with_effects(character_id):
             parts = " · ".join(
@@ -645,7 +800,7 @@ class Profil(commands.Cog):
         return path, s["points_restants"]
 
     async def send_stats(self, channel, character_id, user_id):
-        path, points_restants = await self._render_stats(character_id)
+        path, points_restants = await self._render_stats(character_id, getattr(channel, "guild", None))
         view = StatsPageView(character_id, user_id) if points_restants > 0 else None
         await channel.send(file=discord.File(path, filename="stats.png"), view=view)
         try:
@@ -2329,19 +2484,22 @@ class Profil(commands.Cog):
                 field = "pct" if param.endswith("_pct") else param[len(legacy) + 1:]
                 buffs = db.sum_buff_points(character_id, stat_key)
                 total_now = db.get_stat_base_pts(character_id, stat_key) + buffs
-                level, xp, _ = points_to_level_xp(total_now)
+                # Courbe exponentielle des stats : xp_max dépend désormais du niveau (plus le 1000 plat).
+                level, xp, xp_max_cur = points_to_level_xp_stat(total_now)
                 if field == "level":
-                    level = max(1, v)
+                    level = max(1, min(v, STAT_MAX_LEVEL))
+                    xp_max_cur = db.xp_required_for_level(level)
+                    xp = min(xp, xp_max_cur)
                 elif field == "xp_actuel":
-                    xp = max(0, min(v, 1000))
+                    xp = max(0, min(v, xp_max_cur))
                 elif field == "pct":
-                    xp = max(0, min(round(v / 100 * 1000), 1000))
-                elif field == "xp_max":  # legacy : borne l'XP courant (xp_max vaut 1000 dans ce modèle)
+                    xp = max(0, min(round(v / 100 * xp_max_cur), xp_max_cur))
+                elif field == "xp_max":  # borne l'XP courant (l'xp_max réel est dérivé du niveau)
                     xp = max(0, min(xp, v))
-                target_total = level_xp_to_points(level, xp)
+                target_total = level_xp_to_points_stat(level, xp)
                 new_base = max(0, target_total - buffs)
                 db.set_stat_base_pts(character_id, stat_key, new_base)
-                lvl_disp = points_to_level_xp(new_base + buffs)[0]
+                lvl_disp = points_to_level_xp_stat(new_base + buffs)[0]
                 return True, (f"✅ {STAT_DISPLAY_NAMES[stat_key]} : base {new_base} pts "
                               f"(buffs {'+' if buffs >= 0 else ''}{buffs}, niveau total {lvl_disp}).")
 
