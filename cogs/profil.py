@@ -832,8 +832,9 @@ class Profil(commands.Cog):
         name = char["character_name"] if char else "?"
         camp = (char["camp"] if char else None) or "—"
         portrait_path = char["portrait_path"] if char else None
-        # Slots existants -> tuples (nom, niveau, couleur_rgb, xp_actuel, xp_max) ; l'image complète
-        # elle-même jusqu'à 4 slots avec des tuples verrouillés (None, ...).
+        # La grille affiche EXACTEMENT les sorts principaux réels (aucun padding). Chaque entrée est un
+        # 7-tuple (nom, niveau, couleur, xp_actuel, xp_max, locked, unlock_level). Un sort verrouillé
+        # (is_unlocked == 0) s'affiche « ??? (niveau requis unlock_level) » et n'a pas de bouton 🔍.
         # Séparation grille / Technique Maximum : les sorts promus (is_technique_maximum) quittent la
         # grille « GRANDES CATÉGORIES » et sont listés dans l'encadré du bas.
         sorts = []
@@ -845,8 +846,11 @@ class Profil(commands.Cog):
                 continue
             color = (row["color_r"], row["color_g"], row["color_b"]) \
                 if row["color_r"] is not None else None
-            sorts.append((row["name"], row["level"], color, row["xp_actuel"], row["xp_max"]))
-            principals.append((row["id"], row["name"]))
+            locked = not row["is_unlocked"]
+            sorts.append((row["name"], row["level"], color, row["xp_actuel"], row["xp_max"],
+                          locked, row["unlock_level"]))
+            if not locked:
+                principals.append((row["id"], row["name"]))  # bouton 🔍 seulement si débloqué
         bg = db.get_background(character_id)
         background_path = bg["image_path"] if bg else None
         path = _tmp_profile("technique")
@@ -1091,11 +1095,18 @@ class Profil(commands.Cog):
         # --- Écriture en base (une fois tout le flux terminé) ---
         for slot_index, principal in enumerate(plan):
             color = TECHNIQUE_SORT_PALETTE[slot_index % len(TECHNIQUE_SORT_PALETTE)]
+            # Seul le PREMIER sort principal (slot 0) est débloqué d'office ; les 2e/3e/4e naissent
+            # verrouillés. unlock_level reste calculé et affiché à titre INDICATIF, sans déblocage auto.
+            # TODO : Le déblocage manuel d'un sort principal (passer is_unlocked à 1) ainsi que le
+            # reverrouillage en cas d'erreur sont des actions STAFF, pas encore construites (point non
+            # abordé : outil staff de déblocage/verrouillage des sorts principaux).
+            is_unlocked = 1 if slot_index == 0 else 0
             sort_id = db.insert_principal_sort(
                 character_id, slot_index, principal["name"], color,
                 level=1, xp_actuel=0, xp_max=db.xp_required_for_level(1),
                 unlock_level=principal["unlock_level"],
                 max_level_threshold=principal["max_level_threshold"],
+                is_unlocked=is_unlocked,
             )
             for sec_index, sec in enumerate(principal["secondaires"]):
                 # Coût en % résolu depuis le barème validé (source unique SPELL_CLASS_VALUES).

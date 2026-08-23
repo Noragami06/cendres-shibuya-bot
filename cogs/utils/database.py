@@ -314,10 +314,11 @@ CREATE TABLE IF NOT EXISTS character_sorts (
     xp_actuel INTEGER DEFAULT 0,
     xp_max INTEGER DEFAULT 100,
     color_r INTEGER, color_g INTEGER, color_b INTEGER,
-    unlock_level INTEGER DEFAULT 1,       -- niveau (global perso) auquel ce sort principal devient utilisable (déblocage staff à définir)
+    unlock_level INTEGER DEFAULT 1,       -- niveau requis indicatif (affiché au staff) ; NE déclenche AUCUN déblocage auto
     phase INTEGER DEFAULT 1,              -- 1 = progression normale, 2 = grinding post-max vers Technique Maximum
     max_level_threshold INTEGER,          -- niveau_requis le plus haut parmi ses sorts secondaires (fin de Phase 1)
-    is_technique_maximum INTEGER DEFAULT 0
+    is_technique_maximum INTEGER DEFAULT 0,
+    is_unlocked INTEGER DEFAULT 1         -- 1 = visible/actif ; 0 = verrouillé (sorts principaux 2/3/4 par défaut, déblocage manuel staff)
 );
 
 -- Sorts secondaires d'un sort principal (vue détaillée /profil → ⚡ Technique → 🔍). Jusqu'à 8 slots.
@@ -723,6 +724,8 @@ def _ensure_character_sorts_columns(conn):
         conn.execute("ALTER TABLE character_sorts ADD COLUMN max_level_threshold INTEGER")
     if "is_technique_maximum" not in cols:
         conn.execute("ALTER TABLE character_sorts ADD COLUMN is_technique_maximum INTEGER DEFAULT 0")
+    if "is_unlocked" not in cols:
+        conn.execute("ALTER TABLE character_sorts ADD COLUMN is_unlocked INTEGER DEFAULT 1")
 
 
 def _ensure_character_secondary_sorts_columns(conn):
@@ -1474,7 +1477,7 @@ def get_character_sorts(character_id: int):
     with get_connection() as conn:
         return conn.execute(
             "SELECT id, slot_index, name, level, xp_actuel, xp_max, color_r, color_g, color_b, "
-            "unlock_level, phase, max_level_threshold, is_technique_maximum "
+            "unlock_level, phase, max_level_threshold, is_technique_maximum, is_unlocked "
             "FROM character_sorts WHERE character_id = ? ORDER BY slot_index",
             (character_id,),
         ).fetchall()
@@ -1501,19 +1504,20 @@ def get_character_sort(sort_id: int):
 def insert_principal_sort(character_id: int, slot_index: int, name: str,
                           color, level: int = 1, xp_actuel: int = 0,
                           xp_max: int = xp_required_for_level(1), unlock_level: int = 1,
-                          max_level_threshold=None) -> int:
+                          max_level_threshold=None, is_unlocked: int = 1) -> int:
     """Crée un sort PRINCIPAL et retourne son id. color = (r, g, b). xp_max par défaut = xp requis pour
-    le niveau 1 (formule exponentielle), cohérent dès la création. unlock_level = niveau global auquel le
-    sort devient utilisable ; max_level_threshold = seuil de fin de Phase 1 (plus haut niveau_requis de
-    ses secondaires). phase (=1) et is_technique_maximum (=0) prennent leurs défauts de schéma."""
+    le niveau 1 (formule exponentielle), cohérent dès la création. unlock_level = niveau requis INDICATIF
+    (affiché au staff, aucun déblocage auto) ; max_level_threshold = seuil de fin de Phase 1 (plus haut
+    niveau_requis de ses secondaires) ; is_unlocked = 1 (visible/actif) ou 0 (verrouillé). phase (=1) et
+    is_technique_maximum (=0) prennent leurs défauts de schéma."""
     r, g, b = color
     with get_connection() as conn:
         cur = conn.execute(
             "INSERT INTO character_sorts (character_id, slot_index, name, level, xp_actuel, xp_max, "
-            "color_r, color_g, color_b, unlock_level, max_level_threshold) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "color_r, color_g, color_b, unlock_level, max_level_threshold, is_unlocked) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (character_id, slot_index, name, level, xp_actuel, xp_max, r, g, b,
-             unlock_level, max_level_threshold),
+             unlock_level, max_level_threshold, is_unlocked),
         )
         return cur.lastrowid
 

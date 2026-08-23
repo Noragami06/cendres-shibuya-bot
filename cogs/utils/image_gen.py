@@ -1938,15 +1938,13 @@ def _tech_hex_gauge(d, cx, cy, r, pct, color, bg, width=9):
         d.line((p0, (mx, my)), fill=color, width=width)
         remaining -= edge_len
 
-def _tech_sort_card(d, x, y, w, h, name, level, color, locked=False):
+def _tech_sort_card(d, x, y, w, h, name, level, color, locked=False, unlock_level=None):
     _tech_frame(d, (x, y, x + w, y + h), color, width=3, radius=12)
     if locked:
-        qw = text_w(d, "???", font(20, True))
-        d.text((x + w / 2 - qw / 2, y + h / 2 - 30), "???", font=font(20, True), fill=TECH_SUB)
-        lock_txt = "Verrouillé"
-        lw = text_w(d, lock_txt, font(11))
-        d.rounded_rectangle((x + w / 2 - lw / 2 - 10, y + h - 40, x + w / 2 + lw / 2 + 10, y + h - 16), radius=8, outline=TECH_SUB, width=1)
-        d.text((x + w / 2 - lw / 2, y + h - 35), lock_txt, font=font(11), fill=TECH_SUB)
+        # Sort principal verrouillé : « ??? (niveau requis N) », comme un sort secondaire verrouillé.
+        txt = f"??? (niveau requis {unlock_level})" if unlock_level is not None else "???"
+        tw = text_w(d, txt, font(15, True))
+        d.text((x + w / 2 - tw / 2, y + h / 2 - 10), txt, font=font(15, True), fill=TECH_SUB)
         return
     d.text((x + 18, y + 16), name, font=font(16, True), fill=color)
     badge_txt = f"Lv{level}"
@@ -1993,8 +1991,9 @@ def _tech_maximum_box(d, xy, gold, names=None):
 def generate_technique_image(name: str, camp: str, sorts: list, out_path: str, portrait_path=None,
                              background_path=None, technique_maximum_list=None):
     """
-    sorts : liste de jusqu'à 4 tuples (nom, niveau, couleur_rgb, xp_actuel, xp_max).
-            Un slot verrouillé/vide est représenté par (None, None, None, None, None).
+    sorts : liste des sorts principaux RÉELLEMENT créés (1 à 4, jamais de padding). Chaque élément est
+            un tuple (nom, niveau, couleur_rgb, xp_actuel, xp_max, locked, unlock_level). Un sort avec
+            locked=True s'affiche « ??? (niveau requis unlock_level) » (case ET hexagone de maîtrise).
     technique_maximum_list : noms des sorts principaux ayant atteint la Technique Maximum (affichés dans
             l'encadré du bas). None/vide = aucun.
     """
@@ -2039,18 +2038,31 @@ def generate_technique_image(name: str, camp: str, sorts: list, out_path: str, p
 
     d.text((40, 168), "GRANDES CATÉGORIES", font=font(13, True), fill=TECH_HEADER_COLOR)
     gap = 20
-    card_w = (W - 40 * 2 - gap * 3) // 4
+    # Autant de cases QUE de sorts principaux réels (1 à 4), jamais de padding. Largeur bornée puis rangée
+    # centrée : 1 sort = 1 grande case centrée, 2/3/4 = cases réparties uniformément.
+    n = max(1, len(sorts))
+    card_w = min(320, (W - 40 * 2 - gap * (n - 1)) // n)
+    total_w = n * card_w + gap * (n - 1)
+    start_x = (W - total_w) // 2
     y0 = 198
-    padded_sorts = (sorts + [(None, None, None, None, None)] * 4)[:4]
-    for i, (sname, lvl, color, xp_cur, xp_max) in enumerate(padded_sorts):
-        x = 40 + i * (card_w + gap)
-        _tech_sort_card(d, x, y0, card_w, 150, sname, lvl, color if color else TECH_LOCKED_COLOR, locked=(sname is None))
+    for i, entry in enumerate(sorts):
+        sname, lvl, color, xp_cur, xp_max, locked, unlock_level = entry
+        x = start_x + i * (card_w + gap)
+        card_color = TECH_LOCKED_COLOR if (locked or not color) else color
+        _tech_sort_card(d, x, y0, card_w, 150, sname, lvl, card_color,
+                        locked=locked, unlock_level=unlock_level)
 
     my = y0 + 190
     d.text((40, my), "MAÎTRISE", font=font(13, True), fill=TECH_HEADER_COLOR)
-    for i, (sname, lvl, color, xp_cur, xp_max) in enumerate(padded_sorts):
-        px = 40 + card_w / 2 + i * (card_w + gap)
-        _tech_maitrise_hex(d, px, my + 120, sname, lvl, xp_cur, xp_max, color if color else TECH_LOCKED_COLOR)
+    for i, entry in enumerate(sorts):
+        sname, lvl, color, xp_cur, xp_max, locked, unlock_level = entry
+        px = start_x + card_w / 2 + i * (card_w + gap)
+        if locked:
+            # Hexagone verrouillé (« ??? ») pour un sort principal non débloqué.
+            _tech_maitrise_hex(d, px, my + 120, None, None, 0, 0, TECH_LOCKED_COLOR)
+        else:
+            _tech_maitrise_hex(d, px, my + 120, sname, lvl, xp_cur, xp_max,
+                               color if color else TECH_LOCKED_COLOR)
 
     tm_y = my + 250
     _tech_maximum_box(d, (40, tm_y, W - 40, H - 40), TECH_GOLD, technique_maximum_list)
