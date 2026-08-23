@@ -55,6 +55,8 @@ TECHNIQUE_SORT_PALETTE = [
 ]
 # Les 5 classes de sorts valides (saisies par le joueur lors du flux guidé).
 TECHNIQUE_VALID_CLASSES = ("4", "3", "2", "1", "S")
+# Seul cet utilisateur précis peut valider une demande de création de techniques (bouton ✅ Confirmer).
+TECHNIQUE_VALIDATOR_ID = 396615332346855428
 # Limites de longueur des champs texte libres du flux de création guidée des techniques.
 TECHNIQUE_NAME_MAX = 50        # nom d'un sort principal OU secondaire
 TECHNIQUE_DESC_MAX = 300       # description d'un sort secondaire
@@ -935,11 +937,11 @@ class Profil(commands.Cog):
         # tech_create_confirm:{character_id}:{player_user_id}
         _, character_id, player_user_id = cid.split(":")
         character_id, player_user_id = int(character_id), int(player_user_id)
-        # Seul un membre STAFF peut confirmer ; le joueur lui même ne peut jamais déclencher, même s'il a
-        # par ailleurs un rôle staff (on refuse explicitement l'auteur de la demande).
-        if interaction.user.id == player_user_id or not _is_staff(interaction.user):
+        # Restriction stricte : seul un utilisateur précis peut valider (si c'est le joueur d'origine, il
+        # peut donc valider sa propre demande — c'est voulu, pas une faille).
+        if interaction.user.id != TECHNIQUE_VALIDATOR_ID:
             await interaction.response.send_message(
-                "Seul un membre du staff (autre que le joueur) peut confirmer cette demande.",
+                "❌ Seul ce membre précis peut valider une demande de création de techniques.",
                 ephemeral=True,
             )
             return
