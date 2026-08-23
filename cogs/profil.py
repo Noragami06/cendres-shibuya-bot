@@ -57,6 +57,9 @@ TECHNIQUE_SORT_PALETTE = [
 TECHNIQUE_VALID_CLASSES = ("4", "3", "2", "1", "S")
 # Seul cet utilisateur précis peut valider une demande de création de techniques (bouton ✅ Confirmer).
 TECHNIQUE_VALIDATOR_ID = 396615332346855428
+# Sentinelle renvoyée par les helpers de saisie quand le joueur tape « cancel » (distinct de None =
+# timeout). Permet d'annuler le flux de création de techniques à n'importe quelle étape.
+_CANCELLED = object()
 # Limites de longueur des champs texte libres du flux de création guidée des techniques.
 TECHNIQUE_NAME_MAX = 50        # nom d'un sort principal OU secondaire
 TECHNIQUE_DESC_MAX = 300       # description d'un sort secondaire
@@ -977,8 +980,20 @@ class Profil(commands.Cog):
         (1-8) avec nom/description/faiblesse/classe. Écrit tout en base à la fin (tout ou rien), puis
         affiche le pillow d'ensemble. Isolation par utilisateur déjà posée par l'appelant."""
         await channel.send(
-            f"{player.mention} — la création de tes techniques commence ! Réponds ici, une question à la fois."
+            f"{player.mention} — la création de tes techniques commence ! Réponds ici, une question à la "
+            "fois. Tape « cancel » à tout moment pour tout annuler."
         )
+
+        # Contrôle d'arrêt commun : True s'il faut arrêter le flux (aucune écriture en base). Distingue
+        # l'annulation volontaire (« cancel ») du timeout (plus de réponse).
+        async def _stop(result) -> bool:
+            if result is _CANCELLED:
+                await channel.send("❌ Création de techniques annulée.")
+                return True
+            if result is None:
+                await channel.send("⏳ Création annulée (aucune réponse).")
+                return True
+            return False
 
         # --- Étape 1 : nombre de sorts principaux (1-4) ---
         nb_principaux = await self._ask_bounded_int(
@@ -988,25 +1003,22 @@ class Profil(commands.Cog):
             "Minimum 1, maximum 4.",
             1, 4,
         )
-        if nb_principaux is None:
-            await channel.send("⏳ Création annulée (aucune réponse).")
+        if await _stop(nb_principaux):
             return
 
-        # --- Noms des sorts principaux ---
-        principaux = []  # liste de noms
-        for i in range(1, nb_principaux + 1):
-            nom = await self._ask_bounded_text(
-                channel, player, f"Quel est le nom du Sort Principal n°{i} ?", TECHNIQUE_NAME_MAX
-            )
-            if nom is None:
-                await channel.send("⏳ Création annulée (aucune réponse).")
-                return
-            principaux.append(nom)
-
-        # --- Pour chaque sort principal : ses sorts secondaires ---
+        # --- Traitement sort principal par sort principal : chacun est ENTIÈREMENT complété (nom +
+        # nombre de secondaires + tous ses secondaires) avant de passer au suivant. ---
         # Structure collectée avant tout écrit : [{"name":..., "secondaires":[{name,description,faiblesse,classe}]}]
         plan = []
-        for nom_principal in principaux:
+        for i in range(1, nb_principaux + 1):
+            # a. Nom du sort principal n°i.
+            nom_principal = await self._ask_bounded_text(
+                channel, player, f"Quel est le nom du Sort Principal n°{i} ?", TECHNIQUE_NAME_MAX
+            )
+            if await _stop(nom_principal):
+                return
+
+            # b. Nombre de sorts secondaires POUR CE sort principal.
             nb_secondaires = await self._ask_bounded_int(
                 channel, player,
                 f"Combien de **Sorts Secondaires** veux tu pour « {nom_principal} » ? Un Sort Secondaire "
@@ -1014,10 +1026,10 @@ class Profil(commands.Cog):
                 "« Katon : Boule de feu suprême » serait un Sort Secondaire de « Katon »). Minimum 1, maximum 8.",
                 1, 8,
             )
-            if nb_secondaires is None:
-                await channel.send("⏳ Création annulée (aucune réponse).")
+            if await _stop(nb_secondaires):
                 return
 
+            # c. Les M secondaires de CE sort principal (nom / description / faiblesse / classe).
             secondaires = []
             for j in range(1, nb_secondaires + 1):
                 nom_sec = await self._ask_bounded_text(
@@ -1025,33 +1037,31 @@ class Profil(commands.Cog):
                     f"Nom de la technique {j}/{nb_secondaires} pour « {nom_principal} » :",
                     TECHNIQUE_NAME_MAX,
                 )
-                if nom_sec is None:
-                    await channel.send("⏳ Création annulée (aucune réponse).")
+                if await _stop(nom_sec):
                     return
 
                 description = await self._ask_bounded_text(
                     channel, player, f"Description de « {nom_sec} » :", TECHNIQUE_DESC_MAX
                 )
-                if description is None:
-                    await channel.send("⏳ Création annulée (aucune réponse).")
+                if await _stop(description):
                     return
 
                 faiblesse = await self._ask_bounded_text(
                     channel, player, f"Faiblesse de « {nom_sec} » :", TECHNIQUE_FAIBLESSE_MAX
                 )
-                if faiblesse is None:
-                    await channel.send("⏳ Création annulée (aucune réponse).")
+                if await _stop(faiblesse):
                     return
 
                 classe = await self._ask_spell_class(channel, player, nom_sec)
-                if classe is None:
-                    await channel.send("⏳ Création annulée (aucune réponse).")
+                if await _stop(classe):
                     return
 
                 secondaires.append({
                     "name": nom_sec, "description": description,
                     "faiblesse": faiblesse, "classe": classe,
                 })
+
+            # d. CE sort principal est entièrement traité : on passe au suivant.
             plan.append({"name": nom_principal, "secondaires": secondaires})
 
         # --- Répartition automatique des seuils de déblocage (niveau_requis) et du niveau de déblocage
@@ -1112,12 +1122,14 @@ class Profil(commands.Cog):
     async def _ask_bounded_text(self, channel, player, question, max_len):
         """Pose `question`, renvoie la réponse (nettoyée) tant qu'elle ne dépasse pas `max_len`
         caractères ; sinon message clair et redemande la même question sans avancer. None si le joueur
-        ne répond plus (timeout)."""
+        ne répond plus (timeout) ; _CANCELLED si le joueur tape « cancel »."""
         await channel.send(question)
         while True:
             m = await self.wait_message(channel, player)
             if m is None:
                 return None
+            if _is_cancel(m.content):
+                return _CANCELLED
             reponse = m.content.strip()
             if len(reponse) > max_len:
                 await channel.send(
@@ -1130,12 +1142,14 @@ class Profil(commands.Cog):
 
     async def _ask_bounded_int(self, channel, player, question, minimum, maximum):
         """Pose `question`, valide un entier dans [minimum, maximum], redemande sinon. Retourne None si
-        le joueur ne répond plus (timeout)."""
+        le joueur ne répond plus (timeout) ; _CANCELLED si le joueur tape « cancel »."""
         await channel.send(question)
         while True:
             m = await self.wait_message(channel, player)
             if m is None:
                 return None
+            if _is_cancel(m.content):
+                return _CANCELLED
             n = _parse_int(m.content, minimum=minimum)
             if n is None or n > maximum:
                 await channel.send(f"Entre un nombre entier entre {minimum} et {maximum}.")
@@ -1143,12 +1157,15 @@ class Profil(commands.Cog):
             return n
 
     async def _ask_spell_class(self, channel, player, nom_sec):
-        """Valide strictement une classe parmi 4/3/2/1/S, redemande sinon. None si plus de réponse."""
+        """Valide strictement une classe parmi 4/3/2/1/S, redemande sinon. None si plus de réponse ;
+        _CANCELLED si le joueur tape « cancel »."""
         await channel.send(f"Classe de « {nom_sec} » ? (4, 3, 2, 1, ou S)")
         while True:
             m = await self.wait_message(channel, player)
             if m is None:
                 return None
+            if _is_cancel(m.content):
+                return _CANCELLED
             choix = m.content.strip().upper()
             if choix in TECHNIQUE_VALID_CLASSES:
                 return choix
