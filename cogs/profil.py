@@ -2572,5 +2572,60 @@ class Profil(commands.Cog):
         return False, "❌ Paramètre non pris en charge."
 
 
+# =====================================================================
+# RATTRAPAGES RÉTROACTIFS (exécutés une seule fois au démarrage, à la suite des autres backfills).
+# PV et valeurs de sorts secondaires ne touchent que ce qui n'a pas encore été corrigé (relançables sans
+# danger) ; le statut de déblocage réaligne systématiquement slot 0 = débloqué / slots ≥ 1 = verrouillés.
+# =====================================================================
+async def backfill_pv_system():
+    """PV des personnages créés avant le système de PV (pv_max < 5000) : recalcule 5000 + 500*(level-1)
+    et remet pv_actuel au max. N'affecte que les profils encore sous l'ancienne valeur."""
+    with db.get_connection() as conn:
+        characters = conn.execute(
+            "SELECT character_id, level, pv_max FROM character_profiles WHERE pv_max < 5000"
+        ).fetchall()
+        for char in characters:
+            nouveau_pv_max = 5000 + 500 * (char["level"] - 1)
+            conn.execute(
+                "UPDATE character_profiles SET pv_max = ?, pv_actuel = ? WHERE character_id = ?",
+                (nouveau_pv_max, nouveau_pv_max, char["character_id"]),
+            )
+            print(f"🔍 [backfill PV] Personnage {char['character_id']} : PV mis à jour à "
+                  f"{nouveau_pv_max} (niveau {char['level']})")
+
+
+async def backfill_secondary_sort_values():
+    """Coût % et dégâts des sorts secondaires insérés sans ces valeurs, résolus depuis SPELL_CLASS_VALUES
+    (dégâts tirés une fois dans la fourchette de la classe). Ignore une classe invalide."""
+    with db.get_connection() as conn:
+        secondaires = conn.execute(
+            "SELECT id, classe, cout_pct, degats FROM character_secondary_sorts "
+            "WHERE classe IS NOT NULL AND (cout_pct IS NULL OR cout_pct = 0 OR degats IS NULL OR degats = 0)"
+        ).fetchall()
+        for s in secondaires:
+            if s["classe"] not in SPELL_CLASS_VALUES:
+                print(f"⚠️ [backfill sorts] Sort {s['id']} a une classe invalide ('{s['classe']}'), ignoré.")
+                continue
+            cout_pct = SPELL_CLASS_VALUES[s["classe"]]["cout_pct"]
+            degats_min = SPELL_CLASS_VALUES[s["classe"]]["degats_min"]
+            degats_max = SPELL_CLASS_VALUES[s["classe"]]["degats_max"]
+            degats = random.randint(degats_min, degats_max)
+            conn.execute(
+                "UPDATE character_secondary_sorts SET cout_pct = ?, degats = ? WHERE id = ?",
+                (cout_pct, degats, s["id"]),
+            )
+            print(f"🔍 [backfill sorts] Sort {s['id']} (classe {s['classe']}) : coût {cout_pct}%, dégâts {degats}")
+
+
+async def backfill_sort_unlock_status():
+    """Statut de déblocage des sorts principaux créés avant is_unlocked : slot 0 débloqué, slots ≥ 1
+    verrouillés (déblocage manuel staff à construire — cf. TODO dans _run_technique_creation)."""
+    with db.get_connection() as conn:
+        conn.execute("UPDATE character_sorts SET is_unlocked = 1 WHERE slot_index = 0")
+        conn.execute("UPDATE character_sorts SET is_unlocked = 0 WHERE slot_index >= 1")
+    print("🔍 [backfill sorts] Statuts de déblocage corrigés : seul le 1er sort principal de chaque "
+          "personnage reste débloqué.")
+
+
 async def setup(bot):
     await bot.add_cog(Profil(bot))

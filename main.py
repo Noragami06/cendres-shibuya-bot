@@ -5,6 +5,9 @@ import os
 
 from cogs.clans import build_clans_report
 from cogs.depart import retroactive_departure_check, backfill_role_points
+from cogs.profil import (
+    backfill_pv_system, backfill_secondary_sort_values, backfill_sort_unlock_status,
+)
 from cogs.utils.database import init_db
 
 load_dotenv()
@@ -16,6 +19,9 @@ intents.members = True
 intents.presences = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+# Garde : les rattrapages profil (PV / sorts) ne doivent tourner qu'une fois par process.
+_profil_backfills_done = False
 
 
 @bot.event
@@ -44,6 +50,15 @@ async def on_ready():
     # risque à relancer : ne traite que ceux sans ligne dans character_role_point_grants).
     for guild in bot.guilds:
         await backfill_role_points(guild)
+    # Rattrapages PV / valeurs de sorts secondaires / statut de déblocage des sorts principaux. Exécutés
+    # UNE SEULE FOIS par process (on_ready peut se redéclencher aux reconnexions ; le rattrapage du
+    # verrouillage étant un UPDATE inconditionnel, on le protège d'un re-déclenchement).
+    global _profil_backfills_done
+    if not _profil_backfills_done:
+        _profil_backfills_done = True
+        await backfill_pv_system()
+        await backfill_secondary_sort_values()
+        await backfill_sort_unlock_status()
     if not status_loop.is_running():
         status_loop.start()
 
