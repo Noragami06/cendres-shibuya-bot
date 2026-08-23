@@ -1190,13 +1190,15 @@ class Profil(commands.Cog):
         """principal : ligne character_sorts (le sort principal). Retourne le chemin de l'image détaillée."""
         color = (principal["color_r"], principal["color_g"], principal["color_b"]) \
             if principal["color_r"] is not None else TECHNIQUE_DEFAULT_COLOR
-        # Slots secondaires -> tuples (nom, classe, niveau_requis, debloque). L'image complète elle-même
-        # jusqu'à 8 slots (None, None, 999, False). Un slot sans nom est considéré verrouillé/vide.
+        # Slots secondaires -> tuples (nom, classe, niveau_requis, debloque, cout_pct, degats). L'image
+        # complète elle-même jusqu'à 8 slots (None, None, 999, False, None, None). Un slot sans nom est
+        # considéré verrouillé/vide ; cout_pct et degats viennent de character_secondary_sorts.
         secondaires = []
         for row in db.get_secondary_sorts(principal["id"]):
             debloque = row["name"] is not None
             niveau = row["niveau_requis"] if row["niveau_requis"] is not None else 999
-            secondaires.append((row["name"], row["classe"], niveau, debloque))
+            secondaires.append((row["name"], row["classe"], niveau, debloque,
+                                row["cout_pct"], row["degats"]))
         bg = db.get_background(character_id)
         background_path = bg["image_path"] if bg else None
         path = _tmp_profile("technique_detail")

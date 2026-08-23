@@ -2101,7 +2101,8 @@ def _techdet_class_badge(d, x, y, classe, size=30):
     lw = text_w(d, label, f)
     d.text((x + size / 2 - lw / 2, y + size / 2 - 8), label, font=f, fill=(15, 15, 18, 255))
 
-def _techdet_secondary_card(d, x, y, w, h, name, classe, niveau_requis, debloque, principal_level):
+def _techdet_secondary_card(d, x, y, w, h, name, classe, niveau_requis, debloque, principal_level,
+                            cout_pct=None, degats=None):
     locked = not debloque or (principal_level < niveau_requis)
     color = TECHDET_CLASS_COLORS.get(classe, (90, 88, 100)) if not locked else (70, 68, 80)
     d.rounded_rectangle((x, y, x + w, y + h), radius=10, fill=(22, 20, 28, 255))
@@ -2122,16 +2123,19 @@ def _techdet_secondary_card(d, x, y, w, h, name, classe, niveau_requis, debloque
         display_name = display_name + "..."
     d.text((x + 18, y + 18), display_name, font=font(13, True), fill=TECHDET_TEXT)
     d.text((x + 18, y + 44), f"Niveau requis : {niveau_requis}", font=font(13), fill=TECHDET_SUB)
-    d.text((x + 18, y + h - 56), "Coût EO : —", font=font(13), fill=TECHDET_SUB)
-    d.text((x + 18, y + h - 30), "Dégâts : —", font=font(13), fill=TECHDET_SUB)
+    cout_txt = f"Coût EO : {cout_pct}%" if cout_pct is not None else "Coût EO : —"
+    degats_txt = f"Dégâts : {degats} pts" if degats is not None else "Dégâts : —"
+    d.text((x + 18, y + h - 56), cout_txt, font=font(13), fill=TECHDET_SUB)
+    d.text((x + 18, y + h - 30), degats_txt, font=font(13), fill=TECHDET_SUB)
 
 
 def generate_technique_detail_image(sort_principal_name: str, sort_principal_level: int, sort_principal_color: tuple,
                                      sorts_secondaires: list, out_path: str, background_path=None):
     """
-    sorts_secondaires : liste de jusqu'à 8 tuples (nom, classe, niveau_requis, debloque)
+    sorts_secondaires : liste de jusqu'à 8 tuples (nom, classe, niveau_requis, debloque, cout_pct, degats)
                          classe est une chaîne parmi "S", "1", "2", "3", "4", ou None si le slot est vide.
                          nom est None si le slot n'a pas encore de sort assigné (vide, même déverrouillable).
+                         cout_pct / degats sont None si inconnus (affiche « — »).
     """
     W, H = 1300, 1300
     if background_path and os.path.exists(background_path):
@@ -2167,12 +2171,13 @@ def generate_technique_detail_image(sort_principal_name: str, sort_principal_lev
     row_h = 150
     gap = 20
     y0 = 90
-    padded = (sorts_secondaires + [(None, None, 999, False)] * 8)[:8]
-    for i, (name, classe, niveau, debloque) in enumerate(padded):
+    padded = (sorts_secondaires + [(None, None, 999, False, None, None)] * 8)[:8]
+    for i, (name, classe, niveau, debloque, cout_pct, degats) in enumerate(padded):
         col, row = i % 2, i // 2
         x = 300 + col * (col_w + gap)
         y = y0 + row * (row_h + gap)
-        _techdet_secondary_card(d, x, y, col_w, row_h, name, classe, niveau, debloque, sort_principal_level)
+        _techdet_secondary_card(d, x, y, col_w, row_h, name, classe, niveau, debloque,
+                                sort_principal_level, cout_pct=cout_pct, degats=degats)
 
     img.save(out_path)
     return out_path
