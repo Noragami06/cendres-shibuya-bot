@@ -32,13 +32,13 @@ WAIT_TIMEOUT = 300  # secondes d'attente d'une réponse texte
 BACKGROUND_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "backgrounds")
 PROFILE_IMG_DIR = os.path.join(os.path.dirname(__file__), "..", "temp", "profil_images")
 
-# Les 6 sections encore non développées (boutons sous le profil). "stats" a désormais un vrai écran.
+# Boutons sous le profil. "stats"/"relation"/"technique" ont un vrai écran ; "📜 Sorts" a été retiré
+# (doublon avec ⚡ Technique). Restent en placeholder : Territoire et Armes maudites.
 TODO_SECTIONS = [
     ("stats", "📊 Stats"),
     ("relation", "🤝 Relation"),
     ("technique", "⚡ Technique"),
     ("territoire", "🗺️ Territoire"),
-    ("sorts", "📜 Sorts"),
     ("armes", "🗡️ Armes maudites"),
 ]
 
@@ -888,6 +888,24 @@ class Profil(commands.Cog):
         char = get_character(character_id)
         character_name = char["character_name"] if char else "?"
         player_mention = f"<@{player_user_id}>"
+        # 1) Message TEXTE CLASSIQUE (permanent, sans embed ni ephemeral) : le modèle de fiche, pour que
+        # le joueur prépare ses réponses à l'avance pendant l'attente de validation staff.
+        await interaction.channel.send(
+            "📋 **Modèle de fiche Technique — prépare tes réponses à l'avance !**\n\n"
+            "Voici toutes les questions que le bot te posera une fois que le staff aura validé ta demande. "
+            "Tu peux préparer tes réponses dès maintenant.\n\n"
+            "**1. Combien de Sorts Principaux veux-tu créer ?** (minimum 1, maximum 4)\n"
+            "Un Sort Principal est la grande catégorie de ta technique occulte (exemple : « Katon » dans Naruto).\n\n"
+            "**2. Le nom de chaque Sort Principal** (un par un, selon le nombre choisi à l'étape 1)\n\n"
+            "**3. Pour CHAQUE Sort Principal, dans l'ordre :**\n"
+            "- Combien de Sorts Secondaires veux-tu pour ce Sort Principal ? (minimum 1, maximum 8)\n"
+            "Un Sort Secondaire est une compétence précise qui découle de ce Sort Principal "
+            "(exemple : « Katon : Boule de feu suprême »).\n"
+            "- Pour chaque Sort Secondaire : son nom, sa description, sa faiblesse, et sa classe (4, 3, 2, 1, ou S)\n\n"
+            "⚠️ Un membre du staff doit valider ta demande ci-dessous avant que ces questions ne te soient "
+            "réellement posées."
+        )
+        # 2) Embed récapitulatif + bouton ✅ Confirmer (ping staff), juste en dessous, même salon.
         embed = discord.Embed(
             title="📋 Demande de création de techniques",
             description=(
