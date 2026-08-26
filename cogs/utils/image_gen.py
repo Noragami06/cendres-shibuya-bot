@@ -2089,9 +2089,21 @@ TECHDET_CLASS_COLORS = {
 }
 TECHDET_CLASS_LABELS = {"S": "Ultime", "1": "Avancé", "2": "Normal", "3": "Passif"}
 
-def _techdet_hexagon(d, cx, cy, r, gold, fill=(20, 20, 28, 255)):
+def _techdet_hexagon(d, img, cx, cy, r, gold, portrait_path=None):
+    # Reçoit directement img (comme _stats_hexagon) pour coller la photo dans l'hexagone.
     pts = [(cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a))) for a in range(-90, 271, 60)]
-    d.polygon(pts, outline=gold, width=3, fill=fill)
+    if portrait_path and os.path.exists(portrait_path):
+        size = int(r * 1.6)
+        photo = Image.open(portrait_path).convert("RGB")
+        photo = ImageOps.fit(photo, (size, size), method=Image.LANCZOS)
+        mask = Image.new("L", (size, size), 0)
+        md = ImageDraw.Draw(mask)
+        hex_local = [(size / 2 + r * math.cos(math.radians(a)), size / 2 + r * math.sin(math.radians(a))) for a in range(-90, 271, 60)]
+        md.polygon(hex_local, fill=255)
+        img.paste(photo, (int(cx - size / 2), int(cy - size / 2)), mask)
+    else:
+        d.polygon(pts, fill=(20, 20, 28, 255))
+    d.polygon(pts, outline=gold, width=3)
 
 def _techdet_class_badge(d, x, y, classe, size=30):
     color = TECHDET_CLASS_COLORS.get(classe, (100, 100, 110))
@@ -2130,7 +2142,8 @@ def _techdet_secondary_card(d, x, y, w, h, name, classe, niveau_requis, debloque
 
 
 def generate_technique_detail_image(sort_principal_name: str, sort_principal_level: int, sort_principal_color: tuple,
-                                     sorts_secondaires: list, out_path: str, background_path=None):
+                                     sorts_secondaires: list, out_path: str, background_path=None,
+                                     portrait_path=None):
     """
     sorts_secondaires : liste de jusqu'à 8 tuples (nom, classe, niveau_requis, debloque, cout_pct, degats)
                          classe est une chaîne parmi "S", "1", "2", "3", "4", ou None si le slot est vide.
@@ -2151,7 +2164,7 @@ def generate_technique_detail_image(sort_principal_name: str, sort_principal_lev
     d.rectangle((0, 0, W, H), outline=TECHDET_GOLD, width=2)
     d.rectangle((0, 0, 280, H), fill=(16, 15, 20, 255))
 
-    _techdet_hexagon(d, 140, 100, 60, TECHDET_GOLD)
+    _techdet_hexagon(d, img, 140, 100, 60, TECHDET_GOLD, portrait_path=portrait_path)
     tw = text_w(d, sort_principal_name, font(18, True))
     d.text((140 - tw / 2, 176), sort_principal_name, font=font(18, True), fill=sort_principal_color)
     lvl_txt = f"Niveau {sort_principal_level}"

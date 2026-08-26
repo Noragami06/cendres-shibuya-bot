@@ -331,6 +331,29 @@ PARAM_ALIASES = {
     # --- Rôles (réels slot 1 / virtuels slot 2-3, avec synchro du barème de points) ---
     "roles_ajouter": ["ajouter des roles", "ajouter roles", "roles ajouter"],
     "roles_retirer": ["retirer des roles", "retirer roles", "roles retirer"],
+    # --- Techniques (sorts principaux / secondaires) ---
+    "nom_sort_principal": ["nom sort principal", "renommer sort principal"],
+    "ajouter_xp_sort": ["ajouter xp", "ajouter xp sort"],
+    "retirer_xp_sort": ["retirer xp", "retirer xp sort"],
+    "modifier_level_sort": ["modifier level", "modifier level sort", "modifier niveau sort"],
+    "ajouter_sort_max": ["ajouter sort maximum", "ajouter sort max"],
+    "retirer_sort_max": ["retirer sort maximum", "retirer sort max"],
+    "debloquer_sort_principal": ["debloquer sort principal", "débloquer sort principal"],
+    "bloquer_sort_principal": ["bloquer sort principal", "verrouiller sort principal"],
+    "nom_sort_secondaire": ["nom sort secondaire", "renommer sort secondaire"],
+    "niveau_requis_secondaire": ["niveau requis", "niveau requis secondaire"],
+    "cout_eo_secondaire": ["cout eo", "coût eo", "cout eo secondaire"],
+    "degats_secondaire": ["degats", "dégâts", "degats secondaire"],
+    "debloquer_sort_secondaire": ["debloquer sort secondaire", "débloquer sort secondaire"],
+    "bloquer_sort_secondaire": ["bloquer sort secondaire", "verrouiller sort secondaire"],
+}
+
+# Paramètres du menu staff qui passent par le flux dédié « Techniques ».
+TECHNIQUE_EDIT_PARAMS = {
+    "nom_sort_principal", "ajouter_xp_sort", "retirer_xp_sort", "modifier_level_sort",
+    "ajouter_sort_max", "retirer_sort_max", "debloquer_sort_principal", "bloquer_sort_principal",
+    "nom_sort_secondaire", "niveau_requis_secondaire", "cout_eo_secondaire", "degats_secondaire",
+    "debloquer_sort_secondaire", "bloquer_sort_secondaire",
 }
 
 # "stats_X" -> clé de stat (écriture ABSOLUE dans character_stats).
@@ -528,6 +551,20 @@ class TechniqueDetailView(discord.ui.View):
         self.add_item(discord.ui.Button(
             label="Afficher plus", emoji="🔍", style=discord.ButtonStyle.primary,
             custom_id=f"tech_more:{sort_id}:{user_id}"))
+
+
+class ParamsPageView(discord.ui.View):
+    """Pagination de l'embed des paramètres staff (visible seulement s'il y a plusieurs pages). Les
+    boutons reflètent une page à l'autre ; la sélection du paramètre se fait toujours en TEXTE."""
+
+    def __init__(self, user_id: int, page: int, total_pages: int):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Page précédente", emoji="◀️", style=discord.ButtonStyle.secondary,
+            custom_id=f"param_page_prev:{user_id}:{page}", disabled=(page <= 0)))
+        self.add_item(discord.ui.Button(
+            label="Page suivante", emoji="▶️", style=discord.ButtonStyle.secondary,
+            custom_id=f"param_page_next:{user_id}:{page}", disabled=(page >= total_pages - 1)))
 
 
 class RelationsPageView(discord.ui.View):
@@ -1201,10 +1238,12 @@ class Profil(commands.Cog):
                                 row["cout_pct"], row["degats"]))
         bg = db.get_background(character_id)
         background_path = bg["image_path"] if bg else None
+        char = get_character(character_id)
+        portrait_path = char["portrait_path"] if char else None
         path = _tmp_profile("technique_detail")
         generate_technique_detail_image(
             principal["name"], principal["level"], color, secondaires, path,
-            background_path=background_path,
+            background_path=background_path, portrait_path=portrait_path,
         )
         return path
 
@@ -1373,6 +1412,10 @@ class Profil(commands.Cog):
             await self.handle_rel_page(interaction, cid, "prev")
         elif cid.startswith("rel_page_next:"):
             await self.handle_rel_page(interaction, cid, "next")
+        elif cid.startswith("param_page_prev:"):
+            await self.handle_params_page(interaction, cid, "prev")
+        elif cid.startswith("param_page_next:"):
+            await self.handle_params_page(interaction, cid, "next")
         elif cid.startswith("rel_create:"):
             await self.handle_rel_create(interaction, cid)
         elif cid.startswith("rel_remove:"):
@@ -2031,19 +2074,60 @@ class Profil(commands.Cog):
         finally:
             self._release(user_id)
 
-    def _params_embed(self) -> discord.Embed:
-        desc = (
-            "**PROFIL :**\n"
-            "PV maximum, PV minimum, EO maximum, EO minimum, Level, XP maximum, XP minimum, "
-            "Clan, Rang, Victoires, Défaites, Nuls, Level maîtrise EO, Image, Fond\n\n"
-            "**STATS :**\n"
-            "Stats Force, Stats Vitesse, Stats Endurance, Stats Armes maudites, Stats RCT, "
-            "Stats Territoire, Stats Sorts, Stats Énergie occulte, Buff, Points de stats\n\n"
-            "**RÔLES :**\n"
-            "Ajouter des rôles, Retirer des rôles\n\n"
-            "Écris le nom du paramètre à modifier."
-        )
-        return discord.Embed(title="Paramètres modifiables", description=desc, color=PHOENIX_COLOR)
+    # Catégories du menu staff (titre, contenu). Découpées en pages si l'embed dépasse la limite Discord.
+    _PARAM_CATEGORY_BLOCKS = [
+        ("PROFIL",
+         "PV maximum, PV minimum, EO maximum, EO minimum, Level, XP maximum, XP minimum, "
+         "Clan, Rang, Victoires, Défaites, Nuls, Level maîtrise EO, Image, Fond"),
+        ("STATS",
+         "Stats Force, Stats Vitesse, Stats Endurance, Stats Armes maudites, Stats RCT, "
+         "Stats Territoire, Stats Sorts, Stats Énergie occulte, Buff, Points de stats"),
+        ("RÔLES", "Ajouter des rôles, Retirer des rôles"),
+        ("TECHNIQUES",
+         "Nom sort principal, Ajouter XP, Retirer XP, Modifier level, Ajouter sort maximum, "
+         "Retirer sort maximum, Débloquer sort principal, Bloquer sort principal, Nom sort secondaire, "
+         "Niveau requis, Coût EO, Dégâts, Débloquer sort secondaire, Bloquer sort secondaire"),
+    ]
+    _PARAM_FOOTER = "\n\nÉcris le nom du paramètre à modifier."
+
+    def _params_pages(self) -> list:
+        """Découpe la liste des catégories en pages ≤ ~3900 caractères (limite embed Discord = 4096)."""
+        blocks = [f"**{title} :**\n{content}" for title, content in self._PARAM_CATEGORY_BLOCKS]
+        pages, cur = [], ""
+        for b in blocks:
+            candidate = (cur + "\n\n" + b) if cur else b
+            if cur and len(candidate) + len(self._PARAM_FOOTER) > 3900:
+                pages.append(cur + self._PARAM_FOOTER)
+                cur = b
+            else:
+                cur = candidate
+        if cur:
+            pages.append(cur + self._PARAM_FOOTER)
+        return pages
+
+    async def _send_params_prompt(self, channel, user):
+        pages = self._params_pages()
+        total = len(pages)
+        embed = discord.Embed(title="Paramètres modifiables", description=pages[0], color=PHOENIX_COLOR)
+        # Pagination par boutons SEULEMENT si le contenu déborde sur plusieurs pages.
+        if total > 1:
+            embed.set_footer(text=f"Page 1/{total}")
+            await channel.send(embed=embed, view=ParamsPageView(user.id, 0, total))
+        else:
+            await channel.send(embed=embed)
+
+    async def handle_params_page(self, interaction, cid, direction):
+        _, user_id, page = cid.split(":")
+        user_id, page = int(user_id), int(page)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
+            return
+        pages = self._params_pages()
+        total = len(pages)
+        new_page = max(0, min(total - 1, page - 1 if direction == "prev" else page + 1))
+        embed = discord.Embed(title="Paramètres modifiables", description=pages[new_page], color=PHOENIX_COLOR)
+        embed.set_footer(text=f"Page {new_page + 1}/{total}")
+        await interaction.response.edit_message(embed=embed, view=ParamsPageView(user_id, new_page, total))
 
     async def _pick_param(self, channel, user):
         while True:
@@ -2073,10 +2157,14 @@ class Profil(commands.Cog):
 
     async def _one_edit(self, channel, staff, character_id):
         """Une modification. Retourne True si traitée, None si timeout dur (interruption propre)."""
-        await channel.send(embed=self._params_embed())
+        await self._send_params_prompt(channel, staff)
         param = await self._pick_param(channel, staff)
         if param is None:
             return None
+
+        # Flux dédié Techniques (sorts principaux / secondaires).
+        if param in TECHNIQUE_EDIT_PARAMS:
+            return await self._edit_technique_param(channel, staff, character_id, param)
 
         if param == "image":
             await channel.send("Envoie la nouvelle image du personnage (JPG/PNG, pièce jointe ou lien, pas de GIF).")
@@ -2129,6 +2217,340 @@ class Profil(commands.Cog):
                     await self.send_stats(channel, character_id, staff.id)
                 return True
             # invalide : on redemande la valeur
+
+    # =================================================================
+    # ÉDITION STAFF DES TECHNIQUES (sorts principaux / secondaires)
+    # Isolation déjà posée par handle_edit ; « cancel » disponible à chaque étape.
+    # =================================================================
+    async def select_principal_sort(self, channel, staff, character_id, prompt_extra=""):
+        """Liste les sorts principaux, demande d'en choisir un par son NOM ACTUEL. Gère « cancel ».
+        Retourne l'id du sort choisi, ou None (annulé / aucun sort / timeout)."""
+        sorts = db.get_character_sorts(character_id)
+        if not sorts:
+            await channel.send("Ce personnage n'a aucun sort principal.")
+            return None
+        liste = "\n".join(f"• {s['name']}" for s in sorts)
+        await channel.send(f"Sorts principaux existants :\n{liste}\n\nÉcris le NOM ACTUEL du sort à "
+                           f"modifier (ou « cancel »). {prompt_extra}")
+        while True:
+            m = await self.wait_message(channel, staff)
+            if m is None or _is_cancel(m.content):
+                return None
+            target = m.content.strip().lower()
+            match = next((s for s in sorts if (s["name"] or "").lower() == target), None)
+            if match:
+                return match["id"]
+            await channel.send("Nom introuvable parmi les sorts existants, réessaie (ou « cancel »).")
+
+    async def _tech_ask_int(self, channel, staff, question, minimum=1, maximum=None):
+        """Entier ≥ minimum (et ≤ maximum si fourni). None si « cancel » ou timeout."""
+        await channel.send(question + " (ou « cancel »)")
+        while True:
+            m = await self.wait_message(channel, staff)
+            if m is None or _is_cancel(m.content):
+                return None
+            v = _parse_int(m.content, minimum=minimum)
+            if v is None or (maximum is not None and v > maximum):
+                borne = f"entre {minimum} et {maximum}" if maximum is not None else f"supérieur ou égal à {minimum}"
+                await channel.send(f"Entre un nombre entier {borne}.")
+                continue
+            return v
+
+    async def _tech_pick_numbered(self, channel, staff, items, prompt):
+        """items : liste de (id, label). Retourne l'id choisi, ou None (vide / cancel / timeout)."""
+        if not items:
+            return None
+        lines = "\n".join(f"**{i + 1}.** {lbl}" for i, (_id, lbl) in enumerate(items))
+        await channel.send(embed=discord.Embed(
+            description=prompt + "\n\n" + lines + "\n\nRéponds avec le numéro (ou « cancel »).",
+            color=PHOENIX_COLOR,
+        ))
+        while True:
+            m = await self.wait_message(channel, staff)
+            if m is None or _is_cancel(m.content):
+                return None
+            c = m.content.strip()
+            if c.isdigit() and 1 <= int(c) <= len(items):
+                return items[int(c) - 1][0]
+            await channel.send(f"Réponds avec un numéro entre 1 et {len(items)}.")
+
+    def _tech_secondary_items(self, sort_id, principal_level, only_locked=None):
+        """(id, label) des sorts secondaires NOMMÉS d'un sort principal, avec état débloqué/verrouillé.
+        only_locked=True -> seulement verrouillés ; False -> seulement débloqués ; None -> tous."""
+        items = []
+        for r in db.get_secondary_sorts(sort_id):
+            if r["name"] is None:
+                continue
+            niveau = r["niveau_requis"] if r["niveau_requis"] is not None else 999
+            locked = principal_level < niveau
+            if only_locked is True and not locked:
+                continue
+            if only_locked is False and locked:
+                continue
+            state = f"verrouillé, niveau requis {niveau}" if locked else "débloqué"
+            items.append((r["id"], f"{r['name']} ({state})"))
+        return items
+
+    async def _edit_technique_param(self, channel, staff, character_id, param):
+        """Dispatcher des 14 flux d'édition Techniques. Retourne True (traité ou annulé proprement) ou
+        None (timeout : on laisse l'appelant décider — ici on renvoie True pour ne pas casser la session,
+        l'annulation étant volontaire ou par inactivité)."""
+
+        async def refresh():
+            # Régénère le pillow d'ensemble ⚡ Technique pour refléter la modification.
+            if db.count_character_sorts(character_id) > 0:
+                await self.send_technique(channel, character_id, staff.id)
+            return True
+
+        # ---- Sorts principaux ----
+        if param == "nom_sort_principal":
+            sort_id = await self.select_principal_sort(channel, staff, character_id)
+            if sort_id is None:
+                return True
+            nom = await self._ask_bounded_text(channel, staff, "Nouveau nom du sort principal :", TECHNIQUE_NAME_MAX)
+            if nom is None or nom is _CANCELLED:
+                return True
+            with db.get_connection() as conn:
+                conn.execute("UPDATE character_sorts SET name = ? WHERE id = ?", (nom, sort_id))
+            await channel.send(f"✅ Sort principal renommé en « {nom} ».")
+            return await refresh()
+
+        if param == "ajouter_xp_sort":
+            sort_id = await self.select_principal_sort(channel, staff, character_id)
+            if sort_id is None:
+                return True
+            xp = await self._tech_ask_int(channel, staff, "Combien d'XP ajouter ?", minimum=1)
+            if xp is None:
+                return True
+            ups = await db.grant_sort_xp(sort_id, xp)
+            await channel.send(f"✅ {xp} XP ajoutés ({ups} montée(s) de niveau).")
+            return await refresh()
+
+        if param == "retirer_xp_sort":
+            sort_id = await self.select_principal_sort(channel, staff, character_id)
+            if sort_id is None:
+                return True
+            xp = await self._tech_ask_int(channel, staff, "Combien d'XP retirer ?", minimum=1)
+            if xp is None:
+                return True
+            new_level = await db.revoke_sort_xp(sort_id, xp)
+            await channel.send(f"✅ {xp} XP retirés (niveau du sort désormais {new_level}).")
+            return await refresh()
+
+        if param == "modifier_level_sort":
+            sort_id = await self.select_principal_sort(channel, staff, character_id)
+            if sort_id is None:
+                return True
+            row = db.get_character_sort(sort_id)
+            phase = row["phase"]
+            # En phase 1, le plafond cohérent est le seuil de fin de Phase 1 ; en phase 2, 100.
+            max_lv = 100 if phase == 2 else (row["max_level_threshold"] or 999)
+            new_level = await self._tech_ask_int(
+                channel, staff, f"Nouveau niveau ? (1 à {max_lv})", minimum=1, maximum=max_lv)
+            if new_level is None:
+                return True
+            xp_max = db.PHASE2_XP_PER_LEVEL if phase == 2 else db.xp_required_for_level(new_level)
+            with db.get_connection() as conn:
+                conn.execute(
+                    "UPDATE character_sorts SET level = ?, xp_actuel = 0, xp_max = ? WHERE id = ?",
+                    (new_level, xp_max, sort_id),
+                )
+            await channel.send(f"✅ Niveau du sort principal fixé à {new_level} "
+                               "(carte et hexagone se mettent à jour automatiquement).")
+            return await refresh()
+
+        if param == "ajouter_sort_max":
+            sort_id = await self.select_principal_sort(
+                channel, staff, character_id, prompt_extra="(il sera classé en Technique Maximum)")
+            if sort_id is None:
+                return True
+            with db.get_connection() as conn:
+                conn.execute("UPDATE character_sorts SET is_technique_maximum = 1 WHERE id = ?", (sort_id,))
+            await channel.send("✅ Sort classé en Technique Maximum.")
+            return await refresh()
+
+        if param == "retirer_sort_max":
+            items = [(s["id"], s["name"]) for s in db.get_character_sorts(character_id)
+                     if s["is_technique_maximum"]]
+            if not items:
+                await channel.send("Aucun sort en Technique Maximum.")
+                return True
+            sort_id = await self._tech_pick_numbered(
+                channel, staff, items, "Quel sort retirer de la Technique Maximum ?")
+            if sort_id is None:
+                return True
+            with db.get_connection() as conn:
+                conn.execute("UPDATE character_sorts SET is_technique_maximum = 0 WHERE id = ?", (sort_id,))
+            await channel.send("✅ Sort retiré de la Technique Maximum.")
+            return await refresh()
+
+        if param == "debloquer_sort_principal":
+            locked = [s for s in db.get_character_sorts(character_id) if not s["is_unlocked"]]
+            if not locked:
+                await channel.send("Aucun sort principal verrouillé.")
+                return True
+            combien = await self._tech_ask_int(
+                channel, staff, f"Combien veux tu en débloquer ? (max {len(locked)})",
+                minimum=1, maximum=len(locked))
+            if combien is None:
+                return True
+            remaining = list(locked)
+            for _ in range(combien):
+                items = [(s["id"], s["name"]) for s in remaining]
+                sort_id = await self._tech_pick_numbered(channel, staff, items, "Sort à débloquer :")
+                if sort_id is None:
+                    return True
+                with db.get_connection() as conn:
+                    conn.execute("UPDATE character_sorts SET is_unlocked = 1 WHERE id = ?", (sort_id,))
+                    # Force le déblocage du 1er secondaire (slot_index le plus bas) si son niveau_requis
+                    # dépasse le niveau actuel du sort principal.
+                    lvl = conn.execute("SELECT level FROM character_sorts WHERE id = ?",
+                                       (sort_id,)).fetchone()["level"]
+                    first = conn.execute(
+                        "SELECT id, niveau_requis FROM character_secondary_sorts WHERE sort_id = ? "
+                        "AND name IS NOT NULL ORDER BY slot_index LIMIT 1", (sort_id,)).fetchone()
+                    if first is not None and (first["niveau_requis"] or 0) > lvl:
+                        conn.execute("UPDATE character_secondary_sorts SET niveau_requis = ? WHERE id = ?",
+                                     (lvl, first["id"]))
+                remaining = [s for s in remaining if s["id"] != sort_id]
+            await channel.send(f"✅ {combien} sort(s) principal(aux) débloqué(s).")
+            return await refresh()
+
+        if param == "bloquer_sort_principal":
+            items = [(s["id"], s["name"]) for s in db.get_character_sorts(character_id)
+                     if s["is_unlocked"] and s["slot_index"] != 0]
+            if not items:
+                await channel.send("Aucun sort principal verrouillable (le tout premier reste toujours débloqué).")
+                return True
+            sort_id = await self._tech_pick_numbered(channel, staff, items, "Quel sort principal bloquer ?")
+            if sort_id is None:
+                return True
+            with db.get_connection() as conn:
+                conn.execute("UPDATE character_sorts SET is_unlocked = 0 WHERE id = ?", (sort_id,))
+            await channel.send("✅ Sort principal verrouillé.")
+            return await refresh()
+
+        # ---- Sorts secondaires ----
+        if param == "nom_sort_secondaire":
+            sort_id = await self.select_principal_sort(channel, staff, character_id)
+            if sort_id is None:
+                return True
+            named = [r for r in db.get_secondary_sorts(sort_id) if r["name"] is not None]
+            if not named:
+                await channel.send("Ce sort principal n'a aucun sort secondaire nommé.")
+                return True
+            combien = await self._tech_ask_int(
+                channel, staff, f"Combien de sorts secondaires renommer ? (1 à {len(named)})",
+                minimum=1, maximum=len(named))
+            if combien is None:
+                return True
+            for _ in range(combien):
+                items = [(r["id"], r["name"]) for r in named]
+                sec_id = await self._tech_pick_numbered(channel, staff, items, "Sort secondaire à renommer :")
+                if sec_id is None:
+                    return True
+                nom = await self._ask_bounded_text(channel, staff, "Nouveau nom :", TECHNIQUE_NAME_MAX)
+                if nom is None or nom is _CANCELLED:
+                    return True
+                with db.get_connection() as conn:
+                    conn.execute("UPDATE character_secondary_sorts SET name = ? WHERE id = ?", (nom, sec_id))
+                named = [r for r in db.get_secondary_sorts(sort_id) if r["name"] is not None]
+            await channel.send(f"✅ {combien} sort(s) secondaire(s) renommé(s).")
+            return await refresh()
+
+        if param in ("niveau_requis_secondaire", "cout_eo_secondaire", "degats_secondaire"):
+            sort_id = await self.select_principal_sort(channel, staff, character_id)
+            if sort_id is None:
+                return True
+            principal = db.get_character_sort(sort_id)
+            items = self._tech_secondary_items(sort_id, principal["level"], only_locked=None)
+            if not items:
+                await channel.send("Ce sort principal n'a aucun sort secondaire nommé.")
+                return True
+            sec_id = await self._tech_pick_numbered(channel, staff, items, "Sort secondaire à modifier :")
+            if sec_id is None:
+                return True
+            if param == "niveau_requis_secondaire":
+                v = await self._tech_ask_int(channel, staff, "Nouveau niveau requis ?", minimum=1)
+                if v is None:
+                    return True
+                with db.get_connection() as conn:
+                    conn.execute("UPDATE character_secondary_sorts SET niveau_requis = ? WHERE id = ?",
+                                 (v, sec_id))
+                    # Recalcule le seuil de fin de Phase 1 de ce sort principal, et l'unlock_level
+                    # INDICATIF du sort principal suivant (aucun déblocage automatique).
+                    threshold = conn.execute(
+                        "SELECT MAX(niveau_requis) AS m FROM character_secondary_sorts "
+                        "WHERE sort_id = ? AND name IS NOT NULL", (sort_id,)).fetchone()["m"]
+                    if threshold is not None:
+                        conn.execute("UPDATE character_sorts SET max_level_threshold = ? WHERE id = ?",
+                                     (threshold, sort_id))
+                        nxt = conn.execute(
+                            "SELECT id FROM character_sorts WHERE character_id = ? AND slot_index = ?",
+                            (principal["character_id"], principal["slot_index"] + 1)).fetchone()
+                        if nxt is not None:
+                            conn.execute("UPDATE character_sorts SET unlock_level = ? WHERE id = ?",
+                                         (threshold + 5, nxt["id"]))
+                await channel.send(f"✅ Niveau requis fixé à {v} (seuils recalculés).")
+            elif param == "cout_eo_secondaire":
+                v = await self._tech_ask_int(channel, staff, "Nouveau coût EO (en %) ?", minimum=0)
+                if v is None:
+                    return True
+                with db.get_connection() as conn:
+                    conn.execute("UPDATE character_secondary_sorts SET cout_pct = ? WHERE id = ?", (v, sec_id))
+                await channel.send(f"✅ Coût EO fixé à {v}%.")
+            else:  # degats_secondaire
+                v = await self._tech_ask_int(channel, staff, "Nouvelle valeur de dégâts ?", minimum=1)
+                if v is None:
+                    return True
+                with db.get_connection() as conn:
+                    conn.execute("UPDATE character_secondary_sorts SET degats = ? WHERE id = ?", (v, sec_id))
+                await channel.send(f"✅ Dégâts fixés à {v} pts.")
+            return await refresh()
+
+        if param == "debloquer_sort_secondaire":
+            sort_id = await self.select_principal_sort(channel, staff, character_id)
+            if sort_id is None:
+                return True
+            principal = db.get_character_sort(sort_id)
+            items = self._tech_secondary_items(sort_id, principal["level"], only_locked=None)
+            if not items:
+                await channel.send("Ce sort principal n'a aucun sort secondaire nommé.")
+                return True
+            sec_id = await self._tech_pick_numbered(
+                channel, staff, items, "Sort secondaire à débloquer (niveau requis = niveau actuel du sort principal) :")
+            if sec_id is None:
+                return True
+            with db.get_connection() as conn:
+                conn.execute("UPDATE character_secondary_sorts SET niveau_requis = ? WHERE id = ?",
+                             (principal["level"], sec_id))
+            await channel.send("✅ Sort secondaire débloqué (niveau requis aligné sur le sort principal).")
+            return await refresh()
+
+        if param == "bloquer_sort_secondaire":
+            sort_id = await self.select_principal_sort(channel, staff, character_id)
+            if sort_id is None:
+                return True
+            principal = db.get_character_sort(sort_id)
+            items = self._tech_secondary_items(sort_id, principal["level"], only_locked=None)
+            if not items:
+                await channel.send("Ce sort principal n'a aucun sort secondaire nommé.")
+                return True
+            sec_id = await self._tech_pick_numbered(channel, staff, items, "Sort secondaire à reverrouiller :")
+            if sec_id is None:
+                return True
+            v = await self._tech_ask_int(
+                channel, staff,
+                f"À quel niveau le reverrouiller ? (strictement supérieur à {principal['level']})",
+                minimum=principal["level"] + 1)
+            if v is None:
+                return True
+            with db.get_connection() as conn:
+                conn.execute("UPDATE character_secondary_sorts SET niveau_requis = ? WHERE id = ?", (v, sec_id))
+            await channel.send(f"✅ Sort secondaire reverrouillé (niveau requis {v}).")
+            return await refresh()
+
+        return True
 
     # ---------- gestion des buffs (staff) ----------
     async def _edit_buff(self, channel, staff, character_id):

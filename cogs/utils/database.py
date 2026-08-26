@@ -1637,12 +1637,47 @@ async def grant_sort_xp(sort_id: int, xp_gained: int) -> int:
         return level_ups
 
 
+async def revoke_sort_xp(sort_id: int, xp_removed: int) -> int:
+    """Retire de l'XP à un SORT PRINCIPAL en recalculant level/xp_actuel en sens inverse (jamais sous le
+    niveau plancher — 1 en phase 1, 0 en phase 2 — ni sous xp_actuel=0). Retourne le nouveau niveau.
+    # Ne retire PAS rétroactivement les +55 dégâts déjà accordés aux sorts secondaires lors des niveaux
+    # précédemment gagnés — seul le niveau/XP du sort principal est corrigé, une correction plus fine
+    # serait trop fragile à tracer."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT phase, level, xp_actuel FROM character_sorts WHERE id = ?", (sort_id,)
+        ).fetchone()
+        if row is None:
+            return 0
+        phase, level, xp = row["phase"], row["level"], row["xp_actuel"]
+        xp -= xp_removed
+        if phase == 1:
+            while xp < 0 and level > 1:
+                level -= 1
+                xp += xp_required_for_level(level)
+            level = max(1, level)
+            xp = max(0, xp)
+            xp_max = xp_required_for_level(level)
+        else:  # phase 2 : paliers plats
+            while xp < 0 and level > 0:
+                level -= 1
+                xp += PHASE2_XP_PER_LEVEL
+            level = max(0, level)
+            xp = max(0, xp)
+            xp_max = PHASE2_XP_PER_LEVEL
+        conn.execute(
+            "UPDATE character_sorts SET level = ?, xp_actuel = ?, xp_max = ? WHERE id = ?",
+            (level, xp, xp_max, sort_id),
+        )
+    return level
+
+
 def get_secondary_sorts(sort_id: int):
     """Sorts SECONDAIRES d'un sort principal (character_secondary_sorts), triés par slot_index (0..7).
     Vide par défaut : aucun moyen de la remplir depuis le bot pour l'instant (règles non définies)."""
     with get_connection() as conn:
         return conn.execute(
-            "SELECT slot_index, name, classe, niveau_requis, description, faiblesse, cout_pct, "
+            "SELECT id, slot_index, name, classe, niveau_requis, description, faiblesse, cout_pct, "
             "cout_eo_fixe, cout_converted_at, degats "
             "FROM character_secondary_sorts WHERE sort_id = ? ORDER BY slot_index",
             (sort_id,),
