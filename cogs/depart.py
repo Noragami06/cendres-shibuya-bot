@@ -2955,6 +2955,8 @@ def delete_character_cascade(character_id):
             (character_id,),
         )
         conn.execute("DELETE FROM character_sorts WHERE character_id = ?", (character_id,))
+        # Territoire (/profil → 🗺️ Territoire) propre au personnage
+        conn.execute("DELETE FROM character_territoire WHERE character_id = ?", (character_id,))
         # Statistiques + buffs (et effets de buffs via sous requête sur buff_id)
         conn.execute("DELETE FROM character_stats WHERE character_id = ?", (character_id,))
         conn.execute(

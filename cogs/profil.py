@@ -12,7 +12,7 @@ from discord.ext import commands
 from cogs.utils import database as db
 from cogs.utils.image_gen import (
     generate_profil_image, generate_stats_image, generate_relations_image, generate_technique_image,
-    generate_technique_detail_image, TECHDET_CLASS_COLORS,
+    generate_technique_detail_image, TECHDET_CLASS_COLORS, generate_territoire_image,
 )
 # Barème validé des classes de sorts + stades de Maîtrise RCT + plafonds de maîtrise (source unique
 # partagée avec le check de cohérence).
@@ -924,6 +924,52 @@ class Profil(commands.Cog):
         await interaction.response.defer()
         await self._request_technique_creation(interaction, character_id, user_id)
 
+    async def _render_territoire(self, character_id):
+        """Construit le pillow Territoire. Retourne le chemin de l'image.
+        NB : maitrise_level / maitrise_pct sont mis à 1 / 0 en dur pour l'instant — le lien avec la stat
+        Territoire n'est pas encore fait (point non abordé, système différé)."""
+        terr = db.get_territoire(character_id)
+        char = get_character(character_id)
+        portrait_path = char["portrait_path"] if char else None
+        char_name = (char["name"] if char else None) or "—"
+        bg = db.get_background(character_id)
+        background_path = bg["image_path"] if bg else None
+        path = _tmp_profile("territoire")
+        generate_territoire_image(
+            char_name,
+            terr["name"] or "—",
+            terr["type"] or "—",
+            1, 0,  # maitrise_level / maitrise_pct en dur (lien stat Territoire non encore fait)
+            terr["description"] or "—",
+            terr["cout"] or "—",
+            terr["effets"] or "—",
+            path, portrait_path=portrait_path, background_path=background_path,
+        )
+        return path
+
+    async def send_territoire(self, channel, character_id):
+        path = await self._render_territoire(character_id)
+        await channel.send(file=discord.File(path, filename="territoire.png"))
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    async def handle_territoire(self, interaction, cid):
+        _, character_id, user_id = cid.split(":")  # profil_todo_territoire:{cid}:{uid}
+        character_id, user_id = int(character_id), int(user_id)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
+            return
+        # TODO : flux de création/staff pour le Territoire pas encore construit (point non abordé).
+        if db.get_territoire(character_id) is None:
+            await interaction.response.send_message(
+                "🔧 Cette section n'est pas encore développée.", ephemeral=True
+            )
+            return
+        await interaction.response.defer()
+        await self.send_territoire(interaction.channel, character_id)
+
     # =================================================================
     # CRÉATION GUIDÉE DES TECHNIQUES (validation staff préalable puis flux guidé côté joueur)
     # =================================================================
@@ -1420,6 +1466,8 @@ class Profil(commands.Cog):
             await self.handle_rel_create(interaction, cid)
         elif cid.startswith("rel_remove:"):
             await self.handle_rel_remove(interaction, cid)
+        elif cid.startswith("profil_todo_territoire:"):
+            await self.handle_territoire(interaction, cid)
         elif cid.startswith("profil_todo_"):
             await interaction.response.send_message(
                 "🔧 Cette section n'est pas encore développée.", ephemeral=True

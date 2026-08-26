@@ -2194,3 +2194,111 @@ def generate_technique_detail_image(sort_principal_name: str, sort_principal_lev
 
     img.save(out_path)
     return out_path
+
+
+# ---------------------------------------------------------------------------
+# Territoire (/profil → 🗺️ Territoire)
+# ---------------------------------------------------------------------------
+TERR_BG = (10, 9, 15, 255)
+TERR_TEXT = (235, 235, 240, 255)
+TERR_SUB = (150, 148, 160, 255)
+TERR_GOLD = (232, 197, 121, 255)
+TERR_HEADER_COLOR = (255, 200, 60, 255)
+TERR_ACCENT = (150, 100, 230)
+
+
+def _terr_frame(d, xy, gold, width=3, radius=14):
+    d.rounded_rectangle(xy, radius=radius, outline=gold, width=width)
+
+
+def _terr_hexagon(d, img, cx, cy, r, gold, portrait_path=None):
+    pts = [(cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a))) for a in range(-90, 271, 60)]
+    if portrait_path and os.path.exists(portrait_path):
+        size = int(r * 1.6)
+        photo = Image.open(portrait_path).convert("RGB")
+        photo = ImageOps.fit(photo, (size, size), method=Image.LANCZOS)
+        mask = Image.new("L", (size, size), 0)
+        md = ImageDraw.Draw(mask)
+        hex_local = [(size / 2 + r * math.cos(math.radians(a)), size / 2 + r * math.sin(math.radians(a))) for a in range(-90, 271, 60)]
+        md.polygon(hex_local, fill=255)
+        img.paste(photo, (int(cx - size / 2), int(cy - size / 2)), mask)
+    else:
+        d.polygon(pts, fill=(20, 20, 28, 255))
+    d.polygon(pts, outline=gold, width=3)
+
+
+def _terr_ring_gauge(d, cx, cy, r, pct, color, bg, width=10):
+    d.ellipse((cx - r, cy - r, cx + r, cy + r), outline=bg, width=width)
+    end = -90 + 360 * (pct / 100)
+    d.arc((cx - r, cy - r, cx + r, cy + r), start=-90, end=end, fill=color, width=width)
+
+
+def _terr_type_badge(d, x, y, text, color):
+    tw = text_w(d, text, font(11, True))
+    d.rounded_rectangle((x, y, x + tw + 24, y + 26), radius=13, fill=color)
+    d.text((x + 12, y + 5), text, font=font(11, True), fill=(15, 15, 18, 255))
+    return tw + 24
+
+
+def generate_territoire_image(character_name: str, terr_name: str, terr_type: str,
+                               maitrise_level: int, maitrise_pct: int,
+                               description: str, cout: str, effets: str,
+                               out_path: str, portrait_path=None, background_path=None):
+    """
+    terr_type : chaîne libre, ex "Sans barrière", "Non maîtrisé", "Barrière active"...
+    description, cout, effets : texte libre, jusqu'à 500 caractères chacun.
+    """
+    W = 1100
+    dummy = Image.new("RGBA", (10, 10))
+    dd = ImageDraw.Draw(dummy)
+
+    y_start = 390
+    total_h = y_start
+    boxes = [("DESCRIPTION", description), ("COÛT", cout), ("EFFETS", effets)]
+    for label, content in boxes:
+        h_box = 60 + len(wrap_text(dd, content, font(16), W - 120)) * 24
+        total_h += h_box + 16
+    H = total_h + 40
+
+    if background_path and os.path.exists(background_path):
+        try:
+            bg = ImageOps.fit(Image.open(background_path).convert("RGB"), (W, H), method=Image.LANCZOS)
+            bg = bg.filter(ImageFilter.GaussianBlur(radius=8)).convert("RGBA")
+            img = Image.alpha_composite(bg, Image.new("RGBA", (W, H), (0, 0, 0, 140)))
+        except Exception:
+            img = Image.new("RGBA", (W, H), TERR_BG)
+    else:
+        img = Image.new("RGBA", (W, H), TERR_BG)
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, W, H), outline=TERR_GOLD, width=2)
+
+    _terr_ring_gauge(d, W // 2, 130, 90, maitrise_pct, TERR_ACCENT, (35, 33, 42, 255), width=10)
+    lvl_txt = f"Lv{maitrise_level}"
+    lw = text_w(d, lvl_txt, font(30, True))
+    d.text((W / 2 - lw / 2, 106), lvl_txt, font=font(30, True), fill=TERR_ACCENT)
+    pw = text_w(d, f"{maitrise_pct}%", font(12))
+    d.text((W / 2 - pw / 2, 148), f"{maitrise_pct}%", font=font(12), fill=TERR_SUB)
+    mw = text_w(d, "MAÎTRISE", font(11, True))
+    d.text((W / 2 - mw / 2, 232), "MAÎTRISE", font=font(11, True), fill=TERR_HEADER_COLOR)
+
+    _terr_hexagon(d, img, 90, 90, 50, TERR_GOLD, portrait_path)
+    d.text((160, 60), character_name, font=font(14, True), fill=TERR_TEXT)
+    d.text((160, 84), "TERRITOIRE", font=font(11, True), fill=TERR_GOLD)
+
+    d.line((40, 270, W - 40, 270), fill=(55, 52, 65, 255), width=2)
+    tnw = text_w(d, terr_name, font(22, True))
+    d.text((W / 2 - tnw / 2, 290), terr_name, font=font(22, True), fill=TERR_ACCENT)
+    bw = text_w(d, terr_type, font(11, True)) + 24
+    _terr_type_badge(d, W / 2 - bw / 2, 330, terr_type, (200, 90, 90))
+
+    y = y_start
+    for label, content in boxes:
+        h_box = 60 + len(wrap_text(d, content, font(16), W - 120)) * 24
+        _terr_frame(d, (40, y, W - 40, y + h_box), TERR_GOLD)
+        d.text((60, y + 14), label, font=font(15, True), fill=TERR_HEADER_COLOR)
+        for i, line in enumerate(wrap_text(d, content, font(16), W - 120)):
+            d.text((60, y + 48 + i * 24), line, font=font(16), fill=TERR_TEXT)
+        y += h_box + 16
+
+    img.save(out_path)
+    return out_path

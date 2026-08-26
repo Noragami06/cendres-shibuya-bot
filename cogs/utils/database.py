@@ -343,6 +343,17 @@ CREATE TABLE IF NOT EXISTS character_secondary_sorts (
     degats INTEGER DEFAULT NULL  -- dégâts de BASE tirés une seule fois à la création (dans la fourchette de la classe)
 );
 
+-- Territoire (Extension du Territoire) propre à un personnage (/profil → 🗺️ Territoire). Le flux de
+-- création/staff n'est pas encore construit ; seule la lecture (pillow) est branchée pour l'instant.
+CREATE TABLE IF NOT EXISTS character_territoire (
+    character_id INTEGER PRIMARY KEY,
+    name TEXT,
+    type TEXT,
+    description TEXT,
+    cout TEXT,
+    effets TEXT
+);
+
 -- Barème : points de stats accordés par rôle (camp / clan / grade).
 CREATE TABLE IF NOT EXISTS role_point_values (
     role_id INTEGER PRIMARY KEY,
@@ -1490,6 +1501,17 @@ def count_character_sorts(character_id: int) -> int:
         return conn.execute(
             "SELECT COUNT(*) AS n FROM character_sorts WHERE character_id = ?", (character_id,)
         ).fetchone()["n"]
+
+
+def get_territoire(character_id: int):
+    """Territoire (/profil → 🗺️ Territoire) d'un personnage, ou None si aucun n'a été défini. Le flux
+    de création/staff n'est pas encore construit ; cette lecture ne sert qu'au pillow d'affichage."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT character_id, name, type, description, cout, effets "
+            "FROM character_territoire WHERE character_id = ?",
+            (character_id,),
+        ).fetchone()
 
 
 def get_character_sort(sort_id: int):
