@@ -2227,7 +2227,7 @@ def _terr_hexagon(d, img, cx, cy, r, gold, portrait_path=None):
     d.polygon(pts, outline=gold, width=3)
 
 
-def _terr_ring_gauge(d, cx, cy, r, pct, color, bg, width=10):
+def _terr_ring_gauge(d, cx, cy, r, pct, color, bg, width=9):
     d.ellipse((cx - r, cy - r, cx + r, cy + r), outline=bg, width=width)
     end = -90 + 360 * (pct / 100)
     d.arc((cx - r, cy - r, cx + r, cy + r), start=-90, end=end, fill=color, width=width)
@@ -2242,11 +2242,14 @@ def _terr_type_badge(d, x, y, text, color):
 
 def generate_territoire_image(character_name: str, terr_name: str, terr_type: str,
                                maitrise_level: int, maitrise_pct: int,
-                               description: str, cout: str, effets: str,
+                               cout_eo_pct: int, duree_tours: int,
+                               description: str, effets: str,
                                out_path: str, portrait_path=None, background_path=None):
     """
     terr_type : chaîne libre, ex "Sans barrière", "Non maîtrisé", "Barrière active"...
-    description, cout, effets : texte libre, jusqu'à 500 caractères chacun.
+    cout_eo_pct : coût en % de la réserve, valeur fixe modifiable uniquement par le staff.
+    duree_tours : durée d'effet en tours, valeur fixe modifiable uniquement par le staff.
+    description, effets : texte libre, jusqu'à 500 caractères chacun.
     """
     W = 1100
     dummy = Image.new("RGBA", (10, 10))
@@ -2254,7 +2257,7 @@ def generate_territoire_image(character_name: str, terr_name: str, terr_type: st
 
     y_start = 390
     total_h = y_start
-    boxes = [("DESCRIPTION", description), ("COÛT", cout), ("EFFETS", effets)]
+    boxes = [("DESCRIPTION", description), ("EFFETS", effets)]
     for label, content in boxes:
         h_box = 60 + len(wrap_text(dd, content, font(16), W - 120)) * 24
         total_h += h_box + 16
@@ -2272,14 +2275,25 @@ def generate_territoire_image(character_name: str, terr_name: str, terr_type: st
     d = ImageDraw.Draw(img)
     d.rectangle((0, 0, W, H), outline=TERR_GOLD, width=2)
 
-    _terr_ring_gauge(d, W // 2, 130, 90, maitrise_pct, TERR_ACCENT, (35, 33, 42, 255), width=10)
+    ring_cx = W // 2 - 90
+    _terr_ring_gauge(d, ring_cx, 130, 80, maitrise_pct, TERR_ACCENT, (35, 33, 42, 255), width=9)
     lvl_txt = f"Lv{maitrise_level}"
-    lw = text_w(d, lvl_txt, font(30, True))
-    d.text((W / 2 - lw / 2, 106), lvl_txt, font=font(30, True), fill=TERR_ACCENT)
-    pw = text_w(d, f"{maitrise_pct}%", font(12))
-    d.text((W / 2 - pw / 2, 148), f"{maitrise_pct}%", font=font(12), fill=TERR_SUB)
-    mw = text_w(d, "MAÎTRISE", font(11, True))
-    d.text((W / 2 - mw / 2, 232), "MAÎTRISE", font=font(11, True), fill=TERR_HEADER_COLOR)
+    lw = text_w(d, lvl_txt, font(26, True))
+    d.text((ring_cx - lw / 2, 108), lvl_txt, font=font(26, True), fill=TERR_ACCENT)
+    pw = text_w(d, f"{maitrise_pct}%", font(11))
+    d.text((ring_cx - pw / 2, 146), f"{maitrise_pct}%", font=font(11), fill=TERR_SUB)
+    mw = text_w(d, "MAÎTRISE", font(10, True))
+    d.text((ring_cx - mw / 2, 220), "MAÎTRISE", font=font(10, True), fill=TERR_HEADER_COLOR)
+
+    box_x0 = ring_cx + 110
+    box_x1 = box_x0 + 220
+    box_y0, box_y1 = 60, 200
+    _terr_frame(d, (box_x0, box_y0, box_x1, box_y1), TERR_GOLD, width=2, radius=10)
+    d.text((box_x0 + 14, box_y0 + 12), "COÛT EO", font=font(11, True), fill=TERR_HEADER_COLOR)
+    d.text((box_x0 + 14, box_y0 + 32), f"{cout_eo_pct}%", font=font(18, True), fill=(230, 90, 90, 255))
+    d.line((box_x0 + 14, box_y0 + 68, box_x1 - 14, box_y0 + 68), fill=(50, 47, 58, 255), width=1)
+    d.text((box_x0 + 14, box_y0 + 78), "DURÉE", font=font(11, True), fill=TERR_HEADER_COLOR)
+    d.text((box_x0 + 14, box_y0 + 98), f"{duree_tours} tours", font=font(18, True), fill=(120, 220, 170, 255))
 
     _terr_hexagon(d, img, 90, 90, 50, TERR_GOLD, portrait_path)
     d.text((160, 60), character_name, font=font(14, True), fill=TERR_TEXT)

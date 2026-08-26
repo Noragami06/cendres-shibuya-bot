@@ -131,3 +131,39 @@ generate_ordre_image(
     "temp/preview_ordre.png",
 )
 print("11ème image (ordre) générée dans temp/")
+
+from cogs.utils.image_gen import generate_technique_image, generate_technique_detail_image, generate_territoire_image
+
+# ---------- Technique : vue d'ensemble ----------
+# Chaque sort est un 7-tuple (nom, niveau, couleur, xp_actuel, xp_max, locked, unlock_level).
+sorts_exemple = [
+    ("Limitless", 5, (90, 160, 240), 300, 1150, False, 1),
+    ("Six Eyes", 3, (170, 100, 240), 120, 800, False, 1),
+]
+generate_technique_image("Satoru Gojo", "Exorciste", sorts_exemple, "temp/preview_technique.png")
+print("Technique (vue d'ensemble) générée dans temp/")
+
+# ---------- Technique : détail d'un sort principal ----------
+# Chaque secondaire est un 6-tuple (nom, classe, niveau_requis, debloque, cout_pct, degats).
+secondaires_exemple = [
+    ("Azur Perforant", "3", 1, True, 45, 350),
+    ("Marée Convergente", "1", 3, True, 29, 1200),
+    ("Rupture Bleue", "S", 5, True, 40, 3800),
+    (None, None, 10, False, None, None),
+    (None, None, 15, False, None, None),
+    (None, None, 20, False, None, None),
+    (None, None, 25, False, None, None),
+    (None, None, 30, False, None, None),
+]
+generate_technique_detail_image("Bleu", 5, (90, 160, 240), secondaires_exemple, "temp/preview_technique_detail.png")
+print("Technique (détail) générée dans temp/")
+
+# ---------- Territoire ----------
+generate_territoire_image(
+    "Satoru Gojo", "Domaine du Vide Infini", "Non maîtrisé",
+    maitrise_level=3, maitrise_pct=42, cout_eo_pct=35, duree_tours=4,
+    description="Un espace clos où le temps et la perception ralentissent, projetant l'utilisateur et sa cible dans un vide immatériel saturé d'informations sensorielles infinies.",
+    effets="Toute cible prise dans le domaine subit un assaut informationnel continu, paralysant sa capacité de réaction tant qu'elle n'est pas protégée par une barrière adverse.",
+    out_path="temp/preview_territoire.png",
+)
+print("Territoire générée dans temp/")

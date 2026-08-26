@@ -349,8 +349,9 @@ CREATE TABLE IF NOT EXISTS character_territoire (
     character_id INTEGER PRIMARY KEY,
     name TEXT,
     type TEXT,
+    cout_eo_pct INTEGER,   -- coût en % de la réserve d'EO (valeur fixe, modifiable staff)
+    duree_tours INTEGER,   -- durée d'effet en tours (valeur fixe, modifiable staff)
     description TEXT,
-    cout TEXT,
     effets TEXT
 );
 
@@ -1508,7 +1509,7 @@ def get_territoire(character_id: int):
     de création/staff n'est pas encore construit ; cette lecture ne sert qu'au pillow d'affichage."""
     with get_connection() as conn:
         return conn.execute(
-            "SELECT character_id, name, type, description, cout, effets "
+            "SELECT character_id, name, type, cout_eo_pct, duree_tours, description, effets "
             "FROM character_territoire WHERE character_id = ?",
             (character_id,),
         ).fetchone()

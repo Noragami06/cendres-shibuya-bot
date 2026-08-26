@@ -940,8 +940,9 @@ class Profil(commands.Cog):
             terr["name"] or "—",
             terr["type"] or "—",
             1, 0,  # maitrise_level / maitrise_pct en dur (lien stat Territoire non encore fait)
+            terr["cout_eo_pct"] if terr["cout_eo_pct"] is not None else 0,
+            terr["duree_tours"] if terr["duree_tours"] is not None else 0,
             terr["description"] or "—",
-            terr["cout"] or "—",
             terr["effets"] or "—",
             path, portrait_path=portrait_path, background_path=background_path,
         )
