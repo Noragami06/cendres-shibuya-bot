@@ -949,7 +949,7 @@ class Profil(commands.Cog):
         terr = db.get_territoire(character_id)
         char = get_character(character_id)
         portrait_path = char["portrait_path"] if char else None
-        char_name = (char["name"] if char else None) or "—"
+        char_name = (char["character_name"] if char else None) or "—"
         bg = db.get_background(character_id)
         background_path = bg["image_path"] if bg else None
         path = _tmp_profile("territoire")
