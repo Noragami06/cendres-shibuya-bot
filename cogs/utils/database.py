@@ -348,11 +348,14 @@ CREATE TABLE IF NOT EXISTS character_secondary_sorts (
 CREATE TABLE IF NOT EXISTS character_territoire (
     character_id INTEGER PRIMARY KEY,
     name TEXT,
+    appellation TEXT,      -- texte EXACT choisi : "Extension du Territoire" / "Ryōiki Tenkai" / "Domain Expansion"
     type TEXT,
     cout_eo_pct INTEGER,   -- coût en % de la réserve d'EO (valeur fixe, modifiable staff)
     duree_tours INTEGER,   -- durée d'effet en tours (valeur fixe, modifiable staff)
     description TEXT,
-    effets TEXT
+    effets TEXT,
+    image_path TEXT,       -- image/GIF du territoire (envoyé lors de l'activation en chat)
+    is_unlocked INTEGER DEFAULT 0  -- 0 = verrouillé staff, 1 = débloqué (accessible au joueur)
 );
 
 -- Barème : points de stats accordés par rôle (camp / clan / grade).
@@ -795,6 +798,20 @@ def _seed_role_point_values(conn):
     )
 
 
+def _ensure_character_territoire_columns(conn):
+    """Ajoute les colonnes du système Territoire complet (appellation, image, verrouillage) à une table
+    character_territoire préexistante (créée à l'origine sans ces colonnes)."""
+    cols = _column_names(conn, "character_territoire")
+    if not cols:
+        return
+    if "appellation" not in cols:
+        conn.execute("ALTER TABLE character_territoire ADD COLUMN appellation TEXT")
+    if "image_path" not in cols:
+        conn.execute("ALTER TABLE character_territoire ADD COLUMN image_path TEXT")
+    if "is_unlocked" not in cols:
+        conn.execute("ALTER TABLE character_territoire ADD COLUMN is_unlocked INTEGER DEFAULT 0")
+
+
 def _ensure_salary_columns(conn):
     """Ajoute is_external / expiry_date à une table order_salaries préexistante (salaires temporaires
     pour un IBAN externe à l'ordre)."""
@@ -837,6 +854,7 @@ def init_db():
         _ensure_character_profiles_columns(conn)
         _ensure_character_sorts_columns(conn)
         _ensure_character_secondary_sorts_columns(conn)
+        _ensure_character_territoire_columns(conn)
         _seed_role_point_values(conn)
         _ensure_salary_columns(conn)
         _ensure_tickets_columns(conn)
@@ -1505,14 +1523,69 @@ def count_character_sorts(character_id: int) -> int:
 
 
 def get_territoire(character_id: int):
-    """Territoire (/profil → 🗺️ Territoire) d'un personnage, ou None si aucun n'a été défini. Le flux
-    de création/staff n'est pas encore construit ; cette lecture ne sert qu'au pillow d'affichage."""
+    """Territoire (/profil → 🗺️ Territoire) d'un personnage, ou None si aucune ligne n'existe encore."""
     with get_connection() as conn:
         return conn.execute(
-            "SELECT character_id, name, type, cout_eo_pct, duree_tours, description, effets "
+            "SELECT character_id, name, appellation, type, cout_eo_pct, duree_tours, description, "
+            "effets, image_path, is_unlocked "
             "FROM character_territoire WHERE character_id = ?",
             (character_id,),
         ).fetchone()
+
+
+def unlock_territoire(character_id: int):
+    """Débloque le Territoire (staff). Met is_unlocked=1 ; crée une ligne « coquille vide » (name NULL)
+    si aucune n'existe encore — le joueur passera alors par le questionnaire de création au prochain clic."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE character_territoire SET is_unlocked = 1 WHERE character_id = ?", (character_id,)
+        )
+        if cur.rowcount == 0:
+            conn.execute(
+                "INSERT INTO character_territoire (character_id, is_unlocked) VALUES (?, 1)",
+                (character_id,),
+            )
+
+
+def lock_territoire(character_id: int):
+    """Reverrouille le Territoire (staff). Met is_unlocked=0 sans rien supprimer d'autre : toutes les
+    données déjà créées restent intactes, juste inaccessibles au joueur."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE character_territoire SET is_unlocked = 0 WHERE character_id = ?", (character_id,)
+        )
+
+
+def save_territoire(character_id, name, appellation, type_, description, effets, image_path):
+    """Enregistre les valeurs saisies au questionnaire de création. La ligne existe déjà (coquille créée
+    au déblocage) ; on met à jour ses champs. cout_eo_pct / duree_tours restent tels quels (définis par
+    le staff séparément). UPSERT par sécurité si la ligne avait disparu."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE character_territoire SET name = ?, appellation = ?, type = ?, description = ?, "
+            "effets = ?, image_path = ?, is_unlocked = 1 WHERE character_id = ?",
+            (name, appellation, type_, description, effets, image_path, character_id),
+        )
+        if cur.rowcount == 0:
+            conn.execute(
+                "INSERT INTO character_territoire (character_id, name, appellation, type, description, "
+                "effets, image_path, is_unlocked) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                (character_id, name, appellation, type_, description, effets, image_path),
+            )
+
+
+def find_territoires_by_appellation(user_id: int, guild_id: int, appellation: str):
+    """Tous les territoires CRÉÉS et DÉBLOQUÉS d'un joueur portant cette appellation exacte, avec le
+    numéro de slot du personnage (pour lever l'ambiguïté en cas de plusieurs correspondances)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT ct.character_id, vc.slot_number, ct.name, ct.appellation, ct.image_path "
+            "FROM character_territoire ct "
+            "JOIN validated_characters vc ON vc.id = ct.character_id "
+            "WHERE vc.user_id = ? AND vc.guild_id = ? AND ct.appellation = ? "
+            "AND ct.is_unlocked = 1 AND ct.name IS NOT NULL",
+            (user_id, guild_id, appellation),
+        ).fetchall()
 
 
 def get_character_sort(sort_id: int):

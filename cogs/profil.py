@@ -1,10 +1,12 @@
 import asyncio
+import io
 import math
 import os
 import random
 import uuid
 from datetime import datetime
 
+from PIL import Image
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -30,6 +32,16 @@ from cogs.depart import (
 # ---------- Constantes ----------
 WAIT_TIMEOUT = 300  # secondes d'attente d'une réponse texte
 BACKGROUND_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "backgrounds")
+TERRITOIRE_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "territoires")
+TERRITOIRE_MAX_BYTES = 8 * 1024 * 1024  # 8 Mo : même limite que /réserv-appa (GIF jamais recompressé)
+# Appellations possibles du Territoire (numéro affiché -> TEXTE EXACT stocké en base).
+TERRITOIRE_APPELLATIONS = {
+    "1": "Extension du Territoire",  # VF
+    "2": "Ryōiki Tenkai",           # VO
+    "3": "Domain Expansion",         # VA
+}
+# Phrases d'activation reconnues en chat (les 3 appellations, fixes). Cache construit au démarrage du cog.
+TERRITOIRE_PHRASES = set(TERRITOIRE_APPELLATIONS.values())
 PROFILE_IMG_DIR = os.path.join(os.path.dirname(__file__), "..", "temp", "profil_images")
 
 # Boutons sous le profil. "stats"/"relation"/"technique" ont un vrai écran ; "📜 Sorts" a été retiré
@@ -346,6 +358,9 @@ PARAM_ALIASES = {
     "degats_secondaire": ["degats", "dégâts", "degats secondaire"],
     "debloquer_sort_secondaire": ["debloquer sort secondaire", "débloquer sort secondaire"],
     "bloquer_sort_secondaire": ["bloquer sort secondaire", "verrouiller sort secondaire"],
+    # --- Territoire (déblocage / verrouillage staff) ---
+    "territoire_debloquer": ["débloquer", "debloquer"],
+    "territoire_bloquer": ["bloquer"],
 }
 
 # Paramètres du menu staff qui passent par le flux dédié « Techniques ».
@@ -355,6 +370,9 @@ TECHNIQUE_EDIT_PARAMS = {
     "nom_sort_secondaire", "niveau_requis_secondaire", "cout_eo_secondaire", "degats_secondaire",
     "debloquer_sort_secondaire", "bloquer_sort_secondaire",
 }
+
+# Paramètres du menu staff qui passent par le flux dédié « Territoire » (déblocage / verrouillage).
+TERRITOIRE_EDIT_PARAMS = {"territoire_debloquer", "territoire_bloquer"}
 
 # "stats_X" -> clé de stat (écriture ABSOLUE dans character_stats).
 STATS_PARAM_MAP = {
@@ -962,14 +980,197 @@ class Profil(commands.Cog):
         if interaction.user.id != user_id:
             await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
             return
-        # TODO : flux de création/staff pour le Territoire pas encore construit (point non abordé).
-        if db.get_territoire(character_id) is None:
+        terr = db.get_territoire(character_id)
+        # 1-2. Aucune ligne OU verrouillé staff -> refus (pas encore débloqué).
+        if terr is None or not terr["is_unlocked"]:
             await interaction.response.send_message(
-                "🔧 Cette section n'est pas encore développée.", ephemeral=True
+                "🔒 Tu n'as pas le niveau requis ou ni les éléments qui te permettent de débloquer ton "
+                "territoire.", ephemeral=True
             )
             return
+        # 3. Débloqué mais pas encore créé (name NULL) -> questionnaire de création guidée.
+        if terr["name"] is None:
+            if not self._acquire(user_id):
+                await interaction.response.send_message(
+                    "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True
+                )
+                return
+            try:
+                await interaction.response.defer()
+                await self._run_territoire_creation(interaction.channel, interaction.user, character_id)
+            finally:
+                self._release(user_id)
+            return
+        # 4. Déjà créé -> pillow normal avec les vraies données.
         await interaction.response.defer()
         await self.send_territoire(interaction.channel, character_id)
+
+    # =================================================================
+    # CRÉATION GUIDÉE DU TERRITOIRE (isolation par joueur, « cancel » à chaque étape)
+    # =================================================================
+    async def _run_territoire_creation(self, channel, player, character_id):
+        """Questionnaire de création du Territoire (déclenché quand débloqué mais pas encore créé).
+        Écrit tout en base à la fin, puis affiche le pillow. Isolation déjà posée par l'appelant."""
+        await channel.send(
+            f"{player.mention} — la création de ton **Territoire** commence ! Réponds ici, une question à "
+            "la fois. Tape « cancel » à tout moment pour tout annuler."
+        )
+
+        async def _stop(result) -> bool:
+            if result is _CANCELLED:
+                await channel.send("❌ Création du territoire annulée.")
+                return True
+            if result is None:
+                await channel.send("⏳ Création annulée (aucune réponse).")
+                return True
+            return False
+
+        # 1. Nom (aucune limite de caractères).
+        nom = await self._ask_bounded_text(channel, player, "Quel est le nom de ton territoire ?", 10 ** 9)
+        if await _stop(nom):
+            return
+
+        # 2. Appellation (choix strict 1/2/3 -> texte exact stocké).
+        appellation = await self._ask_territoire_appellation(channel, player)
+        if await _stop(appellation):
+            return
+
+        # 3. Description visuelle.
+        description = await self._ask_bounded_text(
+            channel, player, "Décris visuellement ton territoire.", 10 ** 9
+        )
+        if await _stop(description):
+            return
+
+        # 4. Type de départ : information, pas une question. Stocké directement.
+        await channel.send("📋 Ton territoire commence au type **Incomplet**.")
+        type_ = "Incomplet"
+
+        # 5. Effet.
+        effets = await self._ask_bounded_text(
+            channel, player, "Quel est l'effet de ton territoire (ce qu'il permet de faire) ?", 10 ** 9
+        )
+        if await _stop(effets):
+            return
+
+        # 6. Image ou GIF du territoire (même logique de téléchargement que /réserv-appa).
+        image_path = await self._await_and_save_territoire_media(channel, player, character_id)
+        if await _stop(image_path):
+            return
+
+        # 7. Enregistrement (la ligne « coquille » existe déjà depuis le déblocage staff).
+        db.save_territoire(character_id, nom, appellation, type_, description, effets, image_path)
+
+        # 8. Confirmation + pillow.
+        await channel.send("✅ Ton territoire a été créé !")
+        await self.send_territoire(channel, character_id)
+
+    async def _ask_territoire_appellation(self, channel, player):
+        """Choix strict de l'appellation (1/2/3). Renvoie le TEXTE EXACT ; None si timeout ; _CANCELLED
+        si « cancel »."""
+        await channel.send(embed=discord.Embed(
+            title="Choisis l'appellation de ton territoire",
+            description="**1.** Extension du Territoire (VF)\n"
+                        "**2.** Ryōiki Tenkai (VO)\n"
+                        "**3.** Domain Expansion (VA)\n\nRéponds avec 1, 2 ou 3.",
+            color=PHOENIX_COLOR,
+        ))
+        while True:
+            m = await self.wait_message(channel, player)
+            if m is None:
+                return None
+            if _is_cancel(m.content):
+                return _CANCELLED
+            choix = m.content.strip()
+            if choix in TERRITOIRE_APPELLATIONS:
+                return TERRITOIRE_APPELLATIONS[choix]
+            await channel.send("Réponds avec **1**, **2** ou **3**.")
+
+    async def _await_and_save_territoire_media(self, channel, player, character_id):
+        """Attend une image ou un GIF (pièce jointe), reprend EXACTEMENT la logique de /réserv-appa :
+        GIF (≤ 8 Mo, jamais recompressé) / image statique (compressée comme les portraits), puis vérifie
+        que le fichier s'ouvre bien via PIL. Redemande si invalide. None si timeout ; _CANCELLED si « cancel »."""
+        await channel.send("Envoie l'image ou le GIF de ton territoire.")
+        os.makedirs(TERRITOIRE_DIR, exist_ok=True)
+        while True:
+            m = await self.wait_message(channel, player)
+            if m is None:
+                return None
+            if _is_cancel(m.content):
+                return _CANCELLED
+            if not m.attachments:
+                await channel.send("Envoie une **pièce jointe** (image ou GIF).")
+                continue
+            att = m.attachments[0]
+            ctype = (att.content_type or "").split(";")[0].strip().lower()
+            if not ctype.startswith("image/"):
+                await channel.send("❌ Ce fichier n'a pas pu être traité, envoie une image ou un GIF valide.")
+                continue
+
+            if ctype == "image/gif":
+                # GIF : contrôle STRICT de la taille, jamais recompressé (préserve l'animation).
+                if att.size and att.size > TERRITOIRE_MAX_BYTES:
+                    taille_mo = round(att.size / (1024 * 1024), 2)
+                    await channel.send(f"❌ Ce GIF dépasse la limite de 8 Mo ({taille_mo} Mo). Réduis sa taille.")
+                    continue
+                try:
+                    data = await att.read()
+                except discord.HTTPException:
+                    await channel.send("❌ Le téléchargement a échoué, réessaie.")
+                    continue
+                if len(data) > TERRITOIRE_MAX_BYTES:
+                    taille_mo = round(len(data) / (1024 * 1024), 2)
+                    await channel.send(f"❌ Ce GIF dépasse la limite de 8 Mo ({taille_mo} Mo). Réduis sa taille.")
+                    continue
+                ext = "gif"
+            else:
+                # Image statique : compressée comme les portraits de fiche (redimension + JPEG 85).
+                try:
+                    raw = await att.read()
+                    data = compress_portrait(raw, max_dimension=1600, quality=85)
+                except discord.HTTPException:
+                    await channel.send("❌ Le téléchargement a échoué, réessaie.")
+                    continue
+                except Exception:
+                    await channel.send("❌ Ce fichier n'a pas pu être traité, envoie une image ou un GIF valide.")
+                    continue
+                ext = "jpg"
+
+            # Vérification PIL explicite : le fichier téléchargé doit s'ouvrir correctement.
+            try:
+                with Image.open(io.BytesIO(data)) as im:
+                    im.verify()
+            except Exception:
+                await channel.send("❌ Ce fichier n'a pas pu être traité, envoie une image ou un GIF valide.")
+                continue
+
+            filename = f"{character_id}_{uuid.uuid4().hex}.{ext}"
+            dest = os.path.join(TERRITOIRE_DIR, filename)
+            try:
+                with open(dest, "wb") as f:
+                    f.write(data)
+            except OSError:
+                await channel.send("❌ Impossible d'enregistrer le fichier côté serveur, réessaie.")
+                continue
+            return dest
+
+    async def _edit_territoire_param(self, channel, staff, character_id, param):
+        """Déblocage / verrouillage staff du Territoire. Retourne True (traité) ou None (annulé/timeout)."""
+        if param == "territoire_debloquer":
+            db.unlock_territoire(character_id)
+            await channel.send(
+                "✅ Territoire **débloqué**. Le joueur pourra le créer (ou le consulter) via le bouton "
+                "🗺️ Territoire de son profil."
+            )
+            return True
+        if param == "territoire_bloquer":
+            db.lock_territoire(character_id)
+            await channel.send(
+                "✅ Territoire **verrouillé**. Les données déjà créées restent intactes mais deviennent "
+                "inaccessibles au joueur."
+            )
+            return True
+        return None
 
     # =================================================================
     # CRÉATION GUIDÉE DES TECHNIQUES (validation staff préalable puis flux guidé côté joueur)
@@ -1424,6 +1625,45 @@ class Profil(commands.Cog):
     # =================================================================
     # LISTENER
     # =================================================================
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Déclencheur d'activation du Territoire en chat : si un joueur écrit EXACTEMENT l'appellation de
+        son territoire (éventuellement suivie d'un numéro de slot pour lever l'ambiguïté), on joue la
+        séquence de révélation (appellation -> nom du territoire -> image)."""
+        if message.author.bot or message.guild is None:
+            return
+        content = message.content.strip()
+        # Sortie ULTRA-rapide : le message doit correspondre à une phrase connue (avec ou sans numéro final)
+        # pour éviter d'alourdir le traitement de CHAQUE message.
+        base_phrase, slot_suffix = content, None
+        parts = content.rsplit(" ", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            base_phrase, slot_suffix = parts[0], int(parts[1])
+        if base_phrase not in TERRITOIRE_PHRASES:
+            return
+
+        matches = db.find_territoires_by_appellation(message.author.id, message.guild.id, base_phrase)
+        if not matches:
+            return
+        if len(matches) == 1:
+            target = matches[0]
+        else:
+            # Plusieurs territoires portent la même appellation : le numéro de slot est requis.
+            if slot_suffix is None:
+                return  # ambigu sans numéro, ignore silencieusement
+            target = next((m for m in matches if m["slot_number"] == slot_suffix), None)
+            if target is None:
+                return
+
+        # Séquence de révélation.
+        await message.channel.send(embed=discord.Embed(title=base_phrase, color=PHOENIX_COLOR))
+        await asyncio.sleep(2)
+        await message.channel.send(embed=discord.Embed(title=target["name"], color=PHOENIX_COLOR))
+        await asyncio.sleep(1)
+        image_path = target["image_path"]
+        if image_path and os.path.exists(image_path):
+            await message.channel.send(file=discord.File(image_path))
+
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
         if interaction.type != discord.InteractionType.component:
@@ -2136,6 +2376,7 @@ class Profil(commands.Cog):
          "Nom sort principal, Ajouter XP, Retirer XP, Modifier level, Ajouter sort maximum, "
          "Retirer sort maximum, Débloquer sort principal, Bloquer sort principal, Nom sort secondaire, "
          "Niveau requis, Coût EO, Dégâts, Débloquer sort secondaire, Bloquer sort secondaire"),
+        ("TERRITOIRE", "Débloquer, Bloquer"),
     ]
     _PARAM_FOOTER = "\n\nÉcris le nom du paramètre à modifier."
 
@@ -2214,6 +2455,10 @@ class Profil(commands.Cog):
         # Flux dédié Techniques (sorts principaux / secondaires).
         if param in TECHNIQUE_EDIT_PARAMS:
             return await self._edit_technique_param(channel, staff, character_id, param)
+
+        # Flux dédié Territoire (déblocage / verrouillage).
+        if param in TERRITOIRE_EDIT_PARAMS:
+            return await self._edit_territoire_param(channel, staff, character_id, param)
 
         if param == "image":
             await channel.send("Envoie la nouvelle image du personnage (JPG/PNG, pièce jointe ou lien, pas de GIF).")
