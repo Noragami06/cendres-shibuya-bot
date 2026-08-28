@@ -42,6 +42,10 @@ TERRITOIRE_APPELLATIONS = {
 }
 # Phrases d'activation reconnues en chat (les 3 appellations, fixes). Cache construit au démarrage du cog.
 TERRITOIRE_PHRASES = set(TERRITOIRE_APPELLATIONS.values())
+# Valeurs de base fixes attribuées à TOUT territoire à sa création (ensuite modifiables par le staff).
+TERRITOIRE_DEFAULT_COUT_EO_PCT = 60  # 60 % de la réserve
+TERRITOIRE_DUREE_MIN = 3             # minimum absolu (aussi la valeur de base)
+TERRITOIRE_DEFAULT_DUREE_TOURS = TERRITOIRE_DUREE_MIN  # 3 tours
 PROFILE_IMG_DIR = os.path.join(os.path.dirname(__file__), "..", "temp", "profil_images")
 
 # Boutons sous le profil. "stats"/"relation"/"technique" ont un vrai écran ; "📜 Sorts" a été retiré
@@ -358,9 +362,11 @@ PARAM_ALIASES = {
     "degats_secondaire": ["degats", "dégâts", "degats secondaire"],
     "debloquer_sort_secondaire": ["debloquer sort secondaire", "débloquer sort secondaire"],
     "bloquer_sort_secondaire": ["bloquer sort secondaire", "verrouiller sort secondaire"],
-    # --- Territoire (déblocage / verrouillage staff) ---
+    # --- Territoire (déblocage / verrouillage + valeurs de combat, staff) ---
     "territoire_debloquer": ["débloquer", "debloquer"],
     "territoire_bloquer": ["bloquer"],
+    "territoire_cout_eo": ["coût eo territoire", "cout eo territoire"],
+    "territoire_duree": ["durée en tours", "duree en tours"],
 }
 
 # Paramètres du menu staff qui passent par le flux dédié « Techniques ».
@@ -371,8 +377,10 @@ TECHNIQUE_EDIT_PARAMS = {
     "debloquer_sort_secondaire", "bloquer_sort_secondaire",
 }
 
-# Paramètres du menu staff qui passent par le flux dédié « Territoire » (déblocage / verrouillage).
-TERRITOIRE_EDIT_PARAMS = {"territoire_debloquer", "territoire_bloquer"}
+# Paramètres du menu staff qui passent par le flux dédié « Territoire ».
+TERRITOIRE_EDIT_PARAMS = {
+    "territoire_debloquer", "territoire_bloquer", "territoire_cout_eo", "territoire_duree",
+}
 
 # "stats_X" -> clé de stat (écriture ABSOLUE dans character_stats).
 STATS_PARAM_MAP = {
@@ -1058,8 +1066,13 @@ class Profil(commands.Cog):
         if await _stop(image_path):
             return
 
-        # 7. Enregistrement (la ligne « coquille » existe déjà depuis le déblocage staff).
-        db.save_territoire(character_id, nom, appellation, type_, description, effets, image_path)
+        # 7. Enregistrement (la ligne « coquille » existe déjà depuis le déblocage staff). cout_eo_pct et
+        # duree_tours reçoivent leur valeur de base fixe (60 % / 3 tours), ensuite modifiables par le staff.
+        db.save_territoire(
+            character_id, nom, appellation, type_, description, effets, image_path,
+            cout_eo_pct=TERRITOIRE_DEFAULT_COUT_EO_PCT,
+            duree_tours=TERRITOIRE_DEFAULT_DUREE_TOURS,
+        )
 
         # 8. Confirmation + pillow.
         await channel.send("✅ Ton territoire a été créé !")
@@ -1169,6 +1182,40 @@ class Profil(commands.Cog):
                 "✅ Territoire **verrouillé**. Les données déjà créées restent intactes mais deviennent "
                 "inaccessibles au joueur."
             )
+            return True
+        if param == "territoire_cout_eo":
+            if db.get_territoire(character_id) is None:
+                await channel.send("Ce personnage n'a pas encore de territoire (rien à modifier).")
+                return True
+            valeur = await self._tech_ask_int(
+                channel, staff, "Nouveau **coût EO** du territoire, en % de la réserve ?", minimum=0
+            )
+            if valeur is None:
+                return None
+            with db.get_connection() as conn:
+                conn.execute(
+                    "UPDATE character_territoire SET cout_eo_pct = ? WHERE character_id = ?",
+                    (valeur, character_id),
+                )
+            await channel.send(f"✅ Coût EO du territoire mis à **{valeur} %**.")
+            return True
+        if param == "territoire_duree":
+            if db.get_territoire(character_id) is None:
+                await channel.send("Ce personnage n'a pas encore de territoire (rien à modifier).")
+                return True
+            valeur = await self._tech_ask_int(
+                channel, staff,
+                f"Nouvelle **durée en tours** du territoire ? (minimum {TERRITOIRE_DUREE_MIN})",
+                minimum=TERRITOIRE_DUREE_MIN,
+            )
+            if valeur is None:
+                return None
+            with db.get_connection() as conn:
+                conn.execute(
+                    "UPDATE character_territoire SET duree_tours = ? WHERE character_id = ?",
+                    (valeur, character_id),
+                )
+            await channel.send(f"✅ Durée du territoire mise à **{valeur} tours**.")
             return True
         return None
 
@@ -2376,7 +2423,7 @@ class Profil(commands.Cog):
          "Nom sort principal, Ajouter XP, Retirer XP, Modifier level, Ajouter sort maximum, "
          "Retirer sort maximum, Débloquer sort principal, Bloquer sort principal, Nom sort secondaire, "
          "Niveau requis, Coût EO, Dégâts, Débloquer sort secondaire, Bloquer sort secondaire"),
-        ("TERRITOIRE", "Débloquer, Bloquer"),
+        ("TERRITOIRE", "Débloquer, Bloquer, Coût EO territoire, Durée en tours"),
     ]
     _PARAM_FOOTER = "\n\nÉcris le nom du paramètre à modifier."
 

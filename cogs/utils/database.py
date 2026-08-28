@@ -1556,21 +1556,27 @@ def lock_territoire(character_id: int):
         )
 
 
-def save_territoire(character_id, name, appellation, type_, description, effets, image_path):
+def save_territoire(character_id, name, appellation, type_, description, effets, image_path,
+                    cout_eo_pct, duree_tours):
     """Enregistre les valeurs saisies au questionnaire de création. La ligne existe déjà (coquille créée
-    au déblocage) ; on met à jour ses champs. cout_eo_pct / duree_tours restent tels quels (définis par
-    le staff séparément). UPSERT par sécurité si la ligne avait disparu."""
+    au déblocage) ; on met à jour ses champs. cout_eo_pct / duree_tours reçoivent une valeur de base fixe
+    à la création (60 % / 3 tours), ensuite modifiable par le staff. UPSERT par sécurité si la ligne
+    avait disparu."""
     with get_connection() as conn:
         cur = conn.execute(
             "UPDATE character_territoire SET name = ?, appellation = ?, type = ?, description = ?, "
-            "effets = ?, image_path = ?, is_unlocked = 1 WHERE character_id = ?",
-            (name, appellation, type_, description, effets, image_path, character_id),
+            "effets = ?, image_path = ?, cout_eo_pct = ?, duree_tours = ?, is_unlocked = 1 "
+            "WHERE character_id = ?",
+            (name, appellation, type_, description, effets, image_path, cout_eo_pct, duree_tours,
+             character_id),
         )
         if cur.rowcount == 0:
             conn.execute(
                 "INSERT INTO character_territoire (character_id, name, appellation, type, description, "
-                "effets, image_path, is_unlocked) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
-                (character_id, name, appellation, type_, description, effets, image_path),
+                "effets, image_path, cout_eo_pct, duree_tours, is_unlocked) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                (character_id, name, appellation, type_, description, effets, image_path,
+                 cout_eo_pct, duree_tours),
             )
 
 
