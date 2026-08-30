@@ -42,10 +42,17 @@ TERRITOIRE_APPELLATIONS = {
 }
 # Phrases d'activation reconnues en chat (les 3 appellations, fixes). Cache construit au démarrage du cog.
 TERRITOIRE_PHRASES = set(TERRITOIRE_APPELLATIONS.values())
-# Valeurs de base fixes attribuées à TOUT territoire à sa création (ensuite modifiables par le staff).
-TERRITOIRE_DEFAULT_COUT_EO_PCT = 60  # 60 % de la réserve
+# Valeurs de BASE fixes (niveau 1) attribuées à TOUT territoire à sa création (ensuite modifiables par le
+# staff). La progression par paliers de niveau s'applique par-dessus À L'AFFICHAGE, jamais stockée.
+TERRITOIRE_DEFAULT_COUT_EO_PCT = 45  # 45 % de la réserve (base)
 TERRITOIRE_DUREE_MIN = 3             # minimum absolu (aussi la valeur de base)
 TERRITOIRE_DEFAULT_DUREE_TOURS = TERRITOIRE_DUREE_MIN  # 3 tours
+# Maîtrise Territoire : dérivée des points de stat « territoire » (comme EO/Sort/RCT), plafond 105.
+MASTERY_TERRITOIRE_MAX_LEVEL = 105
+# Progression par paliers : tous les 15 niveaux de Maîtrise Territoire, +1 tour et (selon la réserve d'EO)
+# une réduction du coût. Le coût ne descend jamais sous TERRITOIRE_MIN_COUT_PCT.
+TERRITOIRE_LEVEL_STEP = 15
+TERRITOIRE_MIN_COUT_PCT = 5
 PROFILE_IMG_DIR = os.path.join(os.path.dirname(__file__), "..", "temp", "profil_images")
 
 # Boutons sous le profil. "stats"/"relation"/"technique" ont un vrai écran ; "📜 Sorts" a été retiré
@@ -300,6 +307,34 @@ async def get_mastery_rct(guild, character_id) -> tuple:
     if level >= max_level and RCT_STAGES[stage]["next"] is not None:
         db.update_profile(character_id, rct_quest_available=1)
     return level, xp_actuel, xp_max
+
+
+async def get_mastery_territoire(character_id) -> tuple:
+    """Maîtrise Territoire dérivée des points de stat « territoire », exactement comme EO/Sort/RCT.
+    Retourne (level, xp_actuel, xp_max), plafonnée à MASTERY_TERRITOIRE_MAX_LEVEL."""
+    total = await get_stat_total(character_id, "territoire")
+    return points_to_level_xp_capped(total, MASTERY_TERRITOIRE_MAX_LEVEL)
+
+
+def compute_territoire_tours(base_tours: int, level: int) -> int:
+    """Durée finale = durée de base + 1 tour par palier de 15 niveaux de Maîtrise Territoire."""
+    paliers = level // TERRITOIRE_LEVEL_STEP
+    return base_tours + paliers
+
+
+def compute_territoire_cout(base_cout_pct: int, level: int, eo_reserve: int) -> int:
+    """Coût EO final = coût de base réduit par palier de 15 niveaux, selon la taille de la réserve d'EO :
+    réserve > 1000 -> -10 %/palier ; réserve ≥ 100 -> -5 %/palier ; réserve < 100 -> aucune baisse
+    (seuls les tours augmentent). Ne descend jamais sous TERRITOIRE_MIN_COUT_PCT."""
+    paliers = level // TERRITOIRE_LEVEL_STEP
+    if eo_reserve > 1000:
+        reduction_par_palier = 10
+    elif eo_reserve >= 100:
+        reduction_par_palier = 5
+    else:
+        reduction_par_palier = 0  # réserve < 100 : aucune baisse de coût, seuls les tours augmentent
+    cout = base_cout_pct - (reduction_par_palier * paliers)
+    return max(TERRITOIRE_MIN_COUT_PCT, cout)
 
 
 # =====================================================================
@@ -951,26 +986,39 @@ class Profil(commands.Cog):
         await self._request_technique_creation(interaction, character_id, user_id)
 
     async def _render_territoire(self, character_id):
-        """Construit le pillow Territoire. Retourne le chemin de l'image.
-        NB : maitrise_level / maitrise_pct sont mis à 1 / 0 en dur pour l'instant — le lien avec la stat
-        Territoire n'est pas encore fait (point non abordé, système différé)."""
+        """Construit le pillow Territoire. La Maîtrise Territoire est DÉRIVÉE des points de stat (comme
+        EO/Sort/RCT) ; la progression par paliers de 15 niveaux s'applique au coût EO et à la durée À
+        L'AFFICHAGE (jamais stockée). Retourne le chemin de l'image."""
         terr = db.get_territoire(character_id)
         char = get_character(character_id)
         portrait_path = char["portrait_path"] if char else None
         char_name = (char["character_name"] if char else None) or "—"
         bg = db.get_background(character_id)
         background_path = bg["image_path"] if bg else None
+
+        # Maîtrise dérivée + règle « MAX » au plafond.
+        level, xp_actuel, xp_max = await get_mastery_territoire(character_id)
+        is_max = level >= MASTERY_TERRITOIRE_MAX_LEVEL
+        pct = 100 if is_max else round(xp_actuel / xp_max * 100)
+
+        # Valeurs finales = base (stockée) + progression par paliers de niveau.
+        eo_reserve = (char["eo_value"] if char else 0) or 0
+        base_cout = terr["cout_eo_pct"] or TERRITOIRE_DEFAULT_COUT_EO_PCT
+        base_tours = terr["duree_tours"] or TERRITOIRE_DEFAULT_DUREE_TOURS
+        cout_final = compute_territoire_cout(base_cout, level, eo_reserve)
+        tours_final = compute_territoire_tours(base_tours, level)
+
         path = _tmp_profile("territoire")
         generate_territoire_image(
             char_name,
             terr["name"] or "—",
             terr["type"] or "—",
-            1, 0,  # maitrise_level / maitrise_pct en dur (lien stat Territoire non encore fait)
-            terr["cout_eo_pct"] if terr["cout_eo_pct"] is not None else 0,
-            terr["duree_tours"] if terr["duree_tours"] is not None else 0,
+            level, pct,
+            cout_final, tours_final,
             terr["description"] or "—",
             terr["effets"] or "—",
             path, portrait_path=portrait_path, background_path=background_path,
+            is_max=is_max,
         )
         return path
 
@@ -1183,6 +1231,8 @@ class Profil(commands.Cog):
                 "inaccessibles au joueur."
             )
             return True
+        # Ces valeurs sont la BASE (niveau 1), la progression par paliers de 15 niveaux de Maîtrise
+        # Territoire s'applique automatiquement par dessus au moment de l'affichage, jamais stockée directement.
         if param == "territoire_cout_eo":
             if db.get_territoire(character_id) is None:
                 await channel.send("Ce personnage n'a pas encore de territoire (rien à modifier).")
@@ -3390,6 +3440,23 @@ async def backfill_sort_unlock_status():
         conn.execute("UPDATE character_sorts SET is_unlocked = 0 WHERE slot_index >= 1")
     print("🔍 [backfill sorts] Statuts de déblocage corrigés : seul le 1er sort principal de chaque "
           "personnage reste débloqué.")
+
+
+async def backfill_territoire_defaults():
+    """Territoires CRÉÉS mais figés à 0/NULL sur cout_eo_pct ou duree_tours (créés avant les valeurs de
+    base) : remet le coût à 45 % et la durée à 3 tours (base). N'affecte que les lignes concernées."""
+    with db.get_connection() as conn:
+        territoires = conn.execute(
+            "SELECT character_id FROM character_territoire WHERE name IS NOT NULL AND "
+            "(cout_eo_pct IS NULL OR cout_eo_pct = 0 OR duree_tours IS NULL OR duree_tours = 0)"
+        ).fetchall()
+        for t in territoires:
+            conn.execute(
+                "UPDATE character_territoire SET cout_eo_pct = ?, duree_tours = ? WHERE character_id = ?",
+                (TERRITOIRE_DEFAULT_COUT_EO_PCT, TERRITOIRE_DEFAULT_DUREE_TOURS, t["character_id"]),
+            )
+            print(f"🔍 [backfill territoire] Personnage {t['character_id']} : coût remis à "
+                  f"{TERRITOIRE_DEFAULT_COUT_EO_PCT}%, durée à {TERRITOIRE_DEFAULT_DUREE_TOURS} tours (base).")
 
 
 async def setup(bot):

@@ -2244,11 +2244,13 @@ def generate_territoire_image(character_name: str, terr_name: str, terr_type: st
                                maitrise_level: int, maitrise_pct: int,
                                cout_eo_pct: int, duree_tours: int,
                                description: str, effets: str,
-                               out_path: str, portrait_path=None, background_path=None):
+                               out_path: str, portrait_path=None, background_path=None,
+                               is_max: bool = False):
     """
     terr_type : chaîne libre, ex "Sans barrière", "Non maîtrisé", "Barrière active"...
-    cout_eo_pct : coût en % de la réserve, valeur fixe modifiable uniquement par le staff.
-    duree_tours : durée d'effet en tours, valeur fixe modifiable uniquement par le staff.
+    cout_eo_pct : coût en % de la réserve (valeur finale déjà calculée : base + paliers de niveau).
+    duree_tours : durée d'effet en tours (valeur finale déjà calculée : base + paliers de niveau).
+    is_max : True -> affiche « MAX » au lieu du pourcentage et remplit la jauge (Maîtrise au plafond).
     description, effets : texte libre, jusqu'à 500 caractères chacun.
     """
     W = 1100
@@ -2276,12 +2278,14 @@ def generate_territoire_image(character_name: str, terr_name: str, terr_type: st
     d.rectangle((0, 0, W, H), outline=TERR_GOLD, width=2)
 
     ring_cx = W // 2 - 90
-    _terr_ring_gauge(d, ring_cx, 130, 80, maitrise_pct, TERR_ACCENT, (35, 33, 42, 255), width=9)
+    ring_pct = 100 if is_max else maitrise_pct
+    _terr_ring_gauge(d, ring_cx, 130, 80, ring_pct, TERR_ACCENT, (35, 33, 42, 255), width=9)
     lvl_txt = f"Lv{maitrise_level}"
     lw = text_w(d, lvl_txt, font(26, True))
     d.text((ring_cx - lw / 2, 108), lvl_txt, font=font(26, True), fill=TERR_ACCENT)
-    pw = text_w(d, f"{maitrise_pct}%", font(11))
-    d.text((ring_cx - pw / 2, 146), f"{maitrise_pct}%", font=font(11), fill=TERR_SUB)
+    pct_txt = "MAX" if is_max else f"{maitrise_pct}%"
+    pw = text_w(d, pct_txt, font(11))
+    d.text((ring_cx - pw / 2, 146), pct_txt, font=font(11), fill=TERR_SUB)
     mw = text_w(d, "MAÎTRISE", font(10, True))
     d.text((ring_cx - mw / 2, 220), "MAÎTRISE", font=font(10, True), fill=TERR_HEADER_COLOR)
 
