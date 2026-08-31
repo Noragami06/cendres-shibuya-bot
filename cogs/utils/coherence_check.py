@@ -65,6 +65,12 @@ def compute_mastery_sort_bonus(level: int) -> int:
     return round(level * MASTERY_SORT_BONUS_TOTAL / MASTERY_SORT_MAX_LEVEL)
 
 
+# Maîtrise Territoire : dérivée des points de stat « territoire » (comme EO/Sort). Simple plafond de
+# niveau — la progression (durée / coût EO) se calcule par paliers de 15 niveaux à l'affichage (cogs.profil),
+# aucune formule de plafond « = 100% » à vérifier ici.
+MASTERY_TERRITOIRE_MAX_LEVEL = 105
+
+
 RCT_STAGES = {
     "moyenne": {"role_id": 1522181335337402408, "max_level": 20, "pv_per_level": 1, "next": "bonne"},
     "bonne": {"role_id": 1522181335962091621, "max_level": 25, "pv_per_level": 3, "next": "avancee"},
@@ -267,11 +273,16 @@ def _check_spell_classes(errors):
 
 
 def _check_masteries(errors):
-    """Vérifie les valeurs plafonds des 3 maîtrises (EO / Sort / RCT). Basé sur les constantes ci-dessus."""
+    """Vérifie les valeurs plafonds des maîtrises (EO / Sort / RCT / Territoire). Basé sur les constantes
+    ci-dessus."""
     if compute_mastery_eo_reduction(MASTERY_EO_MAX_LEVEL) != 30.0:
         errors.append("Maîtrise EO : le niveau max ne donne pas exactement -30%.")
     if compute_mastery_sort_bonus(MASTERY_SORT_MAX_LEVEL) != 1000:
         errors.append("Maîtrise Sort : le niveau max ne donne pas exactement +1000.")
+    # Maîtrise Territoire : pas de formule de plafond à vérifier (simple palier de niveau), on s'assure
+    # seulement que la constante reste un entier positif cohérent.
+    if not isinstance(MASTERY_TERRITOIRE_MAX_LEVEL, int) or MASTERY_TERRITOIRE_MAX_LEVEL <= 0:
+        errors.append("Maîtrise Territoire : MASTERY_TERRITOIRE_MAX_LEVEL doit être un entier positif.")
     if compute_rct_pv_bonus("avancee", RCT_STAGES["avancee"]["max_level"]) != 250:
         errors.append("Maîtrise RCT (avancée) : le niveau max ne donne pas exactement +250 PV.")
     if compute_rct_pv_bonus("bonne", RCT_STAGES["bonne"]["max_level"]) != 75:

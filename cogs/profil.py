@@ -20,6 +20,7 @@ from cogs.utils.image_gen import (
 # partagée avec le check de cohérence).
 from cogs.utils.coherence_check import (
     SPELL_CLASS_VALUES, RCT_STAGES, MASTERY_EO_MAX_LEVEL, MASTERY_SORT_MAX_LEVEL,
+    MASTERY_TERRITOIRE_MAX_LEVEL,
 )
 # Réutilise les helpers déjà en place (personnages / comptes / couleur).
 from cogs.banque import get_characters, get_character, PHOENIX_COLOR
@@ -47,8 +48,6 @@ TERRITOIRE_PHRASES = set(TERRITOIRE_APPELLATIONS.values())
 TERRITOIRE_DEFAULT_COUT_EO_PCT = 45  # 45 % de la réserve (base)
 TERRITOIRE_DUREE_MIN = 3             # minimum absolu (aussi la valeur de base)
 TERRITOIRE_DEFAULT_DUREE_TOURS = TERRITOIRE_DUREE_MIN  # 3 tours
-# Maîtrise Territoire : dérivée des points de stat « territoire » (comme EO/Sort/RCT), plafond 105.
-MASTERY_TERRITOIRE_MAX_LEVEL = 105
 # Progression par paliers : tous les 15 niveaux de Maîtrise Territoire, +1 tour et (selon la réserve d'EO)
 # une réduction du coût. Le coût ne descend jamais sous TERRITOIRE_MIN_COUT_PCT.
 TERRITOIRE_LEVEL_STEP = 15

@@ -24,6 +24,7 @@ from cogs.utils.coherence_check import (  # noqa: E402  (import après ajustemen
     pct_sum_ok, run_coherence_check, DB_PATH, SPELL_CLASS_VALUES, SPELL_CLASS_ORDER,
     MASTERY_EO_MAX_LEVEL, compute_mastery_eo_reduction,
     MASTERY_SORT_MAX_LEVEL, compute_mastery_sort_bonus,
+    MASTERY_TERRITOIRE_MAX_LEVEL,
     RCT_STAGES, compute_rct_pv_bonus,
 )
 
@@ -128,7 +129,7 @@ def section_spell_classes():
 
 
 def section_masteries():
-    header("6. MAÎTRISES (EO / Sort / RCT)")
+    header("6. MAÎTRISES (EO / Sort / RCT / Territoire)")
 
     # Maîtrise EO : réduction du coût énergétique, -1%/niveau, plafond -30% à niveau 30.
     print("  [Maîtrise EO] réduction du coût énergétique (-1 %/niveau)")
@@ -158,6 +159,12 @@ def section_masteries():
         suite = info["next"] if info["next"] else "— (sommet)"
         print(f"      {stage:8s} : rôle {info['role_id']}  niveau max {info['max_level']:>2d}  "
               f"+{info['pv_per_level']} PV/niveau  →  +{total} PV au max   (stade suivant : {suite})")
+
+    # Maîtrise Territoire : dérivée des points de stat « territoire », simple plafond de niveau. La durée
+    # et le coût EO progressent par paliers de 15 niveaux, calculés à l'affichage (cogs.profil).
+    print("\n  [Maîtrise Territoire] dérivée des points de stat « territoire » (paliers de 15 niveaux)")
+    print(f"    Confirmation niveau max = {MASTERY_TERRITOIRE_MAX_LEVEL} "
+          f"(+1 tour et réduction du coût EO par palier de 15 niveaux, appliqués à l'affichage)")
 
 
 def section_code_roles(mods, barometer):
