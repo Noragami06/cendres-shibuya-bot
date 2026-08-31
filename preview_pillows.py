@@ -167,3 +167,14 @@ generate_territoire_image(
     out_path="temp/preview_territoire.png",
 )
 print("Territoire générée dans temp/")
+
+from cogs.utils.image_gen import generate_arme_maudite_image
+
+generate_arme_maudite_image(
+    "Satoru Gojo", "Horus", "S",
+    "31% de la réserve", "2 763 pts",
+    "Une baguette qui crée toute sorte de sort, mais principalement du feu. Le sort le plus célèbre étant le Protego Diabolica et l'Avada Kedavra.",
+    weapon_image_path=None,  # remplace par un vrai chemin d'image locale si tu en as un pour tester
+    out_path="temp/preview_arme_maudite.png",
+)
+print("Arme maudite générée dans temp/")

@@ -2320,3 +2320,129 @@ def generate_territoire_image(character_name: str, terr_name: str, terr_type: st
 
     img.save(out_path)
     return out_path
+
+
+# ---------------------------------------------------------------------------
+# Arme maudite (/profil → 🗡️ Armes maudites → une arme précise)
+# ---------------------------------------------------------------------------
+ARME_BG = (10, 9, 15, 255)
+ARME_TEXT = (235, 235, 240, 255)
+ARME_SUB = (150, 148, 160, 255)
+ARME_GOLD = (232, 197, 121, 255)
+ARME_HEADER_COLOR = (255, 200, 60, 255)
+ARME_ACCENT = (230, 140, 60)
+
+ARME_CLASS_COLORS = {"S": (255, 165, 0), "1": (235, 60, 100), "2": (170, 80, 240), "3": (60, 130, 240), "4": (40, 200, 150)}
+ARME_CLASS_ORDER = ["4", "3", "2", "1", "S"]
+
+
+def _arme_frame(d, xy, gold, width=3, radius=14):
+    d.rounded_rectangle(xy, radius=radius, outline=gold, width=width)
+
+
+def _arme_hexagon(d, img, cx, cy, r, gold, portrait_path=None):
+    pts = [(cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a))) for a in range(-90, 271, 60)]
+    if portrait_path and os.path.exists(portrait_path):
+        size = int(r * 1.6)
+        photo = Image.open(portrait_path).convert("RGB")
+        photo = ImageOps.fit(photo, (size, size), method=Image.LANCZOS)
+        mask = Image.new("L", (size, size), 0)
+        md = ImageDraw.Draw(mask)
+        hex_local = [(size / 2 + r * math.cos(math.radians(a)), size / 2 + r * math.sin(math.radians(a))) for a in range(-90, 271, 60)]
+        md.polygon(hex_local, fill=255)
+        img.paste(photo, (int(cx - size / 2), int(cy - size / 2)), mask)
+    else:
+        d.polygon(pts, fill=(20, 20, 28, 255))
+    d.polygon(pts, outline=gold, width=3)
+
+
+def _arme_paste_weapon_image(img, box_xy, gold, weapon_image_path):
+    x0, y0, x1, y1 = box_xy
+    w, h = x1 - x0, y1 - y0
+    d = ImageDraw.Draw(img)
+    if weapon_image_path and os.path.exists(weapon_image_path):
+        try:
+            weapon_img = Image.open(weapon_image_path).convert("RGB")
+            fitted = ImageOps.fit(weapon_img, (w - 6, h - 6), method=Image.LANCZOS)
+            img.paste(fitted, (x0 + 3, y0 + 3))
+        except Exception:
+            d.rounded_rectangle(box_xy, radius=10, fill=(28, 24, 18, 255))
+    else:
+        d.rounded_rectangle(box_xy, radius=10, fill=(28, 24, 18, 255))
+    d.rounded_rectangle(box_xy, radius=10, outline=gold, width=3)
+
+
+def generate_arme_maudite_image(character_name: str, arme_name: str, classe: str,
+                                 cout_eo_txt: str, degats_txt: str, description: str,
+                                 weapon_image_path: str, out_path: str,
+                                 portrait_path=None, background_path=None):
+    """
+    classe : "4", "3", "2", "1", ou "S"
+    cout_eo_txt, degats_txt : déjà formatés en texte (ex: "31% de la réserve", "2 763 pts")
+    description : texte libre, jusqu'à 500 caractères
+    weapon_image_path : image fournie par le joueur, automatiquement recadrée (ImageOps.fit) pour
+                        remplir la case, quel que soit son format d'origine.
+    """
+    W = 1050
+    dummy = Image.new("RGBA", (10, 10))
+    dd = ImageDraw.Draw(dummy)
+    lines = wrap_text(dd, description, font(16, True), W - 90)
+    H = 1000 + len(lines) * 6
+
+    if background_path and os.path.exists(background_path):
+        try:
+            bg = ImageOps.fit(Image.open(background_path).convert("RGB"), (W, H), method=Image.LANCZOS)
+            bg = bg.filter(ImageFilter.GaussianBlur(radius=8)).convert("RGBA")
+            img = Image.alpha_composite(bg, Image.new("RGBA", (W, H), (0, 0, 0, 140)))
+        except Exception:
+            img = Image.new("RGBA", (W, H), ARME_BG)
+    else:
+        img = Image.new("RGBA", (W, H), ARME_BG)
+    d = ImageDraw.Draw(img)
+    _arme_frame(d, (20, 20, W - 20, H - 20), ARME_GOLD, width=2, radius=16)
+
+    _arme_hexagon(d, img, W - 100, 90, 45, ARME_GOLD, portrait_path)
+    d.text((44, 44), character_name, font=font(13, True), fill=ARME_GOLD)
+
+    anw = text_w(d, arme_name, font(24, True))
+    d.text((W / 2 - anw / 2, 90), arme_name, font=font(24, True), fill=ARME_ACCENT)
+
+    classe_txt = f"Classe {classe}"
+    ctw = text_w(d, classe_txt, font(14, True))
+    badge_w = ctw + 28
+    badge_x0 = W / 2 - badge_w / 2
+    color = ARME_CLASS_COLORS.get(classe, (100, 100, 110))
+    d.rounded_rectangle((badge_x0, 128, badge_x0 + badge_w, 128 + 30), radius=15, fill=color)
+    d.text((badge_x0 + 14, 128 + 6), classe_txt, font=font(14, True), fill=(15, 15, 18, 255))
+
+    margin_cm = 113  # ~3cm de marge de chaque côté
+    _arme_paste_weapon_image(img, (margin_cm, 180, W - margin_cm, 560), ARME_GOLD, weapon_image_path)
+
+    d.line((44, 590, W - 44, 590), fill=(55, 52, 65, 255), width=1)
+    y = 610
+    col_w = (W - 44 * 2 - 20) // 2
+    d.text((44, y), "COÛT EO", font=font(16, True), fill=ARME_HEADER_COLOR)
+    d.text((44, y + 26), cout_eo_txt, font=font(16, True), fill=ARME_TEXT)
+    x2 = 44 + col_w + 20
+    d.text((x2, y), "DÉGÂTS", font=font(16, True), fill=ARME_HEADER_COLOR)
+    d.text((x2, y + 26), degats_txt, font=font(16, True), fill=ARME_TEXT)
+
+    d.line((44, 690, W - 44, 690), fill=(45, 42, 52, 255), width=1)
+    d.text((44, 706), "DESCRIPTION", font=font(16, True), fill=ARME_HEADER_COLOR)
+    for i, line in enumerate(lines):
+        d.text((44, 736 + i * 24), line, font=font(16, True), fill=ARME_TEXT)
+
+    legend_y = 736 + len(lines) * 24 + 30
+    d.line((44, legend_y, W - 44, legend_y), fill=(45, 42, 52, 255), width=1)
+    legend_y += 20
+    lx = 44
+    for cl in ARME_CLASS_ORDER:
+        label = f"Classe {cl}"
+        lw = text_w(d, label, font(12, True))
+        bw = lw + 24
+        d.rounded_rectangle((lx, legend_y, lx + bw, legend_y + 28), radius=14, fill=ARME_CLASS_COLORS[cl])
+        d.text((lx + 12, legend_y + 6), label, font=font(12, True), fill=(15, 15, 18, 255))
+        lx += bw + 12
+
+    img.save(out_path)
+    return out_path
