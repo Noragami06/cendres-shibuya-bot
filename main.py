@@ -7,7 +7,7 @@ from cogs.clans import build_clans_report
 from cogs.depart import retroactive_departure_check, backfill_role_points
 from cogs.profil import (
     backfill_pv_system, backfill_secondary_sort_values, backfill_sort_unlock_status,
-    backfill_territoire_defaults, backfill_eo_from_fiche,
+    backfill_territoire_defaults, backfill_fiche_record,
 )
 from cogs.utils.database import init_db
 
@@ -62,10 +62,9 @@ async def on_ready():
         await backfill_secondary_sort_values()
         await backfill_sort_unlock_status()
         await backfill_territoire_defaults()
-        # Réalignement de l'EO sur la fiche validée : force TOUJOURS eo_actuel/eo_max = eo_value (la fiche
-        # fait foi). Le garde _profil_backfills_done le limite à une fois par process (= à chaque
-        # redémarrage), ce qui est exactement le comportement voulu.
-        await backfill_eo_from_fiche()
+        # Rattrapage UNIQUE de fiche_record (source de vérité permanente de l'EO). Ensuite, la
+        # resynchronisation est VIVANTE via sync_eo_with_fiche() à chaque affichage du profil.
+        await backfill_fiche_record()
     if not status_loop.is_running():
         status_loop.start()
 

@@ -486,6 +486,13 @@ CREATE TABLE IF NOT EXISTS bot_state (
     value TEXT                       -- ex: 'last_weekly_orders_run:<guild_id>' -> date ISO du dernier lundi traité
 );
 
+-- Source de vérité PERMANENTE de la réserve d'EO tirée à la validation de fiche. Sert à resynchroniser
+-- l'EO du profil à chaque affichage (sync_eo_with_fiche), quel que soit l'âge du personnage / redémarrages.
+CREATE TABLE IF NOT EXISTS fiche_record (
+    character_id INTEGER PRIMARY KEY,
+    eo_value INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS educator_contracts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id TEXT,                   -- regroupe les contrats créés en une seule fois (validation groupée)
@@ -2385,6 +2392,41 @@ def set_bot_state(key: str, value: str):
     with get_connection() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)", (key, value)
+        )
+
+
+def set_fiche_record(character_id: int, eo_value):
+    """Enregistre (ou remplace) la réserve d'EO de la fiche validée — source de vérité permanente.
+    Appelé à la validation de fiche, juste après l'insertion dans validated_characters."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO fiche_record (character_id, eo_value) VALUES (?, ?)",
+            (character_id, eo_value),
+        )
+
+
+def get_fiche_record(character_id: int):
+    """Ligne fiche_record d'un personnage (ou None)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT character_id, eo_value FROM fiche_record WHERE character_id = ?",
+            (character_id,),
+        ).fetchone()
+
+
+def sync_eo_with_fiche(character_id: int):
+    """Réaligne eo_actuel/eo_max du profil sur la fiche (fiche_record), source de vérité permanente.
+    Appelée à CHAQUE affichage du pillow /profil : garantit l'EO à jour peu importe l'âge du personnage
+    ou un redémarrage entre-temps. Personnage sans réserve (eo_value NULL) -> aucune action."""
+    with get_connection() as conn:
+        fiche = conn.execute(
+            "SELECT eo_value FROM fiche_record WHERE character_id = ?", (character_id,)
+        ).fetchone()
+        if fiche is None or fiche["eo_value"] is None:
+            return  # Humain / Hybride chez les humains : pas de réserve à synchroniser
+        conn.execute(
+            "UPDATE character_profiles SET eo_actuel = ?, eo_max = ? WHERE character_id = ?",
+            (fiche["eo_value"], fiche["eo_value"], character_id),
         )
 
 

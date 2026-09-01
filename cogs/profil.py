@@ -860,6 +860,9 @@ class Profil(commands.Cog):
 
     # ---------- rendu de l'image de profil ----------
     async def _render_profile(self, character_id, guild=None) -> str:
+        # Source de vérité permanente : réaligne l'EO sur la fiche AVANT de lire character_profiles, à
+        # CHAQUE affichage (robuste aux redémarrages / personnages anciens). No-op sans réserve.
+        db.sync_eo_with_fiche(character_id)
         p = db.get_or_create_profile(character_id)
         char = get_character(character_id)
         name = char["character_name"] if char else "?"
@@ -1503,7 +1506,12 @@ class Profil(commands.Cog):
             await channel.send(f"❌ Classe d'arme « {classe} » invalide, impossible de créer cette arme.")
             return
 
-        # Limite par classe.
+        # Le plafond s'applique sur le NOMBRE D'ARMES MAUDITES DÉJÀ CRÉÉES par classe
+        # (character_armes_maudites), jamais sur la quantité d'objets en inventaire. Un joueur gardant le
+        # même objet en inventaire peut légitimement l'utiliser pour valider la possession à chaque
+        # tentative de création, tant que le plafond de la classe n'est pas atteint — c'est le comportement
+        # voulu, pas un bug à corriger. L'objet d'inventaire n'est JAMAIS consommé ni caché à la création
+        # d'une arme maudite.
         deja = db.count_character_armes(character_id, classe)
         if deja >= ARME_MAX_PAR_CLASSE.get(classe, 0):
             await channel.send(
@@ -3748,13 +3756,18 @@ async def backfill_secondary_sort_values():
 
 
 async def backfill_sort_unlock_status():
-    """Statut de déblocage des sorts principaux créés avant is_unlocked : slot 0 débloqué, slots ≥ 1
-    verrouillés (déblocage manuel staff à construire — cf. TODO dans _run_technique_creation)."""
+    """Initialise le statut de déblocage des sorts principaux UNE SEULE FOIS dans toute la vie du bot,
+    puis ne retouche JAMAIS ces valeurs (le staff a pu débloquer des sorts depuis). Ne modifie que les
+    lignes is_unlocked IS NULL (créées avant l'ajout de la colonne), jamais celles déjà à 0 ou 1
+    explicitement (qui peuvent refléter une action staff volontaire)."""
+    if db.get_bot_state("sort_unlock_backfill_done"):
+        return  # déjà fait une fois : ne JAMAIS retoucher les sorts après
     with db.get_connection() as conn:
-        conn.execute("UPDATE character_sorts SET is_unlocked = 1 WHERE slot_index = 0")
-        conn.execute("UPDATE character_sorts SET is_unlocked = 0 WHERE slot_index >= 1")
-    print("🔍 [backfill sorts] Statuts de déblocage corrigés : seul le 1er sort principal de chaque "
-          "personnage reste débloqué.")
+        conn.execute("UPDATE character_sorts SET is_unlocked = 1 WHERE slot_index = 0 AND is_unlocked IS NULL")
+        conn.execute("UPDATE character_sorts SET is_unlocked = 0 WHERE slot_index >= 1 AND is_unlocked IS NULL")
+    db.set_bot_state("sort_unlock_backfill_done", "1")
+    print("🔍 [backfill sorts] Statuts de déblocage initialisés une seule fois, ce backfill ne se "
+          "relancera plus jamais.")
 
 
 async def backfill_territoire_defaults():
@@ -3774,33 +3787,24 @@ async def backfill_territoire_defaults():
                   f"{TERRITOIRE_DEFAULT_COUT_EO_PCT}%, durée à {TERRITOIRE_DEFAULT_DUREE_TOURS} tours (base).")
 
 
-async def backfill_eo_from_fiche():
-    """Force eo_actuel et eo_max de character_profiles à correspondre à la vraie réserve tirée pendant
-    /depart (validated_characters.eo_value), pour TOUS les personnages ayant une réserve définie, sans
-    exception — la fiche validée fait toujours foi, même sur une valeur déjà modifiée manuellement par le
-    staff. Contrairement aux autres backfills (qui ne touchent que les valeurs jamais initialisées),
-    celui-ci force TOUJOURS l'alignement : relançable à chaque démarrage, c'est voulu."""
+async def backfill_fiche_record():
+    """Rattrapage UNIQUE : remplit fiche_record pour les personnages validés AVANT l'existence de cette
+    table, en reprenant validated_characters.eo_value. Ne s'exécute qu'une seule fois (gardé par
+    bot_state) ; ensuite fiche_record est alimentée en direct à la validation de fiche."""
+    if db.get_bot_state("fiche_record_backfill_done"):
+        return
     with db.get_connection() as conn:
         characters = conn.execute(
-            "SELECT id AS character_id, eo_value FROM validated_characters "
-            "WHERE eo_value IS NOT NULL AND eo_value > 0"
+            "SELECT id, eo_value FROM validated_characters "
+            "WHERE id NOT IN (SELECT character_id FROM fiche_record)"
         ).fetchall()
         for char in characters:
-            cp = conn.execute(
-                "SELECT eo_actuel, eo_max FROM character_profiles WHERE character_id = ?",
-                (char["character_id"],),
-            ).fetchone()
-            if cp is None:
-                # Pas de ligne character_profiles pour ce personnage : rien à corriger ici (elle est
-                # créée au premier affichage du pillow, avec la bonne réserve à ce moment-là).
-                continue
-            if cp["eo_actuel"] != char["eo_value"] or cp["eo_max"] != char["eo_value"]:
-                conn.execute(
-                    "UPDATE character_profiles SET eo_actuel = ?, eo_max = ? WHERE character_id = ?",
-                    (char["eo_value"], char["eo_value"], char["character_id"]),
-                )
-                print(f"🔍 [backfill EO] Personnage {char['character_id']} : EO corrigée à "
-                      f"{char['eo_value']:,} (était {cp['eo_actuel']}/{cp['eo_max']}).")
+            conn.execute(
+                "INSERT INTO fiche_record (character_id, eo_value) VALUES (?, ?)",
+                (char["id"], char["eo_value"]),
+            )
+    db.set_bot_state("fiche_record_backfill_done", "1")
+    print(f"🔍 [backfill fiche_record] {len(characters)} personnage(s) rattrapé(s), une seule fois.")
 
 
 async def setup(bot):

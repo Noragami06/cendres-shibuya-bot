@@ -1770,6 +1770,9 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
     if prof_row is not None:
         character_id = prof_row["id"]
         db.create_profile_from_fiche(character_id, progress.get("eo_value"))
+        # Source de vérité PERMANENTE de la réserve d'EO : même valeur que validated_characters.eo_value.
+        # Resynchronisée à chaque affichage du profil (sync_eo_with_fiche), robuste aux redémarrages.
+        db.set_fiche_record(character_id, progress.get("eo_value"))
         # Ligne de stats par défaut (tout à 0). Points de départ à définir (cf. TODO.md).
         db.create_stats_default(character_id)
 
