@@ -337,6 +337,48 @@ def compute_territoire_cout(base_cout_pct: int, level: int, eo_reserve: int) -> 
 
 
 # =====================================================================
+# MAÎTRISE ARME MAUDITE — dérivée des points de stat « armes_maudites » (comme EO/Sort/RCT/Territoire).
+# =====================================================================
+# Plafond de la Maîtrise Arme maudite (NB : les 4 autres plafonds vivent dans coherence_check.py ;
+# cf. note de fin — celui-ci y aurait aussi sa place pour cohérence avec le rapport).
+MASTERY_ARME_MAX_LEVEL = 60
+# Bonus de dégâts accordé PAR NIVEAU gagné de Maîtrise, selon la classe de l'arme (plus la classe est
+# haute, plus le gain par niveau est faible : progression plus lente pour les armes déjà puissantes).
+ARME_DEGATS_PAR_LEVEL = {
+    "4": 30,
+    "3": 15, "2": 15,
+    "1": 10, "S": 10,
+}
+
+
+async def get_mastery_arme_maudite(character_id) -> tuple:
+    """Maîtrise Arme maudite dérivée des points de stat « armes_maudites », exactement comme les autres.
+    Retourne (level, xp_actuel, xp_max), plafonnée à MASTERY_ARME_MAX_LEVEL."""
+    total = await get_stat_total(character_id, "armes_maudites")
+    return points_to_level_xp_capped(total, MASTERY_ARME_MAX_LEVEL)
+
+
+async def grant_arme_maudite_xp(character_id: int, xp_gained: int):
+    """À chaque niveau gagné de Maîtrise Arme maudite, applique le bonus de dégâts correspondant à la
+    classe de CHAQUE arme déjà créée par ce personnage."""
+    total_avant = await get_stat_total(character_id, "armes_maudites")
+    level_avant, _, _ = points_to_level_xp_capped(total_avant, MASTERY_ARME_MAX_LEVEL)
+    # (le vrai déclenchement se fera plus tard quand une source de gain d'XP existera ;
+    # pour l'instant cette fonction sert de référence pour la logique de croissance)
+    armes = db.get_character_armes(character_id)
+    level_apres, _, _ = points_to_level_xp_capped(total_avant + xp_gained, MASTERY_ARME_MAX_LEVEL)
+    level_ups = level_apres - level_avant
+    if level_ups > 0:
+        for arme in armes:
+            bonus = ARME_DEGATS_PAR_LEVEL.get(arme["classe"], 0) * level_ups
+            db.add_arme_degats(arme["id"], bonus)
+
+
+# TODO : aucune source d'XP n'existe encore pour déclencher grant_arme_maudite_xp (pas de système de
+# combat/quête). Prête à être appelée dès qu'une telle source sera construite, exactement comme grant_sort_xp().
+
+
+# =====================================================================
 # PARAMÈTRES MODIFIABLES (staff)
 # =====================================================================
 PARAM_ALIASES = {
@@ -813,10 +855,13 @@ class Profil(commands.Cog):
             ("Maîtrise Territoire", 1, 0, False),  # TODO : système Territoire différé
             _maitrise("RCT", rct_lvl, rct_xa, rct_xm),
         ]
+        # 5ème rond (centre) : Maîtrise Arme maudite, dérivée de la stat, même règle « MAX » au plafond.
+        arme_lvl, arme_xa, arme_xm = await get_mastery_arme_maudite(character_id)
+        arme_maudite = _maitrise("Arme Maudite", arme_lvl, arme_xa, arme_xm)
         path = _tmp_profile("profil")
         generate_profil_image(
             name, (p["pv_actuel"], p["pv_max"]), (p["eo_actuel"], p["eo_max"]), p["level"],
-            (p["xp_actuel"], p["xp_max"]), stats, maitrises, clan, rang,
+            (p["xp_actuel"], p["xp_max"]), stats, maitrises, arme_maudite, clan, rang,
             p["victoires"], p["defaites"], p["nuls"], path,
             portrait_path=portrait_path, background_path=background_path,
         )
@@ -3456,6 +3501,35 @@ async def backfill_territoire_defaults():
             )
             print(f"🔍 [backfill territoire] Personnage {t['character_id']} : coût remis à "
                   f"{TERRITOIRE_DEFAULT_COUT_EO_PCT}%, durée à {TERRITOIRE_DEFAULT_DUREE_TOURS} tours (base).")
+
+
+async def backfill_eo_from_fiche():
+    """Force eo_actuel et eo_max de character_profiles à correspondre à la vraie réserve tirée pendant
+    /depart (validated_characters.eo_value), pour TOUS les personnages ayant une réserve définie, sans
+    exception — la fiche validée fait toujours foi, même sur une valeur déjà modifiée manuellement par le
+    staff. Contrairement aux autres backfills (qui ne touchent que les valeurs jamais initialisées),
+    celui-ci force TOUJOURS l'alignement : relançable à chaque démarrage, c'est voulu."""
+    with db.get_connection() as conn:
+        characters = conn.execute(
+            "SELECT id AS character_id, eo_value FROM validated_characters "
+            "WHERE eo_value IS NOT NULL AND eo_value > 0"
+        ).fetchall()
+        for char in characters:
+            cp = conn.execute(
+                "SELECT eo_actuel, eo_max FROM character_profiles WHERE character_id = ?",
+                (char["character_id"],),
+            ).fetchone()
+            if cp is None:
+                # Pas de ligne character_profiles pour ce personnage : rien à corriger ici (elle est
+                # créée au premier affichage du pillow, avec la bonne réserve à ce moment-là).
+                continue
+            if cp["eo_actuel"] != char["eo_value"] or cp["eo_max"] != char["eo_value"]:
+                conn.execute(
+                    "UPDATE character_profiles SET eo_actuel = ?, eo_max = ? WHERE character_id = ?",
+                    (char["eo_value"], char["eo_value"], char["character_id"]),
+                )
+                print(f"🔍 [backfill EO] Personnage {char['character_id']} : EO corrigée à "
+                      f"{char['eo_value']:,} (était {cp['eo_actuel']}/{cp['eo_max']}).")
 
 
 async def setup(bot):

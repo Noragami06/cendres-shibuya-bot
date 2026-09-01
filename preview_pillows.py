@@ -79,6 +79,7 @@ generate_profil_image(
     level=12, xp=(4200, 5000),
     stats=[("Force", 3, 60, (600, 1000)), ("Vitesse", 2, 37, (300, 800)), ("Défense", 4, 90, (900, 1000))],
     maitrises=[("Maîtrise EO", 7, 70), ("Maîtrise Sort", 4, 40), ("Maîtrise Territoire", 2, 20), ("RCT", 3, 37)],
+    arme_maudite=("Arme Maudite", 6, 38),
     clan="Gojo", rang="Héritier",
     victoires=12, defaites=3, nuls=1,
     out_path="temp/preview_profil.png",

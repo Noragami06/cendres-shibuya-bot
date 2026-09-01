@@ -692,12 +692,13 @@ def _profil_frame(d, xy, gold):
     d.rounded_rectangle(xy, radius=14, outline=gold, width=3)
 
 
-def generate_profil_image(name, pv, eo, level, xp, stats, maitrises, clan, rang, victoires, defaites, nuls,
+def generate_profil_image(name, pv, eo, level, xp, stats, maitrises, arme_maudite, clan, rang, victoires, defaites, nuls,
                           out_path, portrait_path=None, background_path=None):
     """
     pv, eo, xp : tuples (valeur_actuelle, valeur_max)
     stats : liste de 3 tuples (nom, niveau, pourcentage, (xp_actuel, xp_max)) → Force, Vitesse, Défense dans cet ordre
     maitrises : liste de 4 tuples (nom, niveau, pourcentage[, is_max]) → Maîtrise EO, Maîtrise Sort, Maîtrise Territoire, RCT dans cet ordre. is_max (optionnel) → affiche « MAX » au lieu du pourcentage.
+    arme_maudite : tuple (nom, niveau, pourcentage[, is_max]) → 5ème rond, au CENTRE du cadre Maîtrises (même règle MAX).
     clan, rang : chaînes
     victoires, defaites, nuls : entiers
     portrait_path : photo du personnage, découpée à la forme de l'hexagone (cadre en haut à droite).
@@ -842,13 +843,24 @@ def generate_profil_image(name, pv, eo, level, xp, stats, maitrises, clan, rang,
     d.text((x, y), "MAÎTRISES", font=font(13, True), fill=HEADER_COLOR)
 
     maitrise_colors = [(90, 160, 240, 255), (170, 100, 240, 255), (100, 220, 150, 255), (240, 110, 130, 255)]
+    arme_color = (230, 140, 60, 255)
     ring_r_m = 46
-    positions = [(f4[0] + half_w * 0.28, y + 74), (f4[0] + half_w * 0.72, y + 74),
-                 (f4[0] + half_w * 0.28, y + 208), (f4[0] + half_w * 0.72, y + 208)]
-    for md, (px, py), col in zip(maitrises, positions, maitrise_colors):
-        mname, mlvl, mpct = md[:3]
-        m_is_max = md[3] if len(md) > 3 else False  # 4e élément optionnel (rétro-compatible)
-        _profil_ring_gauge(d, px, py, ring_r_m, mpct, col, (35, 33, 42, 255), width=8)
+    margin_px = 38  # ~1cm entre le rond et le bord du cadre
+
+    x_left = f4[0] + margin_px + ring_r_m
+    x_right = f4[2] - margin_px - ring_r_m
+    row1_y = f4[1] + 95
+    row2_y = f4[1] + frame_h - 108
+
+    corners = [(x_left, row1_y), (x_right, row1_y), (x_left, row2_y), (x_right, row2_y)]
+    center = ((x_left + x_right) / 2, (row1_y + row2_y) / 2)
+
+    # Un rond = (nom, niveau, pct[, is_max]). is_max (4e élément optionnel) affiche « MAX » et remplit la
+    # jauge (règle standardisée du projet). Les 4 Maîtrises aux coins, l'Arme maudite au centre.
+    def _draw_mastery_ring(md, px, py, col):
+        mname, mlvl, mpct = md[0], md[1], md[2]
+        m_is_max = md[3] if len(md) > 3 else False
+        _profil_ring_gauge(d, px, py, ring_r_m, 100 if m_is_max else mpct, col, (35, 33, 42, 255), width=8)
         lvl_txt = f"Lv{mlvl}"
         pct_txt = "MAX" if m_is_max else f"{mpct}%"
         lw = text_w(d, lvl_txt, font(15, True))
@@ -857,6 +869,10 @@ def generate_profil_image(name, pv, eo, level, xp, stats, maitrises, clan, rang,
         d.text((px - pw / 2, py + 4), pct_txt, font=font(11), fill=col)
         nw = text_w(d, mname, font(12, True))
         d.text((px - nw / 2, py + ring_r_m + 12), mname, font=font(12, True), fill=SUB)
+
+    for md, (px, py), col in zip(maitrises, corners, maitrise_colors):
+        _draw_mastery_ring(md, px, py, col)
+    _draw_mastery_ring(arme_maudite, center[0], center[1], arme_color)
 
     img.save(out_path)
     return out_path

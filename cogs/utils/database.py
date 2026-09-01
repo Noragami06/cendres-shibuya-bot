@@ -358,6 +358,19 @@ CREATE TABLE IF NOT EXISTS character_territoire (
     is_unlocked INTEGER DEFAULT 0  -- 0 = verrouillé staff, 1 = débloqué (accessible au joueur)
 );
 
+-- Armes maudites CRÉÉES par un personnage (/profil → 🗡️ Armes maudites). Les dégâts croissent avec la
+-- Maîtrise Arme maudite (dérivée de la stat), via grant_arme_maudite_xp (cogs.profil).
+CREATE TABLE IF NOT EXISTS character_armes_maudites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id INTEGER,
+    name TEXT,
+    classe TEXT,          -- '4', '3', '2', '1', 'S'
+    description TEXT,
+    image_path TEXT,
+    degats_base INTEGER,  -- tiré une fois à la création, dans la fourchette de sa classe
+    degats_actuel INTEGER
+);
+
 -- Barème : points de stats accordés par rôle (camp / clan / grade).
 CREATE TABLE IF NOT EXISTS role_point_values (
     role_id INTEGER PRIMARY KEY,
@@ -1592,6 +1605,26 @@ def find_territoires_by_appellation(user_id: int, guild_id: int, appellation: st
             "AND ct.is_unlocked = 1 AND ct.name IS NOT NULL",
             (user_id, guild_id, appellation),
         ).fetchall()
+
+
+def get_character_armes(character_id: int):
+    """Armes maudites créées par un personnage (triées par id de création). Vide par défaut : aucun flux
+    de création côté joueur n'existe encore (comme les techniques à leurs débuts)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT id, name, classe, description, image_path, degats_base, degats_actuel "
+            "FROM character_armes_maudites WHERE character_id = ? ORDER BY id",
+            (character_id,),
+        ).fetchall()
+
+
+def add_arme_degats(arme_id: int, bonus: int):
+    """Ajoute `bonus` aux dégâts actuels d'une arme précise (croissance liée à la Maîtrise Arme maudite)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE character_armes_maudites SET degats_actuel = degats_actuel + ? WHERE id = ?",
+            (bonus, arme_id),
+        )
 
 
 def get_character_sort(sort_id: int):
