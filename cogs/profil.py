@@ -474,6 +474,7 @@ PARAM_ALIASES = {
     "territoire_bloquer": ["bloquer"],
     "territoire_cout_eo": ["coût eo territoire", "cout eo territoire"],
     "territoire_duree": ["durée en tours", "duree en tours"],
+    "type_territoire": ["type", "type territoire"],
 }
 
 # Paramètres du menu staff qui passent par le flux dédié « Techniques ».
@@ -488,6 +489,13 @@ TECHNIQUE_EDIT_PARAMS = {
 # Paramètres du menu staff qui passent par le flux dédié « Territoire ».
 TERRITOIRE_EDIT_PARAMS = {
     "territoire_debloquer", "territoire_bloquer", "territoire_cout_eo", "territoire_duree",
+    "type_territoire",
+}
+# Types de territoire proposés au staff (numéro affiché -> texte EXACT stocké).
+TERRITOIRE_TYPES = {
+    "1": "Territoire incomplet",
+    "2": "Maîtrise simple",
+    "3": "Sans barrière",
 }
 
 # Paramètres du menu staff qui passent par le flux dédié « Armes maudites ».
@@ -1400,6 +1408,33 @@ class Profil(commands.Cog):
                     (valeur, character_id),
                 )
             await channel.send(f"✅ Durée du territoire mise à **{valeur} tours**.")
+            return True
+        if param == "type_territoire":
+            if db.get_territoire(character_id) is None:
+                await channel.send("Ce personnage n'a pas encore de territoire (rien à modifier).")
+                return True
+            await channel.send(embed=discord.Embed(
+                title="Choisis le nouveau type du territoire",
+                description="**1.** Territoire incomplet\n**2.** Maîtrise simple\n**3.** Sans barrière"
+                            "\n\nRéponds avec 1, 2 ou 3 (ou « cancel »).",
+                color=PHOENIX_COLOR,
+            ))
+            while True:
+                m = await self.wait_message(channel, staff)
+                if m is None or _is_cancel(m.content):
+                    return True
+                choix = m.content.strip()
+                if choix in TERRITOIRE_TYPES:
+                    break
+                await channel.send("Réponds avec **1**, **2** ou **3**.")
+            nouveau_type = TERRITOIRE_TYPES[choix]
+            with db.get_connection() as conn:
+                conn.execute(
+                    "UPDATE character_territoire SET type = ? WHERE character_id = ?",
+                    (nouveau_type, character_id),
+                )
+            await channel.send(f"✅ Type du territoire changé en **{nouveau_type}**.")
+            await self.send_territoire(channel, character_id)
             return True
         return None
 
@@ -2998,7 +3033,7 @@ class Profil(commands.Cog):
          "Retirer sort maximum, Débloquer sort principal, Bloquer sort principal, Nom sort secondaire, "
          "Niveau requis, Coût EO, Dégâts, Débloquer sort secondaire, Bloquer sort secondaire, "
          "Supprimer sort principal, Supprimer tous les sorts"),
-        ("TERRITOIRE", "Débloquer, Bloquer, Coût EO territoire, Durée en tours"),
+        ("TERRITOIRE", "Débloquer, Bloquer, Coût EO territoire, Durée en tours, Type"),
         ("ARMES MAUDITES",
          "Nom arme, Image arme, Coût EO arme, Dégâts arme, Description arme, Supprimer arme"),
     ]

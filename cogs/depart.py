@@ -3138,6 +3138,36 @@ async def restore_player_roles(bot, user_id: int, guild):
         print(f"[retour] Échec de réattribution des rôles pour {user_id} : {e}")
 
 
+def _build_departure_roles_lines(user_id: int, guild_id: int) -> str:
+    """Pour le DM de décision : une ligne par personnage (ORDER BY slot_number) avec ses rôles en mentions.
+    Slot 1 : rôles RÉELS résolus depuis les attributs de fiche (camp/clan + membre de clan/grade). Slots
+    2/3 : rôles VIRTUELS enregistrés (character_virtual_roles), qui n'ont jamais bougé au départ."""
+    with db.get_connection() as conn:
+        chars = conn.execute(
+            "SELECT id, slot_number, character_name, camp, clan, grade FROM validated_characters "
+            "WHERE user_id = ? AND guild_id = ? ORDER BY slot_number",
+            (user_id, guild_id),
+        ).fetchall()
+    lignes = []
+    for ch in chars:
+        if ch["slot_number"] == 1:
+            camp_rid, clan_rid, grade_rid = resolve_role_point_ids(ch["camp"], ch["clan"], ch["grade"])
+            role_ids = [rid for rid in (camp_rid, clan_rid, grade_rid) if rid]
+            if ch["clan"] and ch["clan"] != "sans_clan":
+                role_ids.append(CLAN_MEMBER_ROLE_ID)
+        else:
+            role_ids = db.get_virtual_roles(ch["id"])
+        # Dé-doublonne en gardant l'ordre.
+        seen, uniques = set(), []
+        for rid in role_ids:
+            if rid not in seen:
+                seen.add(rid)
+                uniques.append(rid)
+        mentions = " ".join(f"<@&{rid}>" for rid in uniques) if uniques else "_(aucun rôle)_"
+        lignes.append(f"**Slot {ch['slot_number']} — {ch['character_name']}**\n{mentions}")
+    return "\n\n".join(lignes)
+
+
 class PlayerReturnDecisionView(discord.ui.View):
     """Décision de l'owner au retour d'un joueur mis en réserve. Boutons à custom_id DYNAMIQUE (user_id /
     guild_id encodés) : persistants et gérés par le listener on_interaction (comme DeleteConfirmView),
@@ -3273,20 +3303,35 @@ class Depart(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
-        # Retour d'un joueur mis en réserve : gèle la purge et demande à l'owner s'il faut tout restaurer.
+        # Retour d'un joueur mis en réserve.
         if member.bot:
             return
         departure = db.get_departure(member.id, member.guild.id)
         if departure is None:
             return  # jamais parti (ou déjà purgé après 15 j), rien à faire
-        db.set_departure_awaiting(member.id)  # gèle la purge, sans limite de temps
 
         try:
             departed_dt = datetime.fromisoformat(departure["departed_at"])
         except (TypeError, ValueError):
             departed_dt = datetime.utcnow()
-        jours_absence = max(0, (datetime.utcnow() - departed_dt).days)
+        elapsed = datetime.utcnow() - departed_dt
+
+        # §3 : arrivé APRÈS le délai exact de 15 jours -> aucune pitié, suppression définitive, aucun DM.
+        if elapsed >= timedelta(days=15):
+            await purge_player_completely(self.bot, member.id, member.guild)
+            db.delete_departure(member.id)
+            print(f"🔍 [retour joueur] {member.id} revenu après le délai de 15 jours, suppression "
+                  "définitive sans décision.")
+            return
+
+        # Retour DANS les temps : gèle la purge ET ajoute 10 jours de marge (le temps que l'owner échange
+        # avec le joueur), puis envoie le DM de décision.
+        new_departed = (departed_dt + timedelta(days=10)).isoformat()
+        db.freeze_and_extend_departure(member.id, new_departed)
+
+        jours_absence = max(0, elapsed.days)
         date_lisible = departed_dt.strftime("%d/%m/%Y")
+        roles_field = _build_departure_roles_lines(member.id, member.guild.id)
 
         embed = discord.Embed(
             title="🔄 Retour d'un joueur parti",
@@ -3299,13 +3344,26 @@ class Depart(commands.Cog):
             ),
             color=discord.Color.gold(),
         )
+        if roles_field:
+            embed.add_field(name="Ce qu'il avait, personnage par personnage", value=roles_field, inline=False)
         view = PlayerReturnDecisionView(user_id=member.id, guild_id=member.guild.id)
-        try:
-            owner = self.bot.get_user(SPECIAL_USER_ID) or await self.bot.fetch_user(SPECIAL_USER_ID)
-            if owner is not None:
+
+        owner = self.bot.get_user(SPECIAL_USER_ID) or await self.bot.fetch_user(SPECIAL_USER_ID)
+        if owner is None:
+            return
+        # §1 : retry sur les erreurs transitoires (HTTPException), jamais sur Forbidden (DMs fermés).
+        for tentative in range(3):
+            try:
                 await owner.send(embed=embed, view=view)
-        except (discord.Forbidden, discord.HTTPException):
-            pass  # MP owner indisponible : la ligne reste gelée, décision différée
+                break
+            except discord.Forbidden:
+                break  # DMs fermés, rien à faire, accepté tel quel
+            except discord.HTTPException:
+                if tentative == 2:
+                    print(f"⚠️ [retour joueur] Échec d'envoi du DM à l'owner après 3 tentatives pour "
+                          f"{member.id}.")
+                else:
+                    await asyncio.sleep(2)
 
     @tasks.loop(hours=6)
     async def departure_purge_loop(self):

@@ -2492,6 +2492,16 @@ def set_departure_awaiting(user_id: int):
         )
 
 
+def freeze_and_extend_departure(user_id: int, new_departed_at: str):
+    """Retour DANS les temps : gèle la purge (awaiting=1) ET repousse le timer (departed_at += 10 j)
+    pour laisser à l'owner le temps d'échanger avec le joueur avant de trancher."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE player_departures SET awaiting_owner_decision = 1, departed_at = ? WHERE user_id = ?",
+            (new_departed_at, user_id),
+        )
+
+
 def delete_departure(user_id: int):
     """Supprime la trace de départ (retour validé, purge effectuée, ou décision tranchée)."""
     with get_connection() as conn:
