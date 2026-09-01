@@ -1045,10 +1045,37 @@ def resolve_role_point_ids(camp, clan, grade):
     return camp_role_id, clan_role_id, grade_role_id
 
 
-async def sync_role_points(character_id: int, category: str, new_role_id):
+async def sync_role_points(character_id: int, category: str, new_role_id, bot=None):
     """Wrapper asynchrone de db.sync_role_points (les appels du projet utilisent `await`). La logique
-    (delta + dette + mémorisation du rôle de référence) est atomique côté base."""
-    db.sync_role_points(character_id, category, new_role_id)
+    (delta + dette + mémorisation du rôle de référence) est atomique côté base. Si `bot` est fourni et
+    qu'une dette a été NOUVELLEMENT appliquée (points repris au-delà des points libres), notifie le
+    joueur par MP (échec silencieux si ses MP sont fermés)."""
+    remaining_debt = db.sync_role_points(character_id, category, new_role_id)
+    if bot is not None and remaining_debt and remaining_debt > 0:
+        await _notify_points_debt(bot, character_id, remaining_debt)
+
+
+async def _notify_points_debt(bot, character_id: int, remaining_debt: int):
+    """Envoie un MP au propriétaire du personnage pour l'informer d'une dette de points appliquée.
+    Silencieux si le joueur a fermé ses MP ou si l'utilisateur est introuvable."""
+    char = db.get_character(character_id) if hasattr(db, "get_character") else None
+    if char is None:
+        with db.get_connection() as conn:
+            char = conn.execute(
+                "SELECT user_id FROM validated_characters WHERE id = ?", (character_id,)
+            ).fetchone()
+    if char is None:
+        return
+    user_id = char["user_id"]
+    try:
+        user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+        if user is not None:
+            await user.send(
+                f"⚠️ Suite à une modification de rôle, une dette de {remaining_debt} points a été "
+                "appliquée. Elle sera déduite de ton prochain gain de points de stats."
+            )
+    except (discord.Forbidden, discord.HTTPException):
+        pass  # MP fermés / utilisateur inaccessible : on ignore silencieusement
 
 
 async def grant_initial_role_points(character_id: int, camp, clan, grade):
@@ -2962,6 +2989,8 @@ def delete_character_cascade(character_id):
         conn.execute("DELETE FROM character_territoire WHERE character_id = ?", (character_id,))
         # Armes maudites (/profil → 🗡️ Armes maudites) propres au personnage
         conn.execute("DELETE FROM character_armes_maudites WHERE character_id = ?", (character_id,))
+        # Plafonds de niveau personnalisés (staff) propres au personnage
+        conn.execute("DELETE FROM character_mastery_overrides WHERE character_id = ?", (character_id,))
         # Statistiques + buffs (et effets de buffs via sous requête sur buff_id)
         conn.execute("DELETE FROM character_stats WHERE character_id = ?", (character_id,))
         conn.execute(
@@ -3013,9 +3042,25 @@ def delete_character_cascade(character_id):
 # DÉPART D'UN JOUEUR DU SERVEUR (nettoyage automatique)
 # =====================================================================
 async def handle_player_departure(bot, user_id: int, guild):
-    """Traite un joueur ayant quitté le serveur comme s'il avait supprimé ses personnages NON chefs
-    d'ordre. Les personnages chefs d'ordre sont laissés intacts ici : leur ordre (et eux mêmes) ne sont
-    dissous/supprimés que par la vérification programmée check_chief_presence (voir cogs/ordre.py)."""
+    """Un joueur quitte le serveur : au lieu d'une suppression immédiate, on le MET EN RÉSERVE 15 jours
+    (table player_departures). Discord retire déjà rôles/accès tout seul en quittant ; officieusement,
+    RIEN n'est touché en base pendant 15 jours (purge par la tâche planifiée _purge_expired_departures).
+    Le départ d'un CHEF D'ORDRE reste géré indépendamment par check_chief_presence (cogs/ordre.py) :
+    ce système de réserve/restauration ne concerne jamais l'ordre."""
+    with db.get_connection() as conn:
+        characters = conn.execute(
+            "SELECT id FROM validated_characters WHERE user_id = ? AND guild_id = ?",
+            (user_id, guild.id),
+        ).fetchall()
+    if not characters:
+        return  # rien à faire, ce joueur n'avait pas de personnage
+    db.record_departure(user_id, guild.id, datetime.utcnow().isoformat())
+
+
+async def purge_player_completely(bot, user_id: int, guild):
+    """VRAIE suppression complète des personnages d'un joueur (après 15 jours d'absence, ou décision
+    « ❌ Non » de l'owner). Réutilise la logique historique : conséquences côté ordre puis cascade +
+    retrait de validated_characters, en laissant les personnages CHEFS d'ordre à check_chief_presence."""
     with db.get_connection() as conn:
         characters = conn.execute(
             "SELECT id, slot_number FROM validated_characters WHERE user_id = ? AND guild_id = ?",
@@ -3054,11 +3099,67 @@ async def handle_player_departure(bot, user_id: int, guild):
             conn.execute("DELETE FROM validated_characters WHERE id = ?", (char_id,))
 
 
+async def restore_player_roles(bot, user_id: int, guild):
+    """Réattribue les VRAIS rôles Discord des personnages SLOT 1 d'un joueur de retour, depuis les
+    attributs déjà stockés dans validated_characters (camp, clan/sans-clan + rôle membre de clan, grade).
+    Discord les avait retirés automatiquement quand il a quitté. Les rôles VIRTUELS (slots 2/3) n'ont
+    jamais bougé (aucune action). Ne lève jamais : logue et continue en cas d'erreur."""
+    if guild is None:
+        return
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except (discord.NotFound, discord.HTTPException):
+            member = None
+    if member is None:
+        print(f"[retour] Membre {user_id} introuvable, rôles non réattribués.")
+        return
+    with db.get_connection() as conn:
+        chars = conn.execute(
+            "SELECT camp, clan, grade FROM validated_characters "
+            "WHERE user_id = ? AND guild_id = ? AND slot_number = 1",
+            (user_id, guild.id),
+        ).fetchall()
+    role_ids = set()
+    for ch in chars:
+        camp_rid, clan_rid, grade_rid = resolve_role_point_ids(ch["camp"], ch["clan"], ch["grade"])
+        for rid in (camp_rid, clan_rid, grade_rid):
+            if rid:
+                role_ids.add(rid)
+        if ch["clan"] and ch["clan"] != "sans_clan":
+            role_ids.add(CLAN_MEMBER_ROLE_ID)  # rôle générique « membre de clan »
+    roles = [r for r in (guild.get_role(rid) for rid in role_ids) if r is not None]
+    if not roles:
+        return
+    try:
+        await member.add_roles(*roles, reason="Retour de joueur : restauration des rôles")
+    except discord.HTTPException as e:
+        print(f"[retour] Échec de réattribution des rôles pour {user_id} : {e}")
+
+
+class PlayerReturnDecisionView(discord.ui.View):
+    """Décision de l'owner au retour d'un joueur mis en réserve. Boutons à custom_id DYNAMIQUE (user_id /
+    guild_id encodés) : persistants et gérés par le listener on_interaction (comme DeleteConfirmView),
+    donc cliquables même après un redémarrage sans reconstruire l'instance avec les bons ids."""
+
+    def __init__(self, user_id: int = 0, guild_id: int = 0):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="✅ Oui, tout restaurer", style=discord.ButtonStyle.success,
+            custom_id=f"player_return_yes:{user_id}:{guild_id}",
+        ))
+        self.add_item(discord.ui.Button(
+            label="❌ Non, il perd tout", style=discord.ButtonStyle.danger,
+            custom_id=f"player_return_no:{user_id}:{guild_id}",
+        ))
+
+
 async def retroactive_departure_check(bot):
-    """Rattrapage des joueurs partis AVANT l'ajout du listener on_member_remove. Déclenché une fois au
-    démarrage. Ce rattrapage tourne à CHAQUE démarrage du bot, mais ne fait rien pour les joueurs déjà
-    nettoyés (leurs personnages n'existent plus en base), donc c'est sans risque de le laisser tourner
-    indéfiniment à chaque redémarrage."""
+    """Rattrapage des joueurs partis AVANT l'ajout du listener on_member_remove. Déclenché à chaque
+    démarrage. Au lieu de purger, on MET EN RÉSERVE (ensure_departure, sans réinitialiser un départ déjà
+    enregistré) : la purge effective viendra 15 jours plus tard via la tâche planifiée. Idempotent : ne
+    réinitialise jamais un timer existant ni un gel de décision."""
     for guild in bot.guilds:
         with db.get_connection() as conn:
             rows = conn.execute(
@@ -3075,9 +3176,9 @@ async def retroactive_departure_check(bot):
                 except discord.HTTPException:
                     continue  # erreur réseau temporaire : on retentera au prochain redémarrage
             if member is None:
-                print(f"🔍 [rattrapage] Joueur {user_id} a quitté le serveur avant cet ajout, "
-                      "nettoyage en cours...")
-                await handle_player_departure(bot, user_id, guild)
+                print(f"🔍 [rattrapage] Joueur {user_id} absent du serveur : mise en réserve (purge dans "
+                      "15 jours s'il ne revient pas).")
+                db.ensure_departure(user_id, guild.id, datetime.utcnow().isoformat())
             await asyncio.sleep(0.5)  # évite de spam l'API Discord sur un gros serveur
 
 
@@ -3150,18 +3251,120 @@ class Depart(commands.Cog):
         # même si le message réellement envoyé n'en affichait que 3.
         self.bot.add_view(DMSortView(show_partial=True))
 
+        # Vue de décision au retour d'un joueur (custom_id DYNAMIQUE : la persistance réelle passe par le
+        # listener on_interaction ; add_view couvre l'enregistrement du composant côté discord.py).
+        self.bot.add_view(PlayerReturnDecisionView())
+
         # Tâche d'annulation des fiches expirées.
         if not self.fiche_expiry_loop.is_running():
             self.fiche_expiry_loop.start()
+        # Tâche de purge définitive des départs en réserve depuis ≥ 15 jours.
+        if not self.departure_purge_loop.is_running():
+            self.departure_purge_loop.start()
 
     async def cog_unload(self):
         self.fiche_expiry_loop.cancel()
+        self.departure_purge_loop.cancel()
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
-        # Un joueur quitte le serveur : on nettoie ses personnages (et dissout ses ordres) comme s'il
-        # les avait tous supprimés.
+        # Un joueur quitte le serveur : mise en RÉSERVE 15 jours (aucune suppression immédiate).
         await handle_player_departure(self.bot, member.id, member.guild)
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        # Retour d'un joueur mis en réserve : gèle la purge et demande à l'owner s'il faut tout restaurer.
+        if member.bot:
+            return
+        departure = db.get_departure(member.id, member.guild.id)
+        if departure is None:
+            return  # jamais parti (ou déjà purgé après 15 j), rien à faire
+        db.set_departure_awaiting(member.id)  # gèle la purge, sans limite de temps
+
+        try:
+            departed_dt = datetime.fromisoformat(departure["departed_at"])
+        except (TypeError, ValueError):
+            departed_dt = datetime.utcnow()
+        jours_absence = max(0, (datetime.utcnow() - departed_dt).days)
+        date_lisible = departed_dt.strftime("%d/%m/%Y")
+
+        embed = discord.Embed(
+            title="🔄 Retour d'un joueur parti",
+            description=(
+                f"{member.mention} a quitté le serveur le {date_lisible}, et vient de rejoindre à "
+                f"nouveau après {jours_absence} jour(s) d'absence.\n\n"
+                "Veux tu lui redonner tout ce qu'il avait (personnage, rôles, banque, techniques, "
+                "territoire, armes maudites) — **sauf l'ordre**, qui suit sa propre logique déjà "
+                "existante ?"
+            ),
+            color=discord.Color.gold(),
+        )
+        view = PlayerReturnDecisionView(user_id=member.id, guild_id=member.guild.id)
+        try:
+            owner = self.bot.get_user(SPECIAL_USER_ID) or await self.bot.fetch_user(SPECIAL_USER_ID)
+            if owner is not None:
+                await owner.send(embed=embed, view=view)
+        except (discord.Forbidden, discord.HTTPException):
+            pass  # MP owner indisponible : la ligne reste gelée, décision différée
+
+    @tasks.loop(hours=6)
+    async def departure_purge_loop(self):
+        """Purge définitive des joueurs en réserve depuis ≥ 15 jours, toujours absents et non gelés.
+        Même rythme que le scheduler d'ordre (4×/jour). check_chief_presence reste indépendant."""
+        cutoff = (datetime.utcnow() - timedelta(days=15)).isoformat()
+        for row in db.get_departures_to_purge(cutoff):
+            user_id, guild_id = row["user_id"], row["guild_id"]
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                continue
+            # Sécurité : ne purge que si le joueur n'est TOUJOURS PAS sur le serveur.
+            member = guild.get_member(user_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(user_id)
+                except discord.NotFound:
+                    member = None
+                except discord.HTTPException:
+                    continue  # incertitude réseau : on retentera au prochain passage
+            if member is not None:
+                continue  # il est revenu sans passer par la décision : on ne purge pas
+            print(f"🔍 [purge départ] Joueur {user_id} absent depuis ≥ 15 jours : suppression définitive.")
+            await purge_player_completely(self.bot, user_id, guild)
+            db.delete_departure(user_id)
+
+    @departure_purge_loop.before_loop
+    async def _before_departure_purge(self):
+        await self.bot.wait_until_ready()
+
+    async def handle_player_return_decision(self, interaction: discord.Interaction, custom_id: str, restore: bool):
+        # Réservé à l'owner du bot.
+        if interaction.user.id != SPECIAL_USER_ID:
+            await interaction.response.send_message("Cette décision ne t'appartient pas.", ephemeral=True)
+            return
+        parts = custom_id.split(":")
+        user_id, guild_id = int(parts[1]), int(parts[2])
+        guild = self.bot.get_guild(guild_id)
+        mention = f"<@{user_id}>"
+        if restore:
+            if guild is not None:
+                await restore_player_roles(self.bot, user_id, guild)
+            db.delete_departure(user_id)
+            await interaction.response.edit_message(
+                content=f"✅ Tout a été restauré pour {mention}.", embed=None, view=None
+            )
+            try:
+                player = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
+                if player is not None:
+                    await player.send("✅ Bon retour ! Tout ce que tu avais a été restauré.")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        else:
+            if guild is not None:
+                await purge_player_completely(self.bot, user_id, guild)
+            db.delete_departure(user_id)
+            await interaction.response.edit_message(
+                content=f"❌ Tout a été supprimé pour {mention}.", embed=None, view=None
+            )
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
@@ -3195,6 +3398,10 @@ class Depart(commands.Cog):
             await handle_fiche_valide(interaction, custom_id)
         elif custom_id.startswith("depart_fiche_refuse:"):
             await handle_fiche_refuse(interaction, custom_id)
+        elif custom_id.startswith("player_return_yes:"):
+            await self.handle_player_return_decision(interaction, custom_id, restore=True)
+        elif custom_id.startswith("player_return_no:"):
+            await self.handle_player_return_decision(interaction, custom_id, restore=False)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):

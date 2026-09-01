@@ -727,8 +727,9 @@ class Banque(commands.Cog):
         generate_pin_image(char["portrait_path"] if char else None, _pin_values(buffer), path)
         return path
 
-    def _build_account_image(self, character_id):
-        """Génère l'image de l'écran de compte, retourne (chemin, AccountView)."""
+    def _build_account_image(self, character_id, readonly=False):
+        """Génère l'image de l'écran de compte, retourne (chemin, view). En lecture seule (readonly),
+        AUCUN bouton n'est proposé (consultation pure d'un compte qui n'est pas le sien)."""
         account = get_account(character_id)
         char = get_character(character_id)
         prenom, nom_clan = _display_names(char)
@@ -741,7 +742,8 @@ class Banque(commands.Cog):
         generate_economie_image(
             prenom, nom_clan, account["solde_courant"], account["solde_livret"], transactions, path
         )
-        return path, AccountView(character_id, account["user_id"])
+        view = None if readonly else AccountView(character_id, account["user_id"])
+        return path, view
 
     # ---------- écran de compte ----------
     async def show_account_screen(self, channel, character_id):
@@ -1008,11 +1010,39 @@ class Banque(commands.Cog):
             return
 
         account = get_account(character_id)
+
+        # 1) Verrou actif : refuse l'accès tant que locked_until est dans le futur.
+        if account and account["locked_until"]:
+            try:
+                locked_until = datetime.fromisoformat(account["locked_until"])
+            except (TypeError, ValueError):
+                locked_until = None
+            if locked_until and locked_until > datetime.utcnow():
+                self.pin_buffers[(user_id, character_id)] = ""
+                heure = locked_until.strftime("%H:%M")
+                embed = discord.Embed(
+                    description=f"🔒 Ce compte est verrouillé jusqu'à {heure}, trop de tentatives échouées.",
+                    color=discord.Color.red(),
+                )
+                await interaction.response.edit_message(
+                    content=None, embed=embed, attachments=[], view=PinErrorView(character_id, user_id)
+                )
+                return
+
         if account and buf == account["pin_code"]:
+            # 3) Code correct : RESET du compteur d'échecs.
             self.pin_buffers[(user_id, character_id)] = ""
+            with db.get_connection() as conn:
+                conn.execute(
+                    "UPDATE bank_accounts SET failed_pin_attempts = 0 WHERE character_id = ?",
+                    (character_id,),
+                )
             set_session(user_id, character_id)
-            # Passe directement à l'écran de compte, sur le même message.
-            path, view = self._build_account_image(character_id)
+            # 4) Accès en LECTURE SEULE si ce n'est pas le compte de l'utilisateur (aucun bouton).
+            char = get_character(character_id)
+            owner_uid = char["user_id"] if char else None
+            readonly = (owner_uid != interaction.user.id)
+            path, view = self._build_account_image(character_id, readonly=readonly)
             await interaction.response.edit_message(
                 content=None, embed=None,
                 attachments=[discord.File(path, filename="compte.png")], view=view,
@@ -1022,8 +1052,33 @@ class Banque(commands.Cog):
             except OSError:
                 pass
         else:
+            # 2) Code FAUX : incrémente le compteur, verrouille au 3e échec.
             self.pin_buffers[(user_id, character_id)] = ""
-            embed = discord.Embed(description="❌ Code incorrect.", color=discord.Color.red())
+            locked_msg = None
+            if account:
+                with db.get_connection() as conn:
+                    conn.execute(
+                        "UPDATE bank_accounts SET failed_pin_attempts = failed_pin_attempts + 1 "
+                        "WHERE character_id = ?",
+                        (character_id,),
+                    )
+                    row = conn.execute(
+                        "SELECT failed_pin_attempts FROM bank_accounts WHERE character_id = ?",
+                        (character_id,),
+                    ).fetchone()
+                    if row and row["failed_pin_attempts"] >= 3:
+                        delai_h = random.choice([1, 2, 3])
+                        locked_until = (datetime.utcnow() + timedelta(hours=delai_h)).isoformat()
+                        conn.execute(
+                            "UPDATE bank_accounts SET locked_until = ?, failed_pin_attempts = 0 "
+                            "WHERE character_id = ?",
+                            (locked_until, character_id),
+                        )
+                        locked_msg = (
+                            f"🔒 Trop de tentatives échouées, ce compte est verrouillé pour {delai_h}h."
+                        )
+            desc = locked_msg if locked_msg else "❌ Code incorrect."
+            embed = discord.Embed(description=desc, color=discord.Color.red())
             await interaction.response.edit_message(
                 content=None, embed=embed, attachments=[], view=PinErrorView(character_id, user_id)
             )

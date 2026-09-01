@@ -3,6 +3,7 @@ import io
 import math
 import os
 import random
+import time
 import uuid
 from datetime import datetime
 
@@ -81,6 +82,8 @@ TECHNIQUE_SORT_PALETTE = [
 TECHNIQUE_VALID_CLASSES = ("4", "3", "2", "1", "S")
 # Seul cet utilisateur précis peut valider une demande de création de techniques (bouton ✅ Confirmer).
 TECHNIQUE_VALIDATOR_ID = 396615332346855428
+# Propriétaire du bot (même identifiant) : seul habilité à modifier un coût encore exprimé en %.
+OWNER_ID = 396615332346855428
 # Sentinelle renvoyée par les helpers de saisie quand le joueur tape « cancel » (distinct de None =
 # timeout). Permet d'annuler le flux de création de techniques à n'importe quelle étape.
 _CANCELLED = object()
@@ -286,14 +289,23 @@ async def get_current_rct_stage(guild, character_id):
 # (energie_occulte_pts / sorts_pts / rct_pts), exactement comme Force/Vitesse/Défense.
 # Plus aucun niveau de maîtrise n'est stocké séparément (colonnes mastery_*_level obsolètes).
 # =====================================================================
+async def get_effective_max_level(character_id, mastery_key, default_max):
+    """Plafond de niveau EFFECTIF d'une Maîtrise pour ce personnage : l'override staff s'il existe
+    (character_mastery_overrides), sinon le plafond par défaut (constante)."""
+    override = db.get_mastery_override(character_id, mastery_key)
+    return override if override is not None else default_max
+
+
 async def get_mastery_eo(character_id) -> tuple:
     total = await get_stat_total(character_id, "energie_occulte")
-    return points_to_level_xp_capped(total, MASTERY_EO_MAX_LEVEL)
+    cap = await get_effective_max_level(character_id, "eo", MASTERY_EO_MAX_LEVEL)
+    return points_to_level_xp_capped(total, cap)
 
 
 async def get_mastery_sort(character_id) -> tuple:
     total = await get_stat_total(character_id, "sorts")
-    return points_to_level_xp_capped(total, MASTERY_SORT_MAX_LEVEL)
+    cap = await get_effective_max_level(character_id, "sort", MASTERY_SORT_MAX_LEVEL)
+    return points_to_level_xp_capped(total, cap)
 
 
 async def get_mastery_rct(guild, character_id) -> tuple:
@@ -301,7 +313,7 @@ async def get_mastery_rct(guild, character_id) -> tuple:
     if stage is None:
         return 1, 0, db.xp_required_for_level(1)  # aucun rôle RCT détecté, comme avant
     total = await get_stat_total(character_id, "rct")
-    max_level = RCT_STAGES[stage]["max_level"]
+    max_level = await get_effective_max_level(character_id, "rct", RCT_STAGES[stage]["max_level"])
     level, xp_actuel, xp_max = points_to_level_xp_capped(total, max_level)
     # Quête de progression débloquée au niveau max du stade (sauf 'avancee', le sommet). Simple flag
     # stocké : AUCUNE notification/DM n'est envoyée — le staff consulte l'info manuellement (RP).
@@ -312,9 +324,10 @@ async def get_mastery_rct(guild, character_id) -> tuple:
 
 async def get_mastery_territoire(character_id) -> tuple:
     """Maîtrise Territoire dérivée des points de stat « territoire », exactement comme EO/Sort/RCT.
-    Retourne (level, xp_actuel, xp_max), plafonnée à MASTERY_TERRITOIRE_MAX_LEVEL."""
+    Retourne (level, xp_actuel, xp_max), plafonnée au plafond effectif (override staff ou constante)."""
     total = await get_stat_total(character_id, "territoire")
-    return points_to_level_xp_capped(total, MASTERY_TERRITOIRE_MAX_LEVEL)
+    cap = await get_effective_max_level(character_id, "territoire", MASTERY_TERRITOIRE_MAX_LEVEL)
+    return points_to_level_xp_capped(total, cap)
 
 
 def compute_territoire_tours(base_tours: int, level: int) -> int:
@@ -359,9 +372,10 @@ ARME_CATEGORY_NAME = "Arme maudite"  # nom EXACT de la catégorie de boutique li
 
 async def get_mastery_arme_maudite(character_id) -> tuple:
     """Maîtrise Arme maudite dérivée des points de stat « armes_maudites », exactement comme les autres.
-    Retourne (level, xp_actuel, xp_max), plafonnée à MASTERY_ARME_MAX_LEVEL."""
+    Retourne (level, xp_actuel, xp_max), plafonnée au plafond effectif (override staff ou constante)."""
     total = await get_stat_total(character_id, "armes_maudites")
-    return points_to_level_xp_capped(total, MASTERY_ARME_MAX_LEVEL)
+    cap = await get_effective_max_level(character_id, "arme", MASTERY_ARME_MAX_LEVEL)
+    return points_to_level_xp_capped(total, cap)
 
 
 async def grant_arme_maudite_xp(character_id: int, xp_gained: int):
@@ -444,6 +458,17 @@ PARAM_ALIASES = {
     "degats_secondaire": ["degats", "dégâts", "degats secondaire"],
     "debloquer_sort_secondaire": ["debloquer sort secondaire", "débloquer sort secondaire"],
     "bloquer_sort_secondaire": ["bloquer sort secondaire", "verrouiller sort secondaire"],
+    "supprimer_sort_principal": ["supprimer sort principal", "supprimer un sort"],
+    "supprimer_tous_les_sorts": ["supprimer tous les sorts", "supprimer toutes les techniques"],
+    # --- Plafond de niveau des Maîtrises (catégorie PROFIL) ---
+    "plafond_niveau": ["plafond de niveau", "plafond niveau"],
+    # --- Armes maudites (staff) ---
+    "nom_arme": ["nom arme"],
+    "image_arme": ["image arme"],
+    "cout_eo_arme": ["coût eo arme", "cout eo arme"],
+    "degats_arme": ["dégâts arme", "degats arme"],
+    "description_arme": ["description arme"],
+    "supprimer_arme": ["supprimer arme"],
     # --- Territoire (déblocage / verrouillage + valeurs de combat, staff) ---
     "territoire_debloquer": ["débloquer", "debloquer"],
     "territoire_bloquer": ["bloquer"],
@@ -457,12 +482,24 @@ TECHNIQUE_EDIT_PARAMS = {
     "ajouter_sort_max", "retirer_sort_max", "debloquer_sort_principal", "bloquer_sort_principal",
     "nom_sort_secondaire", "niveau_requis_secondaire", "cout_eo_secondaire", "degats_secondaire",
     "debloquer_sort_secondaire", "bloquer_sort_secondaire",
+    "supprimer_sort_principal", "supprimer_tous_les_sorts",
 }
 
 # Paramètres du menu staff qui passent par le flux dédié « Territoire ».
 TERRITOIRE_EDIT_PARAMS = {
     "territoire_debloquer", "territoire_bloquer", "territoire_cout_eo", "territoire_duree",
 }
+
+# Paramètres du menu staff qui passent par le flux dédié « Armes maudites ».
+ARME_EDIT_PARAMS = {
+    "nom_arme", "image_arme", "cout_eo_arme", "degats_arme", "description_arme", "supprimer_arme",
+}
+
+# mastery_key -> (fonction de dérivation, constante de plafond par défaut). Sert au « Plafond de niveau ».
+MASTERY_KEYS_LABELS = [
+    ("eo", "Maîtrise EO"), ("sort", "Maîtrise Sort"), ("territoire", "Maîtrise Territoire"),
+    ("rct", "RCT"), ("arme", "Arme Maudite"),
+]
 
 # "stats_X" -> clé de stat (écriture ABSOLUE dans character_stats).
 STATS_PARAM_MAP = {
@@ -824,6 +861,8 @@ class Profil(commands.Cog):
         # Flux "Ajouter/Retirer des rôles" en cours, clés (user_id, character_id) : empêche deux membres
         # du staff de modifier EN MÊME TEMPS les rôles du MÊME personnage (verrou par personnage).
         self._role_flow_locks = set()
+        # Cooldown (mémoire) du déclencheur d'appellation Territoire, par utilisateur : {user_id: timestamp}.
+        self._territoire_cooldowns = {}
 
     # ---------- verrou de flux ----------
     def _acquire(self, *user_ids) -> bool:
@@ -948,28 +987,33 @@ class Profil(commands.Cog):
 
             elif key == "energie_occulte":
                 level, xp_actuel, xp_max = await get_mastery_eo(character_id)
-                tranche = compute_points_manquants(xp_actuel, xp_max, level, MASTERY_EO_MAX_LEVEL)
-                pct = round(xp_actuel / xp_max * 100) if level < MASTERY_EO_MAX_LEVEL else 100
+                cap = await get_effective_max_level(character_id, "eo", MASTERY_EO_MAX_LEVEL)
+                tranche = compute_points_manquants(xp_actuel, xp_max, level, cap)
+                pct = round(xp_actuel / xp_max * 100) if level < cap else 100
 
             elif key == "sorts":
                 level, xp_actuel, xp_max = await get_mastery_sort(character_id)
-                tranche = compute_points_manquants(xp_actuel, xp_max, level, MASTERY_SORT_MAX_LEVEL)
-                pct = round(xp_actuel / xp_max * 100) if level < MASTERY_SORT_MAX_LEVEL else 100
+                cap = await get_effective_max_level(character_id, "sort", MASTERY_SORT_MAX_LEVEL)
+                tranche = compute_points_manquants(xp_actuel, xp_max, level, cap)
+                pct = round(xp_actuel / xp_max * 100) if level < cap else 100
 
             elif key == "rct":
-                # Plafond = max du stade RCT actuel ; sans rôle RCT, aucun plafond atteint (jamais « MAX »).
+                # Plafond = override staff, sinon max du stade RCT actuel ; sans rôle RCT, aucun plafond
+                # atteint (jamais « MAX »).
                 stage = await get_current_rct_stage(guild, character_id)
                 level, xp_actuel, xp_max = await get_mastery_rct(guild, character_id)
-                max_level = RCT_STAGES[stage]["max_level"] if stage else level + 1
-                tranche = compute_points_manquants(xp_actuel, xp_max, level, max_level)
-                pct = round(xp_actuel / xp_max * 100) if level < max_level else 100
+                default_max = RCT_STAGES[stage]["max_level"] if stage else level + 1
+                cap = await get_effective_max_level(character_id, "rct", default_max)
+                tranche = compute_points_manquants(xp_actuel, xp_max, level, cap)
+                pct = round(xp_actuel / xp_max * 100) if level < cap else 100
 
             elif key == "armes_maudites":
-                # Maîtrise Arme maudite dérivée de la stat, plafond MASTERY_ARME_MAX_LEVEL. Même affichage
-                # adaptatif que les autres : « X point(s) manquant(s) » / « MAX » au plafond.
+                # Maîtrise Arme maudite dérivée de la stat. Même affichage adaptatif que les autres :
+                # « X point(s) manquant(s) » / « MAX » au plafond (effectif : override staff ou constante).
                 level, xp_actuel, xp_max = await get_mastery_arme_maudite(character_id)
-                tranche = compute_points_manquants(xp_actuel, xp_max, level, MASTERY_ARME_MAX_LEVEL)
-                pct = round(xp_actuel / xp_max * 100) if level < MASTERY_ARME_MAX_LEVEL else 100
+                cap = await get_effective_max_level(character_id, "arme", MASTERY_ARME_MAX_LEVEL)
+                tranche = compute_points_manquants(xp_actuel, xp_max, level, cap)
+                pct = round(xp_actuel / xp_max * 100) if level < cap else 100
 
             else:
                 # Territoire : système de tranches par palier x10 inchangé.
@@ -1360,6 +1404,152 @@ class Profil(commands.Cog):
         return None
 
     # =================================================================
+    # PLAFOND DE NIVEAU DES MAÎTRISES (staff, par personnage)
+    # =================================================================
+    async def _edit_plafond_niveau(self, channel, staff, character_id):
+        """Fixe un plafond de niveau personnalisé pour une Maîtrise donnée. Retourne True/None."""
+        items = [(key, label) for key, label in MASTERY_KEYS_LABELS]
+        mastery_key = await self._tech_pick_numbered(
+            channel, staff, items, "Pour quelle Maîtrise veux tu fixer un plafond de niveau ?"
+        )
+        if mastery_key is None:
+            return True
+        char = get_character(character_id)
+        nom = char["character_name"] if char else "?"
+        # Plafond : entier ≥ 1 strictement, aucune limite haute (le staff décide librement).
+        await channel.send(f"Quelle est la nouvelle limite de niveau pour {nom} ? (ou « cancel »)")
+        valeur = None
+        while valeur is None:
+            m = await self.wait_message(channel, staff)
+            if m is None or _is_cancel(m.content):
+                return True
+            v = _parse_int(m.content, minimum=1)
+            if v is None or v <= 0:
+                await channel.send("Le plafond doit être d'au moins 1.")
+                continue
+            valeur = v
+        db.set_mastery_override(character_id, mastery_key, valeur)
+        label = dict(MASTERY_KEYS_LABELS)[mastery_key]
+        await channel.send(f"✅ Plafond de niveau de « {label} » fixé à **{valeur}** pour {nom}.")
+        await self.send_stats(channel, character_id, staff.id)
+        return True
+
+    # =================================================================
+    # ÉDITION STAFF DES ARMES MAUDITES
+    # =================================================================
+    async def select_arme_maudite(self, channel, staff, character_id):
+        """Liste les armes du personnage numérotées « Classe {classe} — {nom} », le staff choisit un
+        numéro. Gère « cancel ». Retourne l'id de l'arme, ou None (aucune / annulé / timeout)."""
+        armes = db.get_character_armes(character_id)
+        if not armes:
+            await channel.send("Ce personnage n'a aucune arme maudite.")
+            return None
+        items = [(a["id"], f"Classe {a['classe']} — {a['name']}") for a in armes]
+        return await self._tech_pick_numbered(channel, staff, items, "Quelle arme maudite modifier ?")
+
+    async def _edit_arme_param(self, channel, staff, character_id, param):
+        """Dispatcher des flux d'édition Armes maudites. Retourne True (traité/annulé) ou None (timeout)."""
+        async def refresh(arme_id):
+            arme = db.get_arme(arme_id)
+            if arme is not None:
+                await self._send_arme(channel, character_id, arme)
+            return True
+
+        if param == "nom_arme":
+            arme_id = await self.select_arme_maudite(channel, staff, character_id)
+            if arme_id is None:
+                return True
+            nom = await self._ask_bounded_text(channel, staff, "Nouveau nom de l'arme :", TECHNIQUE_NAME_MAX)
+            if nom is None or nom is _CANCELLED:
+                return True
+            with db.get_connection() as conn:
+                conn.execute("UPDATE character_armes_maudites SET name = ? WHERE id = ?", (nom, arme_id))
+            await channel.send(f"✅ Arme renommée en « {nom} ».")
+            return await refresh(arme_id)
+
+        if param == "image_arme":
+            arme_id = await self.select_arme_maudite(channel, staff, character_id)
+            if arme_id is None:
+                return True
+            image_path = await self._await_and_save_arme_image(channel, staff, character_id)
+            if image_path is None or image_path is _CANCELLED:
+                return True
+            with db.get_connection() as conn:
+                conn.execute("UPDATE character_armes_maudites SET image_path = ? WHERE id = ?",
+                             (image_path, arme_id))
+            await channel.send("✅ Image de l'arme mise à jour.")
+            return await refresh(arme_id)
+
+        if param == "cout_eo_arme":
+            arme_id = await self.select_arme_maudite(channel, staff, character_id)
+            if arme_id is None:
+                return True
+            # VERROU (armes) : le coût d'arme reste conceptuellement un % tant qu'aucune conversion en
+            # nombre fixe n'existe (mécanisme à construire via /technique). Seul l'owner peut donc le
+            # modifier pour l'instant. Système SÉPARÉ de celui des sorts (aucune logique mutualisée).
+            if staff.id != OWNER_ID:
+                await channel.send(
+                    "🔒 Le coût en % ne peut être modifié que par le propriétaire du bot. Une fois "
+                    "converti en nombre fixe (via la future commande /technique), le staff pourra le "
+                    "modifier normalement."
+                )
+                return True
+            valeur = await self._tech_ask_int(
+                channel, staff, "Nouveau coût EO de l'arme, en % de la réserve ?", minimum=0
+            )
+            if valeur is None:
+                return True
+            with db.get_connection() as conn:
+                conn.execute("UPDATE character_armes_maudites SET cout_eo_pct_override = ? WHERE id = ?",
+                             (valeur, arme_id))
+            await channel.send(f"✅ Coût EO de l'arme fixé à **{valeur} %**.")
+            return await refresh(arme_id)
+
+        if param == "degats_arme":
+            arme_id = await self.select_arme_maudite(channel, staff, character_id)
+            if arme_id is None:
+                return True
+            valeur = await self._tech_ask_int(channel, staff, "Nouveau montant de dégâts ?", minimum=1)
+            if valeur is None:
+                return True
+            with db.get_connection() as conn:
+                conn.execute("UPDATE character_armes_maudites SET degats_actuel = ? WHERE id = ?",
+                             (valeur, arme_id))
+            await channel.send(f"✅ Dégâts de l'arme fixés à **{valeur} pts**.")
+            return await refresh(arme_id)
+
+        if param == "description_arme":
+            arme_id = await self.select_arme_maudite(channel, staff, character_id)
+            if arme_id is None:
+                return True
+            desc = await self._ask_bounded_text(channel, staff, "Nouvelle description de l'arme :", ARME_DESC_MAX)
+            if desc is None or desc is _CANCELLED:
+                return True
+            with db.get_connection() as conn:
+                conn.execute("UPDATE character_armes_maudites SET description = ? WHERE id = ?",
+                             (desc, arme_id))
+            await channel.send("✅ Description de l'arme mise à jour.")
+            return await refresh(arme_id)
+
+        if param == "supprimer_arme":
+            arme_id = await self.select_arme_maudite(channel, staff, character_id)
+            if arme_id is None:
+                return True
+            ok = await self._ask_confirm(channel, staff, "Es tu sûr de vouloir supprimer cette arme maudite ?")
+            if not ok:
+                await channel.send("Suppression annulée.")
+                return True
+            with db.get_connection() as conn:
+                conn.execute("DELETE FROM character_armes_maudites WHERE id = ?", (arme_id,))
+            await channel.send(
+                "✅ Arme supprimée. Le joueur pourra en recréer une de cette classe s'il n'a pas atteint "
+                "la limite (elle vient de baisser de 1)."
+            )
+            return True
+
+        return None
+
+    # =================================================================
     # ARMES MAUDITES (bouton 🗡️ Armes maudites) — création liée à l'inventaire
     # =================================================================
     async def _render_arme(self, character_id, arme):
@@ -1370,7 +1560,9 @@ class Profil(commands.Cog):
         bg = db.get_background(character_id)
         background_path = bg["image_path"] if bg else None
         classe = arme["classe"]
-        cout_pct = SPELL_CLASS_VALUES.get(classe, {}).get("cout_pct", 0)
+        # Coût EO : override staff s'il existe, sinon valeur dérivée de la classe.
+        override = arme["cout_eo_pct_override"] if "cout_eo_pct_override" in arme.keys() else None
+        cout_pct = override if override is not None else SPELL_CLASS_VALUES.get(classe, {}).get("cout_pct", 0)
         path = _tmp_profile("arme")
         generate_arme_maudite_image(
             char_name, arme["name"] or "—", classe,
@@ -2048,8 +2240,10 @@ class Profil(commands.Cog):
         """Déclencheur d'activation du Territoire en chat : si un joueur écrit EXACTEMENT l'appellation de
         son territoire (éventuellement suivie d'un numéro de slot pour lever l'ambiguïté), on joue la
         séquence de révélation (appellation -> nom du territoire -> image)."""
-        if message.author.bot or message.guild is None:
+        if message.author.bot:
             return
+        if message.guild is None:
+            return  # message privé (MP), pas de contexte serveur, on ignore silencieusement
         content = message.content.strip()
         # Sortie ULTRA-rapide : le message doit correspondre à une phrase connue (avec ou sans numéro final)
         # pour éviter d'alourdir le traitement de CHAQUE message.
@@ -2072,6 +2266,13 @@ class Profil(commands.Cog):
             target = next((m for m in matches if m["slot_number"] == slot_suffix), None)
             if target is None:
                 return
+
+        # Cooldown de 5 s par utilisateur : évite le spam de la séquence de révélation.
+        now = time.time()
+        last = self._territoire_cooldowns.get(message.author.id, 0)
+        if now - last < 5:
+            return  # cooldown actif, ignore silencieusement
+        self._territoire_cooldowns[message.author.id] = now
 
         # Séquence de révélation.
         await message.channel.send(embed=discord.Embed(title=base_phrase, color=PHOENIX_COLOR))
@@ -2787,7 +2988,7 @@ class Profil(commands.Cog):
     _PARAM_CATEGORY_BLOCKS = [
         ("PROFIL",
          "PV maximum, PV minimum, EO maximum, EO minimum, Level, XP maximum, XP minimum, "
-         "Clan, Rang, Victoires, Défaites, Nuls, Level maîtrise EO, Image, Fond"),
+         "Clan, Rang, Victoires, Défaites, Nuls, Level maîtrise EO, Plafond de niveau, Image, Fond"),
         ("STATS",
          "Stats Force, Stats Vitesse, Stats Endurance, Stats Armes maudites, Stats RCT, "
          "Stats Territoire, Stats Sorts, Stats Énergie occulte, Buff, Points de stats"),
@@ -2795,8 +2996,11 @@ class Profil(commands.Cog):
         ("TECHNIQUES",
          "Nom sort principal, Ajouter XP, Retirer XP, Modifier level, Ajouter sort maximum, "
          "Retirer sort maximum, Débloquer sort principal, Bloquer sort principal, Nom sort secondaire, "
-         "Niveau requis, Coût EO, Dégâts, Débloquer sort secondaire, Bloquer sort secondaire"),
+         "Niveau requis, Coût EO, Dégâts, Débloquer sort secondaire, Bloquer sort secondaire, "
+         "Supprimer sort principal, Supprimer tous les sorts"),
         ("TERRITOIRE", "Débloquer, Bloquer, Coût EO territoire, Durée en tours"),
+        ("ARMES MAUDITES",
+         "Nom arme, Image arme, Coût EO arme, Dégâts arme, Description arme, Supprimer arme"),
     ]
     _PARAM_FOOTER = "\n\nÉcris le nom du paramètre à modifier."
 
@@ -2879,6 +3083,14 @@ class Profil(commands.Cog):
         # Flux dédié Territoire (déblocage / verrouillage).
         if param in TERRITOIRE_EDIT_PARAMS:
             return await self._edit_territoire_param(channel, staff, character_id, param)
+
+        # Flux dédié Armes maudites (nom / image / coût / dégâts / description / suppression).
+        if param in ARME_EDIT_PARAMS:
+            return await self._edit_arme_param(channel, staff, character_id, param)
+
+        # Plafond de niveau des Maîtrises (par personnage).
+        if param == "plafond_niveau":
+            return await self._edit_plafond_niveau(channel, staff, character_id)
 
         if param == "image":
             await channel.send("Envoie la nouvelle image du personnage (JPG/PNG, pièce jointe ou lien, pas de GIF).")
@@ -3005,8 +3217,16 @@ class Profil(commands.Cog):
             items.append((r["id"], f"{r['name']} ({state})"))
         return items
 
+    async def _ask_confirm(self, channel, staff, question) -> bool:
+        """Confirmation Oui/Non par boutons (protection anti double-clic via edit_message). Retourne
+        True (oui), False (non), ou None (timeout). Réutilise ArmeConfirmView."""
+        view = ArmeConfirmView(staff.id)
+        await channel.send(question, view=view)
+        await view.wait()
+        return view.result
+
     async def _edit_technique_param(self, channel, staff, character_id, param):
-        """Dispatcher des 14 flux d'édition Techniques. Retourne True (traité ou annulé proprement) ou
+        """Dispatcher des flux d'édition Techniques. Retourne True (traité ou annulé proprement) ou
         None (timeout : on laisse l'appelant décider — ici on renvoie True pour ne pas casser la session,
         l'annulation étant volontaire ou par inactivité)."""
 
@@ -3207,6 +3427,17 @@ class Profil(commands.Cog):
                                          (threshold + 5, nxt["id"]))
                 await channel.send(f"✅ Niveau requis fixé à {v} (seuils recalculés).")
             elif param == "cout_eo_secondaire":
+                # VERROU (sorts) : tant que le coût est exprimé en % (cout_eo_fixe IS NULL), seul l'owner
+                # peut le modifier. Une fois converti en nombre fixe, n'importe quel staff pourra le faire.
+                sec = next((r for r in db.get_secondary_sorts(sort_id) if r["id"] == sec_id), None)
+                encore_en_pct = sec is None or sec["cout_eo_fixe"] is None
+                if encore_en_pct and staff.id != OWNER_ID:
+                    await channel.send(
+                        "🔒 Le coût en % ne peut être modifié que par le propriétaire du bot. Une fois "
+                        "converti en nombre fixe (via la future commande /technique), le staff pourra le "
+                        "modifier normalement."
+                    )
+                    return True
                 v = await self._tech_ask_int(channel, staff, "Nouveau coût EO (en %) ?", minimum=0)
                 if v is None:
                     return True
@@ -3263,6 +3494,48 @@ class Profil(commands.Cog):
                 conn.execute("UPDATE character_secondary_sorts SET niveau_requis = ? WHERE id = ?", (v, sec_id))
             await channel.send(f"✅ Sort secondaire reverrouillé (niveau requis {v}).")
             return await refresh()
+
+        # ---- Suppressions ----
+        if param == "supprimer_sort_principal":
+            sort_id = await self.select_principal_sort(channel, staff, character_id)
+            if sort_id is None:
+                return True
+            sort = db.get_character_sort(sort_id)
+            nom = sort["name"] if sort else "?"
+            ok = await self._ask_confirm(
+                channel, staff,
+                f"Es tu sûr de vouloir supprimer « {nom} » et tous ses sorts secondaires ?",
+            )
+            if not ok:
+                await channel.send("Suppression annulée.")
+                return True
+            with db.get_connection() as conn:
+                conn.execute("DELETE FROM character_secondary_sorts WHERE sort_id = ?", (sort_id,))
+                conn.execute("DELETE FROM character_sorts WHERE id = ?", (sort_id,))
+            await channel.send(f"✅ Sort principal « {nom} » et ses sorts secondaires supprimés.")
+            return await refresh()
+
+        if param == "supprimer_tous_les_sorts":
+            ok = await self._ask_confirm(
+                channel, staff,
+                "Es tu sûr de vouloir supprimer TOUTES les techniques de ce personnage ? Il pourra "
+                "recréer sa fiche depuis le début.",
+            )
+            if not ok:
+                await channel.send("Suppression annulée.")
+                return True
+            with db.get_connection() as conn:
+                conn.execute(
+                    "DELETE FROM character_secondary_sorts WHERE sort_id IN "
+                    "(SELECT id FROM character_sorts WHERE character_id = ?)",
+                    (character_id,),
+                )
+                conn.execute("DELETE FROM character_sorts WHERE character_id = ?", (character_id,))
+            await channel.send(
+                "✅ Toutes les techniques ont été supprimées, le joueur pourra recréer sa fiche depuis "
+                "zéro au prochain clic sur Technique."
+            )
+            return True
 
         return True
 
@@ -3529,12 +3802,12 @@ class Profil(commands.Cog):
             if category:
                 if add:
                     # Rôle du barème ajouté : (re)synchronise CETTE catégorie sur CE rôle (idempotent).
-                    await sync_role_points(character_id, category, role.id)
+                    await sync_role_points(character_id, category, role.id, bot=self.bot)
                 elif changed:
                     # Retrait effectif d'un rôle du barème : reprise complète des points de CETTE
                     # catégorie (new_role_id=None). Conditionné à `changed` pour ne PAS remettre à zéro
                     # une catégorie quand le rôle retiré n'appartenait pas réellement au personnage.
-                    await sync_role_points(character_id, category, None)
+                    await sync_role_points(character_id, category, None, bot=self.bot)
 
         # 6) Récapitulatif (mentionne les rôles ignorés car déjà dans l'état voulu).
         verbe_pp = "ajouté(s)" if add else "retiré(s)"
@@ -3571,7 +3844,7 @@ class Profil(commands.Cog):
         with db.get_connection() as conn:
             conn.execute("UPDATE validated_characters SET clan = ? WHERE id = ?", (key, character_id))
         # 3) Resynchronise les points de stats de la catégorie clan.
-        await sync_role_points(character_id, "clan", new_role_id)
+        await sync_role_points(character_id, "clan", new_role_id, bot=self.bot)
         await channel.send(f"✅ Clan = {key.capitalize() if key != 'sans_clan' else 'Sans clan'} "
                            "(rôle et points de stats mis à jour).")
         await self.send_profile(channel, character_id, staff.id)
@@ -3601,7 +3874,7 @@ class Profil(commands.Cog):
         with db.get_connection() as conn:
             conn.execute("UPDATE validated_characters SET grade = ? WHERE id = ?", (val, character_id))
         if new_role_id is not None:
-            await sync_role_points(character_id, "grade", new_role_id)
+            await sync_role_points(character_id, "grade", new_role_id, bot=self.bot)
             await channel.send(f"✅ Rang = {val} (rôle et points de stats mis à jour).")
         else:
             # Grade libre hors barème : on met à jour le texte sans toucher aux rôles ni aux points.

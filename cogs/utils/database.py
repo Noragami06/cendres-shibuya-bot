@@ -181,7 +181,9 @@ CREATE TABLE IF NOT EXISTS bank_accounts (
     created_at TEXT,
     is_at_risk INTEGER DEFAULT 0,
     deletion_deadline TEXT,
-    last_savings_trigger_at TEXT        -- dernier déclenchement de l'épargne auto (fenêtre glissante 3h)
+    last_savings_trigger_at TEXT,       -- dernier déclenchement de l'épargne auto (fenêtre glissante 3h)
+    failed_pin_attempts INTEGER DEFAULT 0,  -- tentatives de code erronées consécutives
+    locked_until TEXT                   -- compte verrouillé jusqu'à cette date ISO (trop d'échecs)
 );
 
 CREATE TABLE IF NOT EXISTS bank_sessions (
@@ -368,7 +370,17 @@ CREATE TABLE IF NOT EXISTS character_armes_maudites (
     description TEXT,
     image_path TEXT,
     degats_base INTEGER,  -- tiré une fois à la création, dans la fourchette de sa classe
-    degats_actuel INTEGER
+    degats_actuel INTEGER,
+    cout_eo_pct_override INTEGER DEFAULT NULL  -- coût EO % forcé par le staff ; NULL = dérivé de la classe
+);
+
+-- Plafonds de niveau des Maîtrises modifiables PAR PERSONNAGE (staff). Absence de ligne = plafond par
+-- défaut (constante). mastery_key ∈ 'eo','sort','territoire','rct','arme'.
+CREATE TABLE IF NOT EXISTS character_mastery_overrides (
+    character_id INTEGER,
+    mastery_key TEXT,
+    max_level_override INTEGER,
+    PRIMARY KEY (character_id, mastery_key)
 );
 
 -- Barème : points de stats accordés par rôle (camp / clan / grade).
@@ -493,6 +505,15 @@ CREATE TABLE IF NOT EXISTS fiche_record (
     eo_value INTEGER
 );
 
+-- Départs de joueurs mis EN RÉSERVE 15 jours avant purge définitive (au lieu d'une suppression immédiate).
+-- awaiting_owner_decision = 1 gèle la purge (le joueur est revenu, l'owner doit trancher).
+CREATE TABLE IF NOT EXISTS player_departures (
+    user_id INTEGER PRIMARY KEY,
+    guild_id INTEGER,
+    departed_at TEXT,
+    awaiting_owner_decision INTEGER DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS educator_contracts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id TEXT,                   -- regroupe les contrats créés en une seule fois (validation groupée)
@@ -600,6 +621,8 @@ _BANK_EXTRA_COLUMNS = [
     ("is_at_risk", "INTEGER DEFAULT 0"),
     ("deletion_deadline", "TEXT"),
     ("last_savings_trigger_at", "TEXT"),
+    ("failed_pin_attempts", "INTEGER DEFAULT 0"),
+    ("locked_until", "TEXT"),
 ]
 
 
@@ -818,6 +841,15 @@ def _seed_role_point_values(conn):
     )
 
 
+def _ensure_character_armes_maudites_columns(conn):
+    """Ajoute cout_eo_pct_override (coût EO % forcé par le staff) à une table préexistante."""
+    cols = _column_names(conn, "character_armes_maudites")
+    if not cols:
+        return
+    if "cout_eo_pct_override" not in cols:
+        conn.execute("ALTER TABLE character_armes_maudites ADD COLUMN cout_eo_pct_override INTEGER DEFAULT NULL")
+
+
 def _ensure_character_territoire_columns(conn):
     """Ajoute les colonnes du système Territoire complet (appellation, image, verrouillage) à une table
     character_territoire préexistante (créée à l'origine sans ces colonnes)."""
@@ -875,6 +907,7 @@ def init_db():
         _ensure_character_sorts_columns(conn)
         _ensure_character_secondary_sorts_columns(conn)
         _ensure_character_territoire_columns(conn)
+        _ensure_character_armes_maudites_columns(conn)
         _seed_role_point_values(conn)
         _ensure_salary_columns(conn)
         _ensure_tickets_columns(conn)
@@ -1365,7 +1398,8 @@ def sync_role_points(character_id: int, category: str, new_role_id: int = None):
     - new_role_id NON None mais absent du barème : la fonction ne fait STRICTEMENT rien (le delta doit
       toujours reposer sur des valeurs connues du barème). Tout en une transaction."""
     if category not in _ROLE_POINT_CATEGORIES:
-        return
+        return 0
+    remaining_debt = 0  # dette NOUVELLEMENT ajoutée à points_debt (pour notifier le joueur en amont)
     with get_connection() as conn:
         if new_role_id is None:
             new_points = 0  # retrait sans remplacement : aucun lookup, la référence passera à NULL
@@ -1419,6 +1453,7 @@ def sync_role_points(character_id: int, category: str, new_role_id: int = None):
                     "WHERE character_id = ?",
                     (remaining_debt, character_id),
                 )
+                # (remaining_debt renvoyé en fin de fonction pour permettre une notification MP au joueur)
 
         # Mémorise le nouveau rôle de référence + ses points, SANS toucher aux 2 autres catégories.
         conn.execute(
@@ -1429,6 +1464,7 @@ def sync_role_points(character_id: int, category: str, new_role_id: int = None):
             "WHERE character_id = ?",
             (new_role_id, new_points, character_id),
         )
+    return remaining_debt
 
 
 def characters_without_role_point_grant():
@@ -1619,8 +1655,8 @@ def get_character_armes(character_id: int):
     de création côté joueur n'existe encore (comme les techniques à leurs débuts)."""
     with get_connection() as conn:
         return conn.execute(
-            "SELECT id, name, classe, description, image_path, degats_base, degats_actuel "
-            "FROM character_armes_maudites WHERE character_id = ? ORDER BY id",
+            "SELECT id, name, classe, description, image_path, degats_base, degats_actuel, "
+            "cout_eo_pct_override FROM character_armes_maudites WHERE character_id = ? ORDER BY id",
             (character_id,),
         ).fetchall()
 
@@ -1689,10 +1725,31 @@ def get_arme(arme_id: int):
     """Une arme maudite précise par son id, ou None."""
     with get_connection() as conn:
         return conn.execute(
-            "SELECT id, character_id, name, classe, description, image_path, degats_base, degats_actuel "
-            "FROM character_armes_maudites WHERE id = ?",
+            "SELECT id, character_id, name, classe, description, image_path, degats_base, degats_actuel, "
+            "cout_eo_pct_override FROM character_armes_maudites WHERE id = ?",
             (arme_id,),
         ).fetchone()
+
+
+def get_mastery_override(character_id: int, mastery_key: str):
+    """Plafond de niveau forcé (staff) pour une Maîtrise d'un personnage, ou None si aucun override."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT max_level_override FROM character_mastery_overrides "
+            "WHERE character_id = ? AND mastery_key = ?",
+            (character_id, mastery_key),
+        ).fetchone()
+    return row["max_level_override"] if row else None
+
+
+def set_mastery_override(character_id: int, mastery_key: str, max_level_override: int):
+    """Fixe (ou remplace) le plafond de niveau d'une Maîtrise pour un personnage."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO character_mastery_overrides "
+            "(character_id, mastery_key, max_level_override) VALUES (?, ?, ?)",
+            (character_id, mastery_key, max_level_override),
+        )
 
 
 def get_character_sort(sort_id: int):
@@ -2393,6 +2450,63 @@ def set_bot_state(key: str, value: str):
         conn.execute(
             "INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)", (key, value)
         )
+
+
+def record_departure(user_id: int, guild_id: int, departed_at: str):
+    """Enregistre (ou RÉINITIALISE) un départ frais : timer à `departed_at`, awaiting_owner_decision=0.
+    À utiliser sur un vrai on_member_remove (le joueur vient de partir)."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO player_departures "
+            "(user_id, guild_id, departed_at, awaiting_owner_decision) VALUES (?, ?, ?, 0)",
+            (user_id, guild_id, departed_at),
+        )
+
+
+def ensure_departure(user_id: int, guild_id: int, departed_at: str):
+    """Crée une ligne de départ SEULEMENT si aucune n'existe (ne réinitialise ni le timer ni le gel).
+    À utiliser au rattrapage de démarrage pour les joueurs déjà absents."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO player_departures "
+            "(user_id, guild_id, departed_at, awaiting_owner_decision) VALUES (?, ?, ?, 0)",
+            (user_id, guild_id, departed_at),
+        )
+
+
+def get_departure(user_id: int, guild_id: int):
+    """Ligne de départ d'un joueur sur un serveur (ou None)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT user_id, guild_id, departed_at, awaiting_owner_decision "
+            "FROM player_departures WHERE user_id = ? AND guild_id = ?",
+            (user_id, guild_id),
+        ).fetchone()
+
+
+def set_departure_awaiting(user_id: int):
+    """Gèle la purge (le joueur est revenu, décision de l'owner en attente)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE player_departures SET awaiting_owner_decision = 1 WHERE user_id = ?", (user_id,)
+        )
+
+
+def delete_departure(user_id: int):
+    """Supprime la trace de départ (retour validé, purge effectuée, ou décision tranchée)."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM player_departures WHERE user_id = ?", (user_id,))
+
+
+def get_departures_to_purge(cutoff_iso: str):
+    """Départs éligibles à la purge : non gelés (awaiting=0) ET partis depuis au moins 15 jours
+    (departed_at <= cutoff_iso). Retourne (user_id, guild_id)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT user_id, guild_id FROM player_departures "
+            "WHERE awaiting_owner_decision = 0 AND departed_at <= ?",
+            (cutoff_iso,),
+        ).fetchall()
 
 
 def set_fiche_record(character_id: int, eo_value):
