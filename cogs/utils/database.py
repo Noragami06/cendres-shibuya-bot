@@ -1627,6 +1627,67 @@ def add_arme_degats(arme_id: int, bonus: int):
         )
 
 
+def get_arme_category_id():
+    """id de la catégorie de boutique nommée EXACTEMENT « Arme maudite », ou None si elle n'existe pas
+    encore (elle doit être créée manuellement via /shop). Sert à filtrer l'inventaire du joueur."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT id FROM shop_categories WHERE name = 'Arme maudite'"
+        ).fetchone()
+    return row["id"] if row else None
+
+
+def get_inventory_armes(character_id: int, categorie_id: int):
+    """Armes maudites POSSÉDÉES dans l'inventaire (catégorie « Arme maudite », quantité > 0), avec leur
+    classe issue de la définition d'objet. Sert de source pour la création d'une arme."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT ci.item_id, ci.quantity, item.name, item.classe "
+            "FROM character_inventory ci "
+            "JOIN item_definitions item ON item.id = ci.item_id "
+            "WHERE ci.character_id = ? AND item.categorie_id = ? AND ci.quantity > 0 "
+            "ORDER BY item.name",
+            (character_id, categorie_id),
+        ).fetchall()
+
+
+def count_character_armes(character_id: int, classe: str = None) -> int:
+    """Nombre d'armes maudites déjà CRÉÉES par ce personnage, éventuellement filtré par classe."""
+    with get_connection() as conn:
+        if classe is None:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM character_armes_maudites WHERE character_id = ?",
+                (character_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM character_armes_maudites WHERE character_id = ? AND classe = ?",
+                (character_id, classe),
+            ).fetchone()
+    return row["n"]
+
+
+def create_arme_maudite(character_id, name, classe, description, image_path, degats_base):
+    """Crée une arme maudite. degats_actuel démarre à degats_base (tiré une fois à la création)."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO character_armes_maudites (character_id, name, classe, description, image_path, "
+            "degats_base, degats_actuel) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (character_id, name, classe, description, image_path, degats_base, degats_base),
+        )
+        return cur.lastrowid
+
+
+def get_arme(arme_id: int):
+    """Une arme maudite précise par son id, ou None."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT id, character_id, name, classe, description, image_path, degats_base, degats_actuel "
+            "FROM character_armes_maudites WHERE id = ?",
+            (arme_id,),
+        ).fetchone()
+
+
 def get_character_sort(sort_id: int):
     """Un sort PRINCIPAL par son id (character_sorts.id), ou None. Sert à la vue détaillée : on vérifie
     aussi via character_id que le sort appartient bien au personnage du panneau."""

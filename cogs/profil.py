@@ -15,6 +15,7 @@ from cogs.utils import database as db
 from cogs.utils.image_gen import (
     generate_profil_image, generate_stats_image, generate_relations_image, generate_technique_image,
     generate_technique_detail_image, TECHDET_CLASS_COLORS, generate_territoire_image,
+    generate_arme_maudite_image,
 )
 # Barème validé des classes de sorts + stades de Maîtrise RCT + plafonds de maîtrise (source unique
 # partagée avec le check de cohérence).
@@ -34,6 +35,7 @@ from cogs.depart import (
 WAIT_TIMEOUT = 300  # secondes d'attente d'une réponse texte
 BACKGROUND_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "backgrounds")
 TERRITOIRE_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "territoires")
+ARME_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "armes")
 TERRITOIRE_MAX_BYTES = 8 * 1024 * 1024  # 8 Mo : même limite que /réserv-appa (GIF jamais recompressé)
 # Appellations possibles du Territoire (numéro affiché -> TEXTE EXACT stocké en base).
 TERRITOIRE_APPELLATIONS = {
@@ -349,6 +351,10 @@ ARME_DEGATS_PAR_LEVEL = {
     "3": 15, "2": 15,
     "1": 10, "S": 10,
 }
+# Nombre maximum d'armes maudites CRÉÉES par classe (limite de possession par personnage).
+ARME_MAX_PAR_CLASSE = {"4": 3, "3": 2, "2": 2, "1": 1, "S": 1}
+ARME_DESC_MAX = 500                 # description d'une arme maudite
+ARME_CATEGORY_NAME = "Arme maudite"  # nom EXACT de la catégorie de boutique liée
 
 
 async def get_mastery_arme_maudite(character_id) -> tuple:
@@ -569,6 +575,42 @@ class BuffChoiceView(discord.ui.View):
         if not await self._guard(interaction):
             return
         self.result = "remove"
+        await interaction.response.edit_message(view=None)
+        self.stop()
+
+
+class ArmeConfirmView(discord.ui.View):
+    """Deux boutons ✅ Oui / ❌ Non en session (le joueur est déjà dans son flux verrouillé).
+    self.result vaut True (oui) / False (non) / None (timeout)."""
+
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=WAIT_TIMEOUT)
+        self.owner_id = owner_id
+        self.result = None
+        oui = discord.ui.Button(label="Oui", emoji="✅", style=discord.ButtonStyle.success)
+        non = discord.ui.Button(label="Non", emoji="❌", style=discord.ButtonStyle.danger)
+        oui.callback = self._oui
+        non.callback = self._non
+        self.add_item(oui)
+        self.add_item(non)
+
+    async def _guard(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Ce choix ne t'appartient pas.", ephemeral=True)
+            return False
+        return True
+
+    async def _oui(self, interaction):
+        if not await self._guard(interaction):
+            return
+        self.result = True
+        await interaction.response.edit_message(view=None)
+        self.stop()
+
+    async def _non(self, interaction):
+        if not await self._guard(interaction):
+            return
+        self.result = False
         await interaction.response.edit_message(view=None)
         self.stop()
 
@@ -920,10 +962,11 @@ class Profil(commands.Cog):
                 pct = round(xp_actuel / xp_max * 100) if level < max_level else 100
 
             elif key == "armes_maudites":
-                # Jauge fixe pleine, aucun texte sous la barre (système à définir plus tard).
-                pct = 100
-                tranche = ""
-                show_tranche_text = False
+                # Maîtrise Arme maudite dérivée de la stat, plafond MASTERY_ARME_MAX_LEVEL. Même affichage
+                # adaptatif que les autres : « X point(s) manquant(s) » / « MAX » au plafond.
+                level, xp_actuel, xp_max = await get_mastery_arme_maudite(character_id)
+                tranche = compute_points_manquants(xp_actuel, xp_max, level, MASTERY_ARME_MAX_LEVEL)
+                pct = round(xp_actuel / xp_max * 100) if level < MASTERY_ARME_MAX_LEVEL else 100
 
             else:
                 # Territoire : système de tranches par palier x10 inchangé.
@@ -1312,6 +1355,232 @@ class Profil(commands.Cog):
             await channel.send(f"✅ Durée du territoire mise à **{valeur} tours**.")
             return True
         return None
+
+    # =================================================================
+    # ARMES MAUDITES (bouton 🗡️ Armes maudites) — création liée à l'inventaire
+    # =================================================================
+    async def _render_arme(self, character_id, arme):
+        """Construit le pillow d'une arme maudite précise. `arme` : ligne character_armes_maudites."""
+        char = get_character(character_id)
+        char_name = (char["character_name"] if char else None) or "—"
+        portrait_path = char["portrait_path"] if char else None
+        bg = db.get_background(character_id)
+        background_path = bg["image_path"] if bg else None
+        classe = arme["classe"]
+        cout_pct = SPELL_CLASS_VALUES.get(classe, {}).get("cout_pct", 0)
+        path = _tmp_profile("arme")
+        generate_arme_maudite_image(
+            char_name, arme["name"] or "—", classe,
+            f"{cout_pct}% de la réserve", f"{arme['degats_actuel']:,} pts",
+            arme["description"] or "—", arme["image_path"], path,
+            portrait_path=portrait_path, background_path=background_path,
+        )
+        return path
+
+    async def _send_arme(self, channel, character_id, arme):
+        path = await self._render_arme(character_id, arme)
+        await channel.send(file=discord.File(path, filename="arme_maudite.png"))
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    async def handle_armes(self, interaction, cid):
+        _, character_id, user_id = cid.split(":")  # profil_todo_armes:{cid}:{uid}
+        character_id, user_id = int(character_id), int(user_id)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
+            return
+
+        # La catégorie d'inventaire « Arme maudite » doit exister (créée via /shop) pour lier possession et
+        # création. TODO : La catégorie 'Arme maudite' doit être créée manuellement via /shop avant que ce
+        # flux fonctionne.
+        categorie_id = db.get_arme_category_id()
+        if categorie_id is None:
+            await interaction.response.send_message(
+                "🔧 La catégorie « Arme maudite » n'existe pas encore côté boutique — préviens le staff.",
+                ephemeral=True,
+            )
+            return
+
+        inventaire_armes = db.get_inventory_armes(character_id, categorie_id)
+        if not inventaire_armes:
+            await interaction.response.send_message(
+                "❌ Tu ne possèdes aucune arme maudite dans ton inventaire.", ephemeral=True
+            )
+            return
+
+        if not self._acquire(user_id):
+            await interaction.response.send_message(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True
+            )
+            return
+        try:
+            await interaction.response.defer()
+            await self._run_arme_flow(interaction.channel, interaction.user, character_id, inventaire_armes)
+        finally:
+            self._release(user_id)
+
+    async def _run_arme_flow(self, channel, player, character_id, inventaire_armes):
+        """Point d'entrée après clic : liste les armes déjà créées (choix voir / créer), sinon propose la
+        création. Isolation déjà posée par l'appelant."""
+        existantes = db.get_character_armes(character_id)
+
+        # §6 : si PLUSIEURS armes déjà créées, on liste d'abord (voir une arme précise, ou « créer »).
+        if len(existantes) >= 2:
+            veut_creer = await self._arme_list_or_create(channel, player, character_id, existantes)
+            if not veut_creer:
+                return  # a vu une arme, annulé, ou timeout : rien d'autre à faire
+        else:
+            # 0 ou 1 arme créée : propose directement la création (boutons ✅ Oui / ❌ Non).
+            n = len(existantes)
+            view = ArmeConfirmView(player.id)
+            await channel.send(
+                f"Tu as {n} arme(s) maudite(s). Veux tu en créer une ?", view=view
+            )
+            await view.wait()
+            if view.result is None:
+                await channel.send("⏳ Délai dépassé.")
+                return
+            if view.result is False:
+                await channel.send("Opération annulée.")
+                return
+
+        await self._run_arme_creation(channel, player, character_id, inventaire_armes)
+
+    async def _arme_list_or_create(self, channel, player, character_id, existantes) -> bool:
+        """Affiche les armes créées, numérotées. Le joueur répond un numéro pour VOIR le pillow, ou
+        « créer » pour lancer une création. Retourne True s'il veut créer, False sinon (vu / cancel / timeout)."""
+        lines = "\n".join(
+            f"**{i + 1}.** {a['name']} — Classe {a['classe']} ({a['degats_actuel']:,} pts)"
+            for i, a in enumerate(existantes)
+        )
+        await channel.send(embed=discord.Embed(
+            title="🗡️ Tes armes maudites",
+            description=lines + "\n\nRéponds avec un **numéro** pour voir une arme, ou « **créer** » "
+                                "pour en créer une nouvelle (ou « cancel »).",
+            color=PHOENIX_COLOR,
+        ))
+        while True:
+            m = await self.wait_message(channel, player)
+            if m is None or _is_cancel(m.content):
+                return False
+            txt = m.content.strip().lower()
+            if txt in ("créer", "creer"):
+                return True
+            if txt.isdigit() and 1 <= int(txt) <= len(existantes):
+                await self._send_arme(channel, character_id, existantes[int(txt) - 1])
+                return False
+            await channel.send(f"Réponds avec un numéro entre 1 et {len(existantes)}, « créer » ou « cancel ».")
+
+    async def _run_arme_creation(self, channel, player, character_id, inventaire_armes):
+        """Questionnaire de création d'une arme maudite (isolation déjà posée). « cancel » à chaque étape."""
+        async def _stop(result) -> bool:
+            if result is _CANCELLED:
+                await channel.send("❌ Création d'arme maudite annulée.")
+                return True
+            if result is None:
+                await channel.send("⏳ Création annulée (aucune réponse).")
+                return True
+            return False
+
+        # §3 : déterminer la classe depuis l'inventaire. Si plusieurs armes DIFFÉRENTES, demander laquelle.
+        distinctes = {a["item_id"]: a for a in inventaire_armes}
+        if len(distinctes) == 1:
+            arme_inv = inventaire_armes[0]
+        else:
+            items = [(a["item_id"], f"{a['name']} — Classe {a['classe']}") for a in inventaire_armes]
+            choix_id = await self._tech_pick_numbered(
+                channel, player, items,
+                "Quelle arme de ton inventaire veux tu utiliser pour cette création ?",
+            )
+            if choix_id is None:
+                await channel.send("❌ Création d'arme maudite annulée.")
+                return
+            arme_inv = next(a for a in inventaire_armes if a["item_id"] == choix_id)
+        classe = arme_inv["classe"]
+        if classe not in SPELL_CLASS_VALUES:
+            await channel.send(f"❌ Classe d'arme « {classe} » invalide, impossible de créer cette arme.")
+            return
+
+        # Limite par classe.
+        deja = db.count_character_armes(character_id, classe)
+        if deja >= ARME_MAX_PAR_CLASSE.get(classe, 0):
+            await channel.send(
+                f"❌ Tu as déjà atteint la limite de {ARME_MAX_PAR_CLASSE.get(classe, 0)} arme(s) "
+                f"maudite(s) de Classe {classe}."
+            )
+            return
+
+        # §4 : questionnaire.
+        nom = await self._ask_bounded_text(channel, player, "Quel est le nom de ton arme maudite ?", TECHNIQUE_NAME_MAX)
+        if await _stop(nom):
+            return
+        await channel.send(f"📋 Cette arme sera de Classe {classe}.")
+        description = await self._ask_bounded_text(
+            channel, player, "Décris la capacité de ton arme (500 caractères max).", ARME_DESC_MAX
+        )
+        if await _stop(description):
+            return
+        image_path = await self._await_and_save_arme_image(channel, player, character_id)
+        if await _stop(image_path):
+            return
+
+        # §5 : dégâts de base tirés dans la fourchette de la classe, puis écriture.
+        degats_min = SPELL_CLASS_VALUES[classe]["degats_min"]
+        degats_max = SPELL_CLASS_VALUES[classe]["degats_max"]
+        degats_base = random.randint(degats_min, degats_max)
+        arme_id = db.create_arme_maudite(character_id, nom, classe, description, image_path, degats_base)
+
+        await channel.send("✅ Ton arme maudite a été créée !")
+        await self._send_arme(channel, character_id, db.get_arme(arme_id))
+
+    async def _await_and_save_arme_image(self, channel, player, character_id):
+        """Attend une image STATIQUE (GIF explicitement refusé), la compresse comme les portraits, vérifie
+        l'ouverture PIL, puis sauvegarde. Redemande si invalide. None si timeout ; _CANCELLED si « cancel »."""
+        await channel.send("Envoie l'image de ton arme (PAS de GIF).")
+        os.makedirs(ARME_DIR, exist_ok=True)
+        while True:
+            m = await self.wait_message(channel, player)
+            if m is None:
+                return None
+            if _is_cancel(m.content):
+                return _CANCELLED
+            if not m.attachments:
+                await channel.send("Envoie une **pièce jointe** image (PNG/JPG, pas de GIF).")
+                continue
+            att = m.attachments[0]
+            ctype = (att.content_type or "").split(";")[0].strip().lower()
+            if ctype == "image/gif" or att.filename.lower().endswith(".gif"):
+                await channel.send("❌ Les GIF ne sont pas acceptés ici, envoie une image statique (PNG/JPG).")
+                continue
+            if not ctype.startswith("image/"):
+                await channel.send("❌ Ce fichier n'est pas une image, envoie une image statique (PNG/JPG).")
+                continue
+            try:
+                raw = await att.read()
+                data = compress_portrait(raw, max_dimension=1600, quality=85)
+            except discord.HTTPException:
+                await channel.send("❌ Le téléchargement a échoué, réessaie.")
+                continue
+            except Exception:
+                await channel.send("❌ Ce fichier n'a pas pu être traité, envoie une image valide (PNG/JPG).")
+                continue
+            # Vérification PIL explicite du résultat.
+            try:
+                with Image.open(io.BytesIO(data)) as im:
+                    im.verify()
+            except Exception:
+                await channel.send("❌ Ce fichier n'a pas pu être traité, envoie une image valide (PNG/JPG).")
+                continue
+            dest = os.path.join(ARME_DIR, f"{character_id}_{uuid.uuid4().hex}.jpg")
+            try:
+                with open(dest, "wb") as f:
+                    f.write(data)
+            except OSError:
+                await channel.send("❌ Impossible d'enregistrer le fichier côté serveur, réessaie.")
+                continue
+            return dest
 
     # =================================================================
     # CRÉATION GUIDÉE DES TECHNIQUES (validation staff préalable puis flux guidé côté joueur)
@@ -1850,6 +2119,8 @@ class Profil(commands.Cog):
             await self.handle_rel_remove(interaction, cid)
         elif cid.startswith("profil_todo_territoire:"):
             await self.handle_territoire(interaction, cid)
+        elif cid.startswith("profil_todo_armes:"):
+            await self.handle_armes(interaction, cid)
         elif cid.startswith("profil_todo_"):
             await interaction.response.send_message(
                 "🔧 Cette section n'est pas encore développée.", ephemeral=True
