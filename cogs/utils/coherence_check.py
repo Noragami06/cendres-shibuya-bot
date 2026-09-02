@@ -228,10 +228,13 @@ def _check_eo(depart, errors):
     total = round(sum(float(info.get("pct", 0)) for _, info in items), 4)
     if not pct_sum_ok(total):
         errors.append(f"EO_CLASS_TABLE : somme des % = {total:.2f} (attendu 100).")
+    # Fourchettes contiguës SANS chevauchement : min/max sont inclusifs (random.randint), donc la
+    # classe suivante doit commencer exactement à max + 1 (ex. 40000 -> 40001). Un écart => trou,
+    # une valeur <= max => chevauchement.
     for (k1, i1), (k2, i2) in zip(items, items[1:]):
-        if i1.get("max") != i2.get("min"):
+        if i2.get("min") != i1.get("max") + 1:
             errors.append(
-                f"EO : {k1}.max ({i1.get('max')}) ≠ {k2}.min ({i2.get('min')}) — trou ou chevauchement.")
+                f"EO : {k2}.min ({i2.get('min')}) ≠ {k1}.max ({i1.get('max')}) + 1 — trou ou chevauchement.")
 
 
 def _check_clan_base(depart, errors):

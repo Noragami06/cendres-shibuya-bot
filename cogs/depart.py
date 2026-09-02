@@ -192,11 +192,11 @@ SPELL_TABLE_PARTIAL = {"sort_inne": 40, "sort_heredit": 5, "sort_heredit_partiel
 
 # ---------- Réserve d'énergie occulte ----------
 EO_CLASS_TABLE = {
-    "classe_4": {"min": 100, "max": 1000, "pct": 45},
-    "classe_3": {"min": 1000, "max": 5000, "pct": 30},
-    "classe_2": {"min": 5000, "max": 15000, "pct": 15},
-    "classe_1": {"min": 15000, "max": 40000, "pct": 7},
-    "classe_s": {"min": 40000, "max": 2000000, "pct": 3},
+    "classe_4": {"min": 10000, "max": 40000, "pct": 45},
+    "classe_3": {"min": 40001, "max": 150000, "pct": 30},
+    "classe_2": {"min": 150001, "max": 400000, "pct": 15},
+    "classe_1": {"min": 400001, "max": 900000, "pct": 7},
+    "classe_s": {"min": 900001, "max": 2000000, "pct": 3},
 }
 
 # Fourchette spéciale de la classe S quand elle provient d'un choix manuel (utilisateur privilégié).
@@ -3047,12 +3047,16 @@ async def handle_player_departure(bot, user_id: int, guild):
     RIEN n'est touché en base pendant 15 jours (purge par la tâche planifiée _purge_expired_departures).
     Le départ d'un CHEF D'ORDRE reste géré indépendamment par check_chief_presence (cogs/ordre.py) :
     ce système de réserve/restauration ne concerne jamais l'ordre."""
+    print(f"🔍 [depart] handle_player_departure appelée pour user_id={user_id}")  # DIAG temporaire
     with db.get_connection() as conn:
         characters = conn.execute(
             "SELECT id FROM validated_characters WHERE user_id = ? AND guild_id = ?",
             (user_id, guild.id),
         ).fetchall()
     if not characters:
+        # DIAG temporaire : cause la plus fréquente d'une table player_departures vide -> le joueur
+        # n'avait AUCUN personnage validé, donc rien n'est mis en réserve (comportement voulu).
+        print(f"🔍 [depart] user_id={user_id} sans personnage validé : aucune mise en réserve.")
         return  # rien à faire, ce joueur n'avait pas de personnage
     db.record_departure(user_id, guild.id, datetime.utcnow().isoformat())
 
@@ -3304,6 +3308,7 @@ class Depart(commands.Cog):
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         # Retour d'un joueur mis en réserve.
+        print(f"🔍 [retour] on_member_join déclenché pour {member.id} ({member.name})")  # DIAG temporaire
         if member.bot:
             return
         departure = db.get_departure(member.id, member.guild.id)
@@ -3351,10 +3356,28 @@ class Depart(commands.Cog):
         owner = self.bot.get_user(SPECIAL_USER_ID) or await self.bot.fetch_user(SPECIAL_USER_ID)
         if owner is None:
             return
+
+        # Une décision précédente était-elle DÉJÀ en attente pour ce joueur ? (`departure` a été lu AVANT
+        # freeze_and_extend, il reflète donc l'état d'avant ce retour-ci.) Si oui, désactive son ancien DM
+        # avant d'en créer un nouveau : plus de bouton actif, message annoté « n'est plus valide ».
+        if departure["awaiting_owner_decision"] == 1 and departure["last_decision_message_id"]:
+            try:
+                old_channel = (self.bot.get_channel(departure["last_decision_channel_id"])
+                               or await self.bot.fetch_channel(departure["last_decision_channel_id"]))
+                old_message = await old_channel.fetch_message(departure["last_decision_message_id"])
+                await old_message.edit(
+                    view=None,
+                    content=((old_message.content or "")
+                             + "\n\n⚠️ Cette demande n'est plus valide, une plus récente l'a remplacée."),
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass  # message déjà supprimé ou inaccessible : tant pis, on continue
+
         # §1 : retry sur les erreurs transitoires (HTTPException), jamais sur Forbidden (DMs fermés).
+        sent_message = None
         for tentative in range(3):
             try:
-                await owner.send(embed=embed, view=view)
+                sent_message = await owner.send(embed=embed, view=view)
                 break
             except discord.Forbidden:
                 break  # DMs fermés, rien à faire, accepté tel quel
@@ -3364,6 +3387,10 @@ class Depart(commands.Cog):
                           f"{member.id}.")
                 else:
                     await asyncio.sleep(2)
+
+        # Mémorise le DM réellement envoyé : référence utilisée pour désactiver / rejeter les anciens.
+        if sent_message is not None:
+            db.set_departure_decision_message(member.id, sent_message.id, sent_message.channel.id)
 
     @tasks.loop(hours=6)
     async def departure_purge_loop(self):
@@ -3401,6 +3428,17 @@ class Depart(commands.Cog):
             return
         parts = custom_id.split(":")
         user_id, guild_id = int(parts[1]), int(parts[2])
+
+        # Filet de sécurité : même si la désactivation de l'ancien DM (dans on_member_join) a échoué
+        # silencieusement, un clic sur un VIEUX bouton ne doit jamais agir sur des données périmées.
+        # Seul le dernier DM mémorisé est valide.
+        departure = db.get_departure(user_id, guild_id)
+        if departure is None or departure["last_decision_message_id"] != interaction.message.id:
+            await interaction.response.send_message(
+                "⚠️ Cette demande n'est plus valide (une plus récente existe).", ephemeral=True
+            )
+            return
+
         guild = self.bot.get_guild(guild_id)
         mention = f"<@{user_id}>"
         if restore:

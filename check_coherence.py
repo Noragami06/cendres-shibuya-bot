@@ -89,10 +89,11 @@ def section_eo_classes(depart):
     for key, info in items:
         print(f"  {key:10s} : {info.get('min'):>8} → {info.get('max'):>8}   {info.get('pct')} %")
     print(f"\n  Somme des pourcentages : {total:.2f} %  [{'OK' if pct_sum_ok(total) else '≠ 100 !'}]")
-    print("\n  Chaînage min/max :")
+    # Fourchettes inclusives (random.randint) : la classe suivante commence à max + 1, sans chevauchement.
+    print("\n  Chaînage min/max (contigu, max + 1) :")
     for (k1, i1), (k2, i2) in zip(items, items[1:]):
-        aligned = i1.get("max") == i2.get("min")
-        print(f"      {k1}.max ({i1.get('max')})  vs  {k2}.min ({i2.get('min')})  →  "
+        aligned = i2.get("min") == i1.get("max") + 1
+        print(f"      {k1}.max ({i1.get('max')})  →  {k2}.min ({i2.get('min')})  →  "
               f"{'OK' if aligned else 'TROU/CHEVAUCHEMENT'}")
 
 

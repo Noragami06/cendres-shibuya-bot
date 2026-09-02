@@ -511,7 +511,11 @@ CREATE TABLE IF NOT EXISTS player_departures (
     user_id INTEGER PRIMARY KEY,
     guild_id INTEGER,
     departed_at TEXT,
-    awaiting_owner_decision INTEGER DEFAULT 0
+    awaiting_owner_decision INTEGER DEFAULT 0,
+    -- Référence au DERNIER DM de décision envoyé à l'owner (pour pouvoir le désactiver si un
+    -- retour plus récent le remplace). Le DM vit dans le salon privé propre à cette conversation.
+    last_decision_message_id INTEGER,
+    last_decision_channel_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS educator_contracts (
@@ -864,6 +868,18 @@ def _ensure_character_territoire_columns(conn):
         conn.execute("ALTER TABLE character_territoire ADD COLUMN is_unlocked INTEGER DEFAULT 0")
 
 
+def _ensure_player_departures_columns(conn):
+    """Ajoute les colonnes de référence au dernier DM de décision (message + salon) à une table
+    player_departures préexistante (créée à l'origine sans ces colonnes)."""
+    cols = _column_names(conn, "player_departures")
+    if not cols:
+        return
+    if "last_decision_message_id" not in cols:
+        conn.execute("ALTER TABLE player_departures ADD COLUMN last_decision_message_id INTEGER")
+    if "last_decision_channel_id" not in cols:
+        conn.execute("ALTER TABLE player_departures ADD COLUMN last_decision_channel_id INTEGER")
+
+
 def _ensure_salary_columns(conn):
     """Ajoute is_external / expiry_date à une table order_salaries préexistante (salaires temporaires
     pour un IBAN externe à l'ordre)."""
@@ -909,6 +925,7 @@ def init_db():
         _ensure_character_territoire_columns(conn)
         _ensure_character_armes_maudites_columns(conn)
         _seed_role_point_values(conn)
+        _ensure_player_departures_columns(conn)
         _ensure_salary_columns(conn)
         _ensure_tickets_columns(conn)
         # Unicité de l'IBAN d'ordre (fonctionne aussi sur une base migrée ; NULL multiples autorisés).
@@ -2478,10 +2495,22 @@ def get_departure(user_id: int, guild_id: int):
     """Ligne de départ d'un joueur sur un serveur (ou None)."""
     with get_connection() as conn:
         return conn.execute(
-            "SELECT user_id, guild_id, departed_at, awaiting_owner_decision "
+            "SELECT user_id, guild_id, departed_at, awaiting_owner_decision, "
+            "last_decision_message_id, last_decision_channel_id "
             "FROM player_departures WHERE user_id = ? AND guild_id = ?",
             (user_id, guild_id),
         ).fetchone()
+
+
+def set_departure_decision_message(user_id: int, message_id: int, channel_id: int):
+    """Mémorise le DERNIER DM de décision envoyé à l'owner pour ce joueur, afin de pouvoir le
+    désactiver si un retour plus récent le remplace (et de rejeter un clic sur un vieux bouton)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE player_departures "
+            "SET last_decision_message_id = ?, last_decision_channel_id = ? WHERE user_id = ?",
+            (message_id, channel_id, user_id),
+        )
 
 
 def set_departure_awaiting(user_id: int):
