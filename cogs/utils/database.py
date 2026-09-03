@@ -538,8 +538,10 @@ CREATE TABLE IF NOT EXISTS educator_contracts (
 
 CREATE TABLE IF NOT EXISTS appearance_reservations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    character_id INTEGER,
+    character_id INTEGER,             -- DÉCOUPLÉ : optionnel (NULL), la réservation précède le personnage
     user_id INTEGER,
+    guild_id INTEGER,                 -- clé de référence (avec user_id + slot_number)
+    slot_number INTEGER,             -- slot visé (1/2/3), saisi manuellement, sans personnage validé requis
     nom_original TEXT,
     univers TEXT,
     image_path TEXT,
@@ -868,6 +870,19 @@ def _ensure_character_territoire_columns(conn):
         conn.execute("ALTER TABLE character_territoire ADD COLUMN is_unlocked INTEGER DEFAULT 0")
 
 
+def _ensure_appearance_reservations_columns(conn):
+    """Ajoute guild_id / slot_number à une table appearance_reservations préexistante (créée à l'origine
+    sans ces colonnes). Découple le système de /réserv-appa des personnages validés : la réservation peut
+    désormais exister AVANT le personnage (character_id reste facultatif)."""
+    cols = _column_names(conn, "appearance_reservations")
+    if not cols:
+        return
+    if "guild_id" not in cols:
+        conn.execute("ALTER TABLE appearance_reservations ADD COLUMN guild_id INTEGER")
+    if "slot_number" not in cols:
+        conn.execute("ALTER TABLE appearance_reservations ADD COLUMN slot_number INTEGER")
+
+
 def _ensure_player_departures_columns(conn):
     """Ajoute les colonnes de référence au dernier DM de décision (message + salon) à une table
     player_departures préexistante (créée à l'origine sans ces colonnes)."""
@@ -925,6 +940,7 @@ def init_db():
         _ensure_character_territoire_columns(conn)
         _ensure_character_armes_maudites_columns(conn)
         _seed_role_point_values(conn)
+        _ensure_appearance_reservations_columns(conn)
         _ensure_player_departures_columns(conn)
         _ensure_salary_columns(conn)
         _ensure_tickets_columns(conn)
@@ -3430,15 +3446,29 @@ def delete_validated_character(user_id: int, guild_id: int, slot_number: int) ->
 
 
 # ---------- Réservations d'apparence (/réserv-appa) ----------
-def create_appearance_reservation(character_id, user_id, nom_original, univers, image_path, created_at):
-    """Insère une demande de réservation d'apparence (status='pending'). Retourne son id."""
+def create_appearance_reservation(user_id, guild_id, slot_number, nom_original, univers, image_path, created_at):
+    """Insère une demande de réservation d'apparence (status='pending'). character_id reste NULL : le
+    système est découplé des personnages validés, la clé de référence est (user_id, guild_id, slot_number).
+    Retourne son id."""
     with get_connection() as conn:
         cur = conn.execute(
-            "INSERT INTO appearance_reservations (character_id, user_id, nom_original, univers, "
-            "image_path, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
-            (character_id, user_id, nom_original, univers, image_path, created_at),
+            "INSERT INTO appearance_reservations (character_id, user_id, guild_id, slot_number, "
+            "nom_original, univers, image_path, status, created_at) "
+            "VALUES (NULL, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+            (user_id, guild_id, slot_number, nom_original, univers, image_path, created_at),
         )
         return cur.lastrowid
+
+
+def has_accepted_appearance_reservation(user_id: int, guild_id: int, slot_number: int) -> bool:
+    """Vrai si ce slot a DÉJÀ une apparence validée (status='accepted') pour ce joueur sur ce serveur.
+    Clé de référence du système découplé : user_id + guild_id + slot_number (plus character_id)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT 1 FROM appearance_reservations "
+            "WHERE user_id = ? AND guild_id = ? AND slot_number = ? AND status = 'accepted' LIMIT 1",
+            (user_id, guild_id, slot_number),
+        ).fetchone() is not None
 
 
 def get_appearance_reservation(reservation_id: int):

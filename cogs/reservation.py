@@ -46,29 +46,6 @@ def _is_fiche_staff(member) -> bool:
     return any(r.id == FICHE_STAFF_ROLE_ID for r in getattr(member, "roles", []))
 
 
-def _available_slots(user_id: int, guild_id: int):
-    """Slots du joueur qui n'ont PAS encore d'apparence validée (triés croissant). Sert au message
-    d'erreur listant les slots encore disponibles."""
-    with db.get_connection() as conn:
-        chars = conn.execute(
-            "SELECT id, slot_number FROM validated_characters WHERE user_id = ? AND guild_id = ? "
-            "ORDER BY slot_number ASC",
-            (user_id, guild_id),
-        ).fetchall()
-        if not chars:
-            return []
-        ids = [c["id"] for c in chars]
-        placeholders = ",".join("?" * len(ids))
-        accepted = {
-            r["character_id"] for r in conn.execute(
-                f"SELECT DISTINCT character_id FROM appearance_reservations "
-                f"WHERE status = 'accepted' AND character_id IN ({placeholders})",
-                ids,
-            ).fetchall()
-        }
-    return [c["slot_number"] for c in chars if c["id"] not in accepted]
-
-
 # =====================================================================
 # VUES
 # =====================================================================
@@ -159,18 +136,14 @@ class Reservation(commands.Cog):
         channel = self.bot.get_channel(APPEARANCE_VALIDATED_CHANNEL_ID)
         if channel is None:
             return
-        with db.get_connection() as conn:
-            crow = conn.execute(
-                "SELECT character_name, slot_number FROM validated_characters WHERE id = ?",
-                (res["character_id"],),
-            ).fetchone()
-        name = (crow["character_name"] if crow and crow["character_name"] else "?")
-        slot = crow["slot_number"] if crow else "?"
+        # Système découplé : le slot est porté directement par la réservation (le personnage validé peut
+        # ne pas encore exister), plus besoin de le résoudre via validated_characters.
+        slot = res["slot_number"] if res["slot_number"] is not None else "?"
         mention = f"<@{res['user_id']}>"
         description = (
             f"**Réservation de {mention}**\n\n"
             f"**Joueur :** {mention}\n"
-            f"**Personnage :** {name} (Slot {slot})\n"
+            f"**Slot :** {slot}\n"
             f"**Nom original :** {res['nom_original']}\n"
             f"**Univers :** {res['univers']}")
         embed = discord.Embed(
@@ -214,27 +187,12 @@ class Reservation(commands.Cog):
             return
         slot = personnage.value
 
-        # 4) Validation stricte côté serveur — le personnage existe-t-il dans ce slot ?
-        char = db.get_validated_character_slot(interaction.user.id, interaction.guild.id, slot)
-        if char is None:
+        # Le slot (1/2/3) est saisi manuellement : AUCUNE validation contre validated_characters, le
+        # joueur peut réserver AVANT que son personnage existe. Seul contrôle : ce slot n'a pas déjà une
+        # apparence validée (doublon basé sur user_id + guild_id + slot_number).
+        if db.has_accepted_appearance_reservation(interaction.user.id, interaction.guild.id, slot):
             await interaction.followup.send(
-                f"Tu n'as pas de personnage validé dans le Slot {slot}.", ephemeral=True)
-            return
-        character_id = char["id"]
-        character_name = char["character_name"] or "?"
-
-        # ... et ce slot n'a-t-il pas DÉJÀ une apparence validée ? (avec la liste des slots encore libres)
-        with db.get_connection() as conn:
-            already_validated = conn.execute(
-                "SELECT 1 FROM appearance_reservations WHERE character_id = ? AND status = 'accepted' LIMIT 1",
-                (character_id,),
-            ).fetchone()
-        if already_validated:
-            libres = _available_slots(interaction.user.id, interaction.guild.id)
-            restants = ", ".join(f"Slot {n}" for n in libres) if libres else "aucun"
-            await interaction.followup.send(
-                f"❌ Le Slot {slot} a déjà une apparence validée. Slots encore disponibles pour toi : "
-                f"{restants}.", ephemeral=True)
+                "❌ Ce slot a déjà une apparence validée, choisis en un autre.", ephemeral=True)
             return
 
         # 5) Validation + traitement de l'image selon son TYPE :
@@ -270,7 +228,7 @@ class Reservation(commands.Cog):
                     f"❌ Ce GIF dépasse la limite de 8 Mo ({taille_mo} Mo). Réduis sa taille avant de le "
                     "renvoyer.", ephemeral=True)
                 return
-            filename = f"{character_id}_{uuid.uuid4().hex}.gif"  # GIF conservé tel quel
+            filename = f"{interaction.user.id}_{uuid.uuid4().hex}.gif"  # GIF conservé tel quel
         else:
             # Image statique : téléchargement puis compression (même fonction que les portraits de fiche).
             try:
@@ -286,7 +244,7 @@ class Reservation(commands.Cog):
                     "❌ Impossible de traiter cette image (format non pris en charge ou fichier corrompu). "
                     "Réessaie avec une autre image.", ephemeral=True)
                 return
-            filename = f"{character_id}_{uuid.uuid4().hex}.jpg"  # toujours .jpg après compression
+            filename = f"{interaction.user.id}_{uuid.uuid4().hex}.jpg"  # toujours .jpg après compression
 
         image_path = os.path.join(RESERVATION_DIR, filename)
         try:
@@ -330,11 +288,11 @@ class Reservation(commands.Cog):
 
         # 8) Enregistrement (pending) + envoi de la demande au staff.
         reservation_id = db.create_appearance_reservation(
-            character_id, interaction.user.id, nom_original, univers, image_path, _now())
+            interaction.user.id, interaction.guild.id, slot, nom_original, univers, image_path, _now())
 
         description = (
             f"**Joueur :** {interaction.user.mention}\n"
-            f"**Personnage :** {character_name} (Slot {slot})\n"
+            f"**Slot :** {slot}\n"
             f"**Nom original :** {nom_original}\n"
             f"**Univers :** {univers}")
         if warned:

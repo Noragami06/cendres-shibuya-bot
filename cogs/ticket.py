@@ -144,6 +144,8 @@ class FicheStartView(discord.ui.View):
         embed = discord.Embed(
             title="Instructions",
             description=(
+                "📋 **Avant toute chose, fais `/réserv-appa` pour réserver l'apparence de ton "
+                "personnage — elle doit être validée par le staff avant de pouvoir utiliser `/depart`.**\n\n"
                 "Puisque tu n'as pas de question, voici ce qu'il te faut préparer avant de commencer :\n\n"
                 "- Une image représentant ton personnage\n"
                 "- Un prénom pour ton personnage\n"

@@ -2960,6 +2960,13 @@ class SelectionView(discord.ui.View):
 # quand un personnage est supprimé.
 def delete_character_cascade(character_id):
     """Nettoyage en cascade des données liées à un personnage (banque, inventaire, échanges...)."""
+    # Résous (user_id, guild_id, slot_number) AVANT toute suppression : le système /réserv-appa est
+    # découplé de character_id (réservation possible avant le personnage), sa clé est ce triplet.
+    with db.get_connection() as conn:
+        owner = conn.execute(
+            "SELECT user_id, guild_id, slot_number FROM validated_characters WHERE id = ?",
+            (character_id,),
+        ).fetchone()
     with db.get_connection() as conn:
         # Banque
         conn.execute("DELETE FROM bank_accounts WHERE character_id = ?", (character_id,))
@@ -3034,8 +3041,15 @@ def delete_character_cascade(character_id):
             "DELETE FROM educator_contracts WHERE disciple_character_id = ? OR educator_character_id = ?",
             (character_id, character_id),
         )
-        # Réservations d'apparence (/réserv-appa) liées à ce personnage.
-        conn.execute("DELETE FROM appearance_reservations WHERE character_id = ?", (character_id,))
+        # Réservations d'apparence (/réserv-appa) : découplées de character_id, on nettoie par le triplet
+        # (user_id, guild_id, slot_number) résolu ci-dessus. Ainsi le joueur devra refaire valider une
+        # apparence s'il recrée un personnage sur ce slot.
+        if owner is not None:
+            conn.execute(
+                "DELETE FROM appearance_reservations "
+                "WHERE user_id = ? AND guild_id = ? AND slot_number = ?",
+                (owner["user_id"], owner["guild_id"], owner["slot_number"]),
+            )
 
 
 # =====================================================================
@@ -3250,6 +3264,22 @@ class DepartView(discord.ui.View):
 
     @discord.ui.button(label="Commencer", style=discord.ButtonStyle.success, custom_id="depart_commencer")
     async def commencer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Slot visé = celui choisi à l'écran de sélection (le prochain slot libre), stocké en progression.
+        progress = get_progress(interaction.user.id)
+        target_slot = progress.get("slot_number") if progress else None
+        if not target_slot:
+            await interaction.response.send_message(
+                "❌ Impossible de déterminer le slot. Relance la sélection de personnage.", ephemeral=True)
+            return
+
+        # Blocage : la création de fiche exige une apparence DÉJÀ validée par le staff pour ce slot.
+        if not db.has_accepted_appearance_reservation(
+                interaction.user.id, interaction.guild.id, target_slot):
+            await interaction.response.send_message(
+                f"❌ Tu dois d'abord réserver et faire valider l'apparence de ce personnage via "
+                f"`/réserv-appa` (Slot {target_slot}) avant de pouvoir créer sa fiche.", ephemeral=True)
+            return
+
         # Nouveau message public : l'embed de départ précédent reste intact.
         # Le bouton ne se désactive volontairement jamais : il reste réutilisable indéfiniment.
         await interaction.response.send_message(embed=build_camp_embed(), view=CampView(), ephemeral=False)
