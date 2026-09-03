@@ -3291,6 +3291,56 @@ class DepartView(discord.ui.View):
         await interaction.response.send_message(embed=build_camp_embed(), view=CampView(), ephemeral=False)
 
 
+async def backfill_fiche_message_ids(guild):
+    """Retrouve les embeds de fiche DÉJÀ postés pour les personnages validés AVANT l'ajout de
+    fiche_message_id (colonne NULL), en scannant l'historique du salon des fiches validées et en
+    faisant correspondre le nom du personnage. Coûteux (scan complet) -> à lancer une seule fois.
+
+    Note d'implémentation : l'embed de fiche n'affiche jamais le nom complet « Prénom Nom » de façon
+    contiguë (il rend « Prénom : … » et « Nom : … » sur deux lignes). On teste donc la présence de
+    TOUS les mots du nom dans le titre + la description, plutôt qu'une sous-chaîne exacte qui ne
+    correspondrait jamais pour un nom en deux parties."""
+    with db.get_connection() as conn:
+        characters = conn.execute(
+            "SELECT id, character_name FROM validated_characters "
+            "WHERE fiche_message_id IS NULL AND guild_id = ?",
+            (guild.id,),
+        ).fetchall()
+    if not characters:
+        return
+
+    channel = guild.get_channel(FICHE_VALIDATED_CHANNEL_ID)
+    if channel is None:
+        return
+
+    # nom -> character_id (recherche en un seul passage d'historique).
+    pending = {c["character_name"]: c["id"] for c in characters if c["character_name"]}
+    total = len(pending)
+    found_count = 0
+
+    try:
+        async for message in channel.history(limit=None):
+            if not pending:
+                break  # tous trouvés, inutile de continuer à scanner
+            if not message.embeds:
+                continue
+            embed = message.embeds[0]
+            contenu_complet = (embed.title or "") + (embed.description or "")
+            for nom, character_id in list(pending.items()):
+                mots = [m for m in nom.split() if m]
+                if mots and all(mot in contenu_complet for mot in mots):
+                    db.set_fiche_message_id(character_id, message.id)
+                    del pending[nom]
+                    found_count += 1
+                    break
+    except discord.HTTPException as e:
+        print(f"⚠️ [backfill fiche] Scan interrompu ({e}). {found_count}/{total} retrouvé(s) avant l'arrêt.")
+        return
+
+    print(f"🔍 [backfill fiche] {found_count}/{total} ancien(s) message(s) de fiche retrouvé(s). "
+          f"{len(pending)} introuvable(s) (peut-être supprimé du salon).")
+
+
 # =====================================================================
 # /reroll — correction a posteriori d'une fiche déjà validée (STAFF)
 # =====================================================================
@@ -4163,28 +4213,25 @@ class Depart(commands.Cog):
                     db.set_recompense_trace(character_id, rw.get("type"), rw.get("detail"))
                     changes.append(f"Récompense → **{rw.get('detail')}**")
 
-        # Réédition de l'embed de fiche (une seule fois) dans le salon des fiches validées.
-        await self._reroll_edit_fiche_message(interaction, character_id)
+        # Réédition (ou repostage) de l'embed de fiche, une seule fois. JAMAIS bloquant : la base est
+        # déjà à jour ci-dessus quoi qu'il arrive.
+        status = await self._reroll_refresh_fiche_message(interaction, character_id)
 
         recap = "\n".join(f"• {c}" for c in changes) if changes else "Aucune modification concrète."
+        if status == "reposted":
+            recap += ("\n\nℹ️ L'ancien embed de fiche n'a pas pu être retrouvé/édité, un nouvel embed "
+                      "à jour a été posté à la place.")
+        elif status in ("no_channel", "error"):
+            recap += ("\n\n⚠️ L'embed de fiche n'a pas pu être mis à jour (salon introuvable ou erreur "
+                      "d'envoi) ; les valeurs en base restent à jour.")
         await interaction.channel.send(embed=discord.Embed(
             title="✅ Reroll appliqué",
             description=f"Personnage **{char['character_name']}** (Slot {char['slot_number']}) :\n{recap}",
             color=discord.Color.green()))
 
-    async def _reroll_edit_fiche_message(self, interaction, character_id):
-        """Réédite l'embed du message de fiche (FICHE_VALIDATED_CHANNEL_ID) avec les valeurs à jour."""
-        char = db.get_validated_character_by_id(character_id)
-        if char is None:
-            return
-        msg_id = char["fiche_message_id"]
-        if not msg_id:
-            await interaction.channel.send(
-                "ℹ️ Impossible de rééditer l'embed de fiche : aucun `fiche_message_id` enregistré "
-                "(personnage validé avant l'ajout de cette traçabilité). Les valeurs en base sont à jour.")
-            return
-        # Reconstruit un dict compatible build_fiche_embed : base = progression existante (prénom/âge/
-        # histoire), surchargée par les valeurs AUTORITAIRES de la fiche validée.
+    def _reroll_build_fiche_embed(self, interaction, char):
+        """Reconstruit l'embed de fiche à jour (dict compatible build_fiche_embed) : base = progression
+        existante (prénom/âge/histoire), surchargée par les valeurs AUTORITAIRES de la fiche validée."""
         progress = get_progress(char["user_id"]) or {}
         merged = dict(progress)
         merged.update({
@@ -4198,19 +4245,53 @@ class Depart(commands.Cog):
         })
         guild = interaction.guild
         member = guild.get_member(char["user_id"]) if guild else None
-        embed = build_fiche_embed(merged, guild, member, char["user_id"],
-                                  statut_display="✅ Validée (corrigée)",
-                                  valide_par_display=interaction.user.mention)
+        return build_fiche_embed(merged, guild, member, char["user_id"],
+                                 statut_display="✅ Validée (corrigée)",
+                                 valide_par_display=interaction.user.mention)
+
+    async def _reroll_refresh_fiche_message(self, interaction, character_id):
+        """Met l'embed de fiche à jour SANS jamais bloquer. Retourne un statut :
+        - 'edited'    : l'ancien message a été retrouvé et réédité ;
+        - 'reposted'  : fiche_message_id NULL ou message supprimé -> nouvel embed posté + id mémorisé ;
+        - 'no_channel': salon introuvable (rien posté) ;
+        - 'error'     : échec d'envoi/édition inattendu."""
+        char = db.get_validated_character_by_id(character_id)
+        if char is None:
+            return "no_channel"
         channel = interaction.client.get_channel(FICHE_VALIDATED_CHANNEL_ID)
         if channel is None:
-            return
+            return "no_channel"
+
+        embed = self._reroll_build_fiche_embed(interaction, char)
+
+        # 1) Message existant retrouvable -> édition normale.
+        msg_id = char["fiche_message_id"]
+        if msg_id:
+            try:
+                fiche_msg = await channel.fetch_message(msg_id)
+                await fiche_msg.edit(embed=embed)
+                return "edited"
+            except discord.NotFound:
+                pass  # supprimé entre-temps : on reposte ci-dessous
+            except (discord.Forbidden, discord.HTTPException):
+                return "error"
+
+        # 2) NULL ou supprimé -> NOUVEAU message + mémorisation de son id (pour les futurs rerolls).
+        member = interaction.guild.get_member(char["user_id"]) if interaction.guild else None
+        member_mention = member.mention if member else f"<@{char['user_id']}>"
+        content = f"Voici la fiche de {member_mention}"
+        portrait_path = char["portrait_path"]
+        filename = _fiche_portrait_filename(char["user_id"], char["slot_number"])
         try:
-            fiche_msg = await channel.fetch_message(msg_id)
-            await fiche_msg.edit(embed=embed)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            await interaction.channel.send(
-                "⚠️ Le message d'embed de fiche est introuvable/inaccessible ; les valeurs en base sont "
-                "à jour mais l'embed n'a pas pu être réédité.")
+            if portrait_path and os.path.exists(portrait_path):
+                new_msg = await channel.send(
+                    content=content, embed=embed, file=discord.File(portrait_path, filename=filename))
+            else:
+                new_msg = await channel.send(content=content, embed=embed)
+        except discord.HTTPException:
+            return "error"
+        db.set_fiche_message_id(character_id, new_msg.id)
+        return "reposted"
 
     @app_commands.command(name="reroll",
                           description="Corrige un ou plusieurs éléments de la fiche d'un personnage déjà validé")

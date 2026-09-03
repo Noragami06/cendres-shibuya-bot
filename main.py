@@ -4,7 +4,8 @@ from dotenv import load_dotenv
 import os
 
 from cogs.clans import build_clans_report
-from cogs.depart import retroactive_departure_check, backfill_role_points
+from cogs.depart import retroactive_departure_check, backfill_role_points, backfill_fiche_message_ids
+from cogs.utils.database import get_bot_state, set_bot_state
 from cogs.profil import (
     backfill_pv_system, backfill_secondary_sort_values, backfill_sort_unlock_status,
     backfill_territoire_defaults, backfill_fiche_record,
@@ -52,6 +53,12 @@ async def on_ready():
     # risque à relancer : ne traite que ceux sans ligne dans character_role_point_grants).
     for guild in bot.guilds:
         await backfill_role_points(guild)
+    # Rattrapage UNIQUE des fiche_message_id manquants (personnages validés avant cette colonne) :
+    # scan complet de l'historique du salon des fiches validées, coûteux -> une seule fois par base.
+    if get_bot_state("fiche_message_backfill_done") != "1":
+        for guild in bot.guilds:
+            await backfill_fiche_message_ids(guild)
+        set_bot_state("fiche_message_backfill_done", "1")
     # Rattrapages PV / valeurs de sorts secondaires / statut de déblocage des sorts principaux. Exécutés
     # UNE SEULE FOIS par process (on_ready peut se redéclencher aux reconnexions ; le rattrapage du
     # verrouillage étant un UPDATE inconditionnel, on le protège d'un re-déclenchement).
