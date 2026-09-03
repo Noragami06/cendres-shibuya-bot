@@ -3291,54 +3291,107 @@ class DepartView(discord.ui.View):
         await interaction.response.send_message(embed=build_camp_embed(), view=CampView(), ephemeral=False)
 
 
+def _fiche_message_full_text(message) -> str:
+    """Concatène TOUT le texte exploitable d'un message : contenu brut + chaque champ de ses embeds
+    (titre, description, fields nom/valeur, footer). Sert au matching du rattrapage de fiche."""
+    parts = [message.content or ""]
+    for emb in message.embeds:
+        parts.append(emb.title or "")
+        parts.append(emb.description or "")
+        for f in getattr(emb, "fields", None) or []:
+            parts.append(getattr(f, "name", "") or "")
+            parts.append(getattr(f, "value", "") or "")
+        footer = getattr(emb, "footer", None)
+        if footer is not None:
+            parts.append(getattr(footer, "text", "") or "")
+    return "\n".join(parts)
+
+
 async def backfill_fiche_message_ids(guild):
     """Retrouve les embeds de fiche DÉJÀ postés pour les personnages validés AVANT l'ajout de
-    fiche_message_id (colonne NULL), en scannant l'historique du salon des fiches validées et en
-    faisant correspondre le nom du personnage. Coûteux (scan complet) -> à lancer une seule fois.
+    fiche_message_id (colonne NULL), en scannant l'historique du salon des fiches validées. Coûteux
+    (scan complet) -> à lancer une seule fois.
 
-    Note d'implémentation : l'embed de fiche n'affiche jamais le nom complet « Prénom Nom » de façon
-    contiguë (il rend « Prénom : … » et « Nom : … » sur deux lignes). On teste donc la présence de
-    TOUS les mots du nom dans le titre + la description, plutôt qu'une sous-chaîne exacte qui ne
-    correspondrait jamais pour un nom en deux parties."""
+    Matching robuste (anti-homonymie) : pour chaque message, on CROISE tous les critères disponibles —
+      • NOM par mots : l'embed rend « Prénom : … » / « Nom : … » sur deux lignes, donc le nom complet
+        n'apparaît jamais contigu ; on exige la présence de TOUS les mots du nom dans le texte.
+      • SLOT : le « Slot N » de l'embed doit correspondre au slot_number réel du candidat.
+      • MENTION : si une mention <@ID> figure dans le message, elle doit correspondre au user_id réel.
+    Un message n'est retenu que si EXACTEMENT UN candidat satisfait tous les critères disponibles. Si
+    plusieurs candidats restent indépartageables (vrais homonymes, même slot, sans mention), on
+    n'assigne À AUCUN (fiche_message_id laissé NULL) et on log un avertissement pour vérification
+    manuelle du staff, plutôt que de risquer une mauvaise correspondance."""
     with db.get_connection() as conn:
-        characters = conn.execute(
-            "SELECT id, character_name FROM validated_characters "
+        rows = conn.execute(
+            "SELECT id, character_name, slot_number, user_id FROM validated_characters "
             "WHERE fiche_message_id IS NULL AND guild_id = ?",
             (guild.id,),
         ).fetchall()
-    if not characters:
+    if not rows:
         return
 
     channel = guild.get_channel(FICHE_VALIDATED_CHANNEL_ID)
     if channel is None:
         return
 
-    # nom -> character_id (recherche en un seul passage d'historique).
-    pending = {c["character_name"]: c["id"] for c in characters if c["character_name"]}
+    # Candidats encore à retrouver (retirés au fur et à mesure).
+    pending = []
+    for r in rows:
+        if not r["character_name"]:
+            continue
+        pending.append({
+            "id": r["id"], "name": r["character_name"], "slot": r["slot_number"],
+            "user_id": r["user_id"], "tokens": [m for m in r["character_name"].split() if m],
+        })
     total = len(pending)
     found_count = 0
+    ambiguous = {}  # id -> (name, slot) : candidats rencontrés dans un message indépartageable
 
     try:
         async for message in channel.history(limit=None):
             if not pending:
                 break  # tous trouvés, inutile de continuer à scanner
             if not message.embeds:
-                continue
-            embed = message.embeds[0]
-            contenu_complet = (embed.title or "") + (embed.description or "")
-            for nom, character_id in list(pending.items()):
-                mots = [m for m in nom.split() if m]
-                if mots and all(mot in contenu_complet for mot in mots):
-                    db.set_fiche_message_id(character_id, message.id)
-                    del pending[nom]
-                    found_count += 1
-                    break
+                continue  # une fiche est toujours un embed
+            text = _fiche_message_full_text(message)
+            mentions = {int(x) for x in re.findall(r"<@!?(\d+)>", text)}
+            slot_m = re.search(r"Slot\s+(\d+)", text)
+            embed_slot = int(slot_m.group(1)) if slot_m else None
+
+            # Candidats satisfaisant TOUS les critères disponibles pour CE message.
+            candidates = []
+            for cand in pending:
+                if not (cand["tokens"] and all(t in text for t in cand["tokens"])):
+                    continue  # nom (par mots) obligatoire
+                if embed_slot is not None and cand["slot"] != embed_slot:
+                    continue  # slot présent -> doit concorder
+                if mentions and cand["user_id"] not in mentions:
+                    continue  # mention présente -> doit concorder
+                candidates.append(cand)
+
+            if len(candidates) == 1:
+                cand = candidates[0]
+                db.set_fiche_message_id(cand["id"], message.id)
+                pending.remove(cand)
+                found_count += 1
+            elif len(candidates) > 1:
+                # Ambiguïté réelle : ne rien assigner pour ne pas risquer une mauvaise correspondance.
+                for cand in candidates:
+                    ambiguous[cand["id"]] = (cand["name"], cand["slot"])
     except discord.HTTPException as e:
         print(f"⚠️ [backfill fiche] Scan interrompu ({e}). {found_count}/{total} retrouvé(s) avant l'arrêt.")
         return
 
     print(f"🔍 [backfill fiche] {found_count}/{total} ancien(s) message(s) de fiche retrouvé(s). "
           f"{len(pending)} introuvable(s) (peut-être supprimé du salon).")
+
+    # Avertissement pour les homonymes non départageables restés à NULL (encore dans pending).
+    still_null_ids = {c["id"] for c in pending}
+    restants = [(cid, info) for cid, info in ambiguous.items() if cid in still_null_ids]
+    if restants:
+        details = ", ".join(f"{name} (Slot {slot}, id {cid})" for cid, (name, slot) in restants)
+        print("⚠️ [backfill fiche] Homonymes indépartageables laissés à NULL (vérification manuelle "
+              f"du staff nécessaire) : {details}")
 
 
 # =====================================================================
