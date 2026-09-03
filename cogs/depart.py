@@ -3394,6 +3394,52 @@ async def backfill_fiche_message_ids(guild):
               f"du staff nécessaire) : {details}")
 
 
+async def fix_detached_fiche_images(guild):
+    """Correction rétroactive : réintègre proprement l'image des embeds de fiche qui avaient été
+    repostés avec le portrait DÉTACHÉ (attachment envoyé sans set_image, donc affiché au-dessus de
+    l'embed au lieu d'être dedans). Réédite chaque message concerné avec set_image. Une seule fois
+    (bot_state). À lancer APRÈS backfill_fiche_message_ids (a besoin des fiche_message_id résolus)."""
+    if db.get_bot_state("fiche_image_fix_done") == "1":
+        return
+
+    channel = guild.get_channel(FICHE_VALIDATED_CHANNEL_ID)
+    if channel is None:
+        return
+
+    with db.get_connection() as conn:
+        characters = conn.execute(
+            "SELECT id, fiche_message_id, portrait_path FROM validated_characters "
+            "WHERE fiche_message_id IS NOT NULL AND portrait_path IS NOT NULL AND guild_id = ?",
+            (guild.id,),
+        ).fetchall()
+
+    fixed_count = 0
+    for char in characters:
+        portrait_path = char["portrait_path"]
+        if not (portrait_path and os.path.exists(portrait_path)):
+            continue  # fichier portrait disparu du disque : on ne peut rien réintégrer
+        try:
+            message = await channel.fetch_message(char["fiche_message_id"])
+        except (discord.NotFound, discord.HTTPException):
+            continue
+        if not message.embeds:
+            continue
+        embed = message.embeds[0]
+        if embed.image and embed.image.url:
+            continue  # image déjà correctement intégrée, rien à faire
+        # Image manquante dans l'embed : on la réintègre proprement (remplace les pièces jointes).
+        file = discord.File(portrait_path, filename="portrait.png")
+        embed.set_image(url="attachment://portrait.png")
+        try:
+            await message.edit(embed=embed, attachments=[file])
+            fixed_count += 1
+        except discord.HTTPException:
+            continue
+
+    db.set_bot_state("fiche_image_fix_done", "1")
+    print(f"🔍 [fix images] {fixed_count} embed(s) corrigé(s) (image réintégrée proprement).")
+
+
 # =====================================================================
 # /reroll — correction a posteriori d'une fiche déjà validée (STAFF)
 # =====================================================================
@@ -4144,7 +4190,11 @@ class Depart(commands.Cog):
                 return {"cat": "noop"}
             cd = classe.replace("classe_", "").upper()
             while True:
-                value = _draw_reroll_eo_value(classe)
+                if char["user_id"] == SPECIAL_USER_ID:
+                    lo, hi = random.choice([(1850000, 2000000), (1950000, 2000000)])
+                    value = random.randint(lo, hi)
+                else:
+                    value = _draw_reroll_eo_value(classe)
                 emb = discord.Embed(
                     title="🔁 Reroll — Quantité de l'EO",
                     description=f"Classe actuelle (inchangée) : **{cd}**\n"
@@ -4168,7 +4218,8 @@ class Depart(commands.Cog):
                         title="❤️‍🩹 Tentative de RCT",
                         description=f"🔎 Analyse en cours {dots}".rstrip(), color=discord.Color.red()))
                     await asyncio.sleep(1)
-                success = random.random() < 0.01  # 1% — jamais falsifié
+                seuil_reussite = 45 if char["user_id"] == SPECIAL_USER_ID else 1
+                success = random.randint(1, 100) <= seuil_reussite  # vrai tirage, seul le seuil varie
                 label = "Maîtrisé ✅" if success else "Non maîtrisé ❌"
                 emb = discord.Embed(
                     title="❤️‍🩹 Résultat du RCT", description=f"Résultat : **{label}**",
@@ -4334,11 +4385,13 @@ class Depart(commands.Cog):
         member_mention = member.mention if member else f"<@{char['user_id']}>"
         content = f"Voici la fiche de {member_mention}"
         portrait_path = char["portrait_path"]
-        filename = _fiche_portrait_filename(char["user_id"], char["slot_number"])
         try:
             if portrait_path and os.path.exists(portrait_path):
-                new_msg = await channel.send(
-                    content=content, embed=embed, file=discord.File(portrait_path, filename=filename))
+                # set_image AVANT l'envoi, avec un attachment:// dont le nom correspond EXACTEMENT au
+                # filename de discord.File -> l'image est intégrée DANS l'embed (jamais détachée au-dessus).
+                file = discord.File(portrait_path, filename="portrait.png")
+                embed.set_image(url="attachment://portrait.png")
+                new_msg = await channel.send(content=content, embed=embed, file=file)
             else:
                 new_msg = await channel.send(content=content, embed=embed)
         except discord.HTTPException:

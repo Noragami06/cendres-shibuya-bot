@@ -4,7 +4,10 @@ from dotenv import load_dotenv
 import os
 
 from cogs.clans import build_clans_report
-from cogs.depart import retroactive_departure_check, backfill_role_points, backfill_fiche_message_ids
+from cogs.depart import (
+    retroactive_departure_check, backfill_role_points, backfill_fiche_message_ids,
+    fix_detached_fiche_images,
+)
 from cogs.utils.database import get_bot_state, set_bot_state
 from cogs.profil import (
     backfill_pv_system, backfill_secondary_sort_values, backfill_sort_unlock_status,
@@ -59,6 +62,10 @@ async def on_ready():
         for guild in bot.guilds:
             await backfill_fiche_message_ids(guild)
         set_bot_state("fiche_message_backfill_done", "1")
+    # Correction rétroactive UNIQUE des embeds de fiche à image détachée (après le backfill des ids,
+    # dont elle dépend). Sa propre clé bot_state 'fiche_image_fix_done' évite tout re-scan.
+    for guild in bot.guilds:
+        await fix_detached_fiche_images(guild)
     # Rattrapages PV / valeurs de sorts secondaires / statut de déblocage des sorts principaux. Exécutés
     # UNE SEULE FOIS par process (on_ready peut se redéclencher aux reconnexions ; le rattrapage du
     # verrouillage étant un UPDATE inconditionnel, on le protège d'un re-déclenchement).
