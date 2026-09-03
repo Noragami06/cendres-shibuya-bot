@@ -117,7 +117,10 @@ CREATE TABLE IF NOT EXISTS validated_characters (
     grade TEXT,
     rct INTEGER DEFAULT 0,
     portrait_path TEXT,
-    validated_at TEXT
+    validated_at TEXT,
+    fiche_message_id INTEGER,        -- id du message d'embed posté dans FICHE_VALIDATED_CHANNEL_ID (édité par /reroll)
+    recompense_type TEXT,            -- traçabilité de la récompense de départ (clé : argent / xp / relique_X / ...)
+    recompense_detail TEXT           -- détail lisible + montant/quantité (pour retrait exact au reroll)
 );
 
 CREATE TABLE IF NOT EXISTS depart_character_progress (
@@ -143,6 +146,7 @@ CREATE TABLE IF NOT EXISTS depart_character_progress (
     parchemins_nature INTEGER DEFAULT 0,
     rct INTEGER DEFAULT 0,
     recompense TEXT,
+    recompense_type TEXT,
     argent_recompense INTEGER DEFAULT 0,
     nom TEXT,
     prenom TEXT,
@@ -601,6 +605,7 @@ _PROGRESS_EXTRA_COLUMNS = [
     ("parchemins_nature", "INTEGER DEFAULT 0"),
     ("rct", "INTEGER DEFAULT 0"),
     ("recompense", "TEXT"),
+    ("recompense_type", "TEXT"),
     ("argent_recompense", "INTEGER DEFAULT 0"),
     ("nom", "TEXT"),
     ("prenom", "TEXT"),
@@ -620,6 +625,9 @@ _VALIDATED_EXTRA_COLUMNS = [
     ("hybride_type", "TEXT"),
     ("grade", "TEXT"),
     ("rct", "INTEGER DEFAULT 0"),
+    ("fiche_message_id", "INTEGER"),
+    ("recompense_type", "TEXT"),
+    ("recompense_detail", "TEXT"),
 ]
 
 # Colonnes de bank_accounts ajoutées après coup.
@@ -1238,7 +1246,7 @@ _PROGRESS_SCALAR_COLS = (
     "sera_heritier", "grade_choisi", "eo_classe", "eo_value", "nature",
     "reroll_rct_charges", "reroll_energie_charges",
     "parchemins_territoire", "parchemins_rct", "parchemins_nature", "rct",
-    "recompense", "argent_recompense", "nom", "prenom", "age", "histoire", "portrait_path",
+    "recompense", "recompense_type", "argent_recompense", "nom", "prenom", "age", "histoire", "portrait_path",
     "fiche_status", "fiche_stage", "fiche_deadline", "fiche_question_msg_id", "origin_channel_id",
 )
 
@@ -1279,6 +1287,7 @@ def get_character_progress(user_id: int) -> dict:
         "parchemins_nature": row["parchemins_nature"] or 0,
         "rct": row["rct"] or 0,
         "recompense": row["recompense"],
+        "recompense_type": row["recompense_type"],
         "argent_recompense": row["argent_recompense"] or 0,
         "nom": row["nom"],
         "prenom": row["prenom"],
@@ -1320,6 +1329,78 @@ def insert_validated_character(user_id, guild_id, slot_number, discord_username,
              camp, clan, sort, eo_classe, eo_value, nature, hybride_type, grade, rct,
              portrait_path, validated_at),
         )
+
+
+def get_validated_character_by_id(character_id: int):
+    """Ligne complète d'un personnage validé (ou None)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM validated_characters WHERE id = ?", (character_id,)
+        ).fetchone()
+
+
+def get_validated_characters_for_user(user_id: int, guild_id: int):
+    """Tous les personnages validés d'un joueur sur un serveur (triés par slot). Sert au menu /reroll."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM validated_characters WHERE user_id = ? AND guild_id = ? ORDER BY slot_number ASC",
+            (user_id, guild_id),
+        ).fetchall()
+
+
+def set_fiche_message_id(character_id: int, message_id: int):
+    """Mémorise l'id du message d'embed de fiche (salon des fiches validées), pour pouvoir l'éditer."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE validated_characters SET fiche_message_id = ? WHERE id = ?", (message_id, character_id)
+        )
+
+
+def set_recompense_trace(character_id: int, recompense_type, recompense_detail):
+    """Trace la récompense de départ (type + détail) pour un retrait exact au reroll."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE validated_characters SET recompense_type = ?, recompense_detail = ? WHERE id = ?",
+            (recompense_type, recompense_detail, character_id),
+        )
+
+
+def update_validated_fields(character_id: int, **fields):
+    """UPDATE ciblé de validated_characters (clan / sort / eo_classe / eo_value / rct / grade...).
+    N'accepte qu'une liste blanche de colonnes pour éviter toute injection via un nom de champ."""
+    allowed = {"clan", "sort", "eo_classe", "eo_value", "rct", "grade",
+               "recompense_type", "recompense_detail"}
+    cols = {k: v for k, v in fields.items() if k in allowed}
+    if not cols:
+        return
+    assignments = ", ".join(f"{k} = ?" for k in cols)
+    with get_connection() as conn:
+        conn.execute(
+            f"UPDATE validated_characters SET {assignments} WHERE id = ?",
+            (*cols.values(), character_id),
+        )
+
+
+def update_fiche_record_eo(character_id: int, eo_value):
+    """Met à jour la source de vérité permanente de l'EO (fiche_record) — appelée par /reroll pour que
+    sync_eo_with_fiche() reflète la nouvelle valeur au prochain /profil."""
+    set_fiche_record(character_id, eo_value)
+
+
+def credit_character_bank(character_id: int, montant: int) -> bool:
+    """Crédite (ou débite si négatif) le solde courant du compte bancaire d'un personnage. Peut passer
+    en négatif (assumé : « petit cadeau » au reroll). Retourne False si aucun compte n'existe."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM bank_accounts WHERE character_id = ?", (character_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        conn.execute(
+            "UPDATE bank_accounts SET solde_courant = solde_courant + ? WHERE character_id = ?",
+            (montant, character_id),
+        )
+        return True
 
 
 def count_clan_members(guild_id: int, clan: str) -> int:

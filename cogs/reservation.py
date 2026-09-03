@@ -166,18 +166,12 @@ class Reservation(commands.Cog):
     # =================================================================
     @app_commands.command(name="réserv-appa", description="Réserver l'apparence d'un personnage pour ta fiche")
     @app_commands.describe(
-        personnage="Quel personnage (slot) concerné",
         nom_original="Nom original du personnage dans son œuvre",
         univers="Nom de l'univers/œuvre d'origine",
         image="Image du personnage (tout format accepté, GIF inclus)",
     )
-    @app_commands.choices(personnage=[
-        app_commands.Choice(name="Slot 1", value=1),
-        app_commands.Choice(name="Slot 2", value=2),
-        app_commands.Choice(name="Slot 3", value=3),
-    ])
     async def reserv_appa(self, interaction: discord.Interaction,
-                          personnage: app_commands.Choice[int], nom_original: str, univers: str,
+                          nom_original: str, univers: str,
                           image: discord.Attachment):
         # Le traitement (téléchargement d'image, vérifications) prend un peu de temps -> défère tout de suite.
         await interaction.response.defer(ephemeral=True)
@@ -185,12 +179,24 @@ class Reservation(commands.Cog):
         if interaction.guild is None:
             await interaction.followup.send("Cette commande s'utilise sur le serveur.", ephemeral=True)
             return
-        slot = personnage.value
 
-        # Le slot (1/2/3) est saisi manuellement : AUCUNE validation contre validated_characters, le
-        # joueur peut réserver AVANT que son personnage existe. Seul contrôle : ce slot n'a pas déjà une
-        # apparence validée (doublon basé sur user_id + guild_id + slot_number).
-        if db.has_accepted_appearance_reservation(interaction.user.id, interaction.guild.id, slot):
+        # Slot calculé automatiquement, exactement comme /depart : prochain slot libre = nombre de
+        # personnages validés + 1 (0 perso -> Slot 1, 1 -> Slot 2, 2 -> Slot 3).
+        with db.get_connection() as conn:
+            nb_personnages = conn.execute(
+                "SELECT COUNT(*) FROM validated_characters WHERE user_id = ? AND guild_id = ?",
+                (interaction.user.id, interaction.guild.id),
+            ).fetchone()[0]
+        if nb_personnages >= 3:
+            await interaction.followup.send(
+                "❌ Tu as déjà 3 personnages, impossible de réserver une apparence supplémentaire.",
+                ephemeral=True)
+            return
+        target_slot = nb_personnages + 1
+
+        # Seul contrôle : ce slot n'a pas déjà une apparence validée (doublon basé sur
+        # user_id + guild_id + slot_number).
+        if db.has_accepted_appearance_reservation(interaction.user.id, interaction.guild.id, target_slot):
             await interaction.followup.send(
                 "❌ Ce slot a déjà une apparence validée, choisis en un autre.", ephemeral=True)
             return
@@ -288,11 +294,11 @@ class Reservation(commands.Cog):
 
         # 8) Enregistrement (pending) + envoi de la demande au staff.
         reservation_id = db.create_appearance_reservation(
-            interaction.user.id, interaction.guild.id, slot, nom_original, univers, image_path, _now())
+            interaction.user.id, interaction.guild.id, target_slot, nom_original, univers, image_path, _now())
 
         description = (
             f"**Joueur :** {interaction.user.mention}\n"
-            f"**Slot :** {slot}\n"
+            f"**Slot :** {target_slot}\n"
             f"**Nom original :** {nom_original}\n"
             f"**Univers :** {univers}")
         if warned:
@@ -323,7 +329,7 @@ class Reservation(commands.Cog):
             return
 
         await interaction.followup.send(
-            "✅ Ta demande a été envoyée au staff pour validation.", ephemeral=True)
+            f"📋 Ta demande a été envoyée au staff pour validation (Slot {target_slot}).", ephemeral=True)
 
     # =================================================================
     # LISTENER : boutons Accepter / Refuser (custom_id dynamique, persistant)

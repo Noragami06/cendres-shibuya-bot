@@ -1796,6 +1796,8 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
         ).fetchone()
     if prof_row is not None:
         character_id = prof_row["id"]
+        # Traçabilité de la récompense de départ (type + détail) pour un retrait exact au reroll.
+        db.set_recompense_trace(character_id, progress.get("recompense_type"), progress.get("recompense"))
         db.create_profile_from_fiche(character_id, progress.get("eo_value"))
         # Source de vérité PERMANENTE de la réserve d'EO : même valeur que validated_characters.eo_value.
         # Resynchronisée à chaque affichage du profil (sync_eo_with_fiche), robuste aux redémarrages.
@@ -1852,11 +1854,14 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
         # comme pour le salon staff, afin d'identifier immédiatement le propriétaire de la fiche.
         content = f"Voici la fiche de {member_mention}"
         if portrait_path and os.path.exists(portrait_path):
-            await validated_channel.send(
+            fiche_message = await validated_channel.send(
                 content=content, embed=embed, file=discord.File(portrait_path, filename=filename)
             )
         else:
-            await validated_channel.send(content=content, embed=embed)
+            fiche_message = await validated_channel.send(content=content, embed=embed)
+        # Mémorise l'id de CE message pour que /reroll puisse rééditer l'embed plus tard.
+        if prof_row is not None:
+            db.set_fiche_message_id(prof_row["id"], fiche_message.id)
 
     # 4) Notifie le joueur.
     origin = interaction.client.get_channel(progress.get("origin_channel_id"))
@@ -2019,10 +2024,11 @@ async def apply_reward(interaction: discord.Interaction, reward: dict):
     key = reward["key"]
     progress = get_progress(uid)
 
-    # Mémorise la récompense choisie pour l'afficher plus tard dans la fiche.
+    # Mémorise la récompense choisie pour l'afficher plus tard dans la fiche + TRAÇABILITÉ (type + détail)
+    # pour un retrait exact au reroll. Le détail encode la quantité/montant via le suffixe "xN".
     qty = reward.get("qty")
     reco_display = reward["name"] if (not qty or qty == "x1") else f"{reward['name']} — {qty}"
-    update_progress(uid, recompense=reco_display)
+    update_progress(uid, recompense=reco_display, recompense_type=key)
 
     # --- Effet propre à chaque récompense (aucun return : l'enchaînement RCT est commun, plus bas) ---
     if key in ("argent", "xp"):
@@ -3285,6 +3291,141 @@ class DepartView(discord.ui.View):
         await interaction.response.send_message(embed=build_camp_embed(), view=CampView(), ephemeral=False)
 
 
+# =====================================================================
+# /reroll — correction a posteriori d'une fiche déjà validée (STAFF)
+# =====================================================================
+# Menu numéroté des catégories rerollables.
+REROLL_CATEGORIES = {
+    "1": "clan", "2": "sort", "3": "eo_classe", "4": "eo_value", "5": "recompense", "6": "rct",
+}
+REROLL_MENU_TEXT = (
+    "**1.** Clan\n**2.** Sort\n**3.** Classe de l'EO\n**4.** Quantité de l'EO\n"
+    "**5.** Récompense\n**6.** RCT"
+)
+
+
+# ---------- Tirages PURS (aucune dépendance à interaction.user, réutilisables /depart + /reroll) ----------
+def _draw_reroll_clan() -> str:
+    """Tirage pondéré d'un clan (clans ouverts + sans_clan), identique au parcours normal."""
+    state = load_clan_state()
+    pool = {"sans_clan": state["sans_clan_pct"]}
+    for clan_key, inf in state["clans"].items():
+        if not inf["closed"]:
+            pool[clan_key] = inf["current_pct"]
+    return weighted_choice(pool)
+
+
+def _draw_reroll_sort(clan_key, guild):
+    """Tirage de sort basé sur le clan COURANT. Retourne (sort_key, label). Sans clan -> (None, 'Aucun').
+    Réutilise la table CORRIGÉE (SPELL_TABLE_BASE/PARTIAL) : les seules options sont Sort inné,
+    Sort héréditaire (complet), Sort héréditaire partiel (clans à hérédité partielle) et Restriction
+    céleste. Aucune option « Sans sort » n'existe dans ces tables."""
+    if not clan_key or clan_key == "sans_clan":
+        return None, "Aucun"
+    state = load_clan_state()
+    info = state["clans"].get(clan_key)
+    if not info:
+        return None, "Aucun"
+    heredit_taken = is_heredit_taken(guild, info["role_id"])
+    base_table = dict(SPELL_TABLE_PARTIAL if info["partial_heredit"] else SPELL_TABLE_BASE)
+    final_table = redistribute_pct(base_table, "sort_heredit") if heredit_taken else dict(base_table)
+    sort_key = weighted_choice(final_table)
+    label = "Sort héréditaire (complet)" if sort_key == "sort_heredit" else SORT_LABELS[sort_key]
+    return sort_key, label
+
+
+def _draw_reroll_eo_class():
+    """Tirage pondéré de classe EO (45/30/15/7/3) + quantité dans la fourchette. Retourne (classe, value)."""
+    classe = weighted_choice({k: info["pct"] for k, info in EO_CLASS_TABLE.items()})
+    info = EO_CLASS_TABLE[classe]
+    return classe, random.randint(info["min"], info["max"])
+
+
+def _draw_reroll_eo_value(classe: str) -> int:
+    """Nouvelle quantité dans la fourchette de la classe ACTUELLE (inchangée)."""
+    info = EO_CLASS_TABLE[classe]
+    return random.randint(info["min"], info["max"])
+
+
+def _parse_trailing_qty(detail: str):
+    """Extrait la quantité/montant encodé en suffixe « xN » d'un détail de récompense (ou None)."""
+    if not detail:
+        return None
+    m = re.search(r"x\s*(\d+)\s*$", detail)
+    return int(m.group(1)) if m else None
+
+
+# ---------- Vues interactives (pilotées par view.wait(), réservées au staff) ----------
+class _RerollConfirmView(discord.ui.View):
+    """✅ Confirmer / 🔁 Refuser (reroll) — réservé au staff qui pilote /reroll."""
+
+    def __init__(self, staff_id: int):
+        super().__init__(timeout=600)
+        self.staff_id = staff_id
+        self.value = None  # "confirm" / "refuse" / None (timeout)
+
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.staff_id:
+            await interaction.response.send_message("Ce reroll ne t'appartient pas.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirmer", emoji="✅", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        self.value = "confirm"
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="Refuser (reroll)", emoji="🔁", style=discord.ButtonStyle.danger)
+    async def refuse(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        self.value = "refuse"
+        await interaction.response.defer()
+        self.stop()
+
+
+class _RerollRewardView(discord.ui.View):
+    """Choisir A / Choisir B / 🔁 Refaire le tirage — le choix EST la confirmation (pas de bouton séparé)."""
+
+    def __init__(self, staff_id: int):
+        super().__init__(timeout=600)
+        self.staff_id = staff_id
+        self.value = None  # "option_a" / "option_b" / "redraw" / None
+
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.staff_id:
+            await interaction.response.send_message("Ce reroll ne t'appartient pas.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Choisir A", style=discord.ButtonStyle.primary)
+    async def choose_a(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        self.value = "option_a"
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="Choisir B", style=discord.ButtonStyle.primary)
+    async def choose_b(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        self.value = "option_b"
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="Refaire le tirage", emoji="🔁", style=discord.ButtonStyle.secondary)
+    async def redraw(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        self.value = "redraw"
+        await interaction.response.defer()
+        self.stop()
+
+
 class Depart(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -3688,6 +3829,454 @@ class Depart(commands.Cog):
     @fiche_expiry_loop.before_loop
     async def _before_fiche_expiry(self):
         await self.bot.wait_until_ready()
+
+    # =================================================================
+    # /reroll (STAFF) — corriger a posteriori une fiche validée
+    # =================================================================
+    async def _reroll_wait_text(self, channel, staff, question: str):
+        """Envoie une question et attend une réponse texte du STAFF dans le MÊME salon. Retourne le
+        contenu (str) ou None si annulation / délai."""
+        await channel.send(question)
+
+        def check(m):
+            return m.author.id == staff.id and m.channel.id == channel.id
+
+        try:
+            m = await self.bot.wait_for("message", check=check, timeout=300)
+        except asyncio.TimeoutError:
+            await channel.send("⏳ Temps écoulé, reroll annulé.")
+            return None
+        content = m.content.strip()
+        if content.lower() in ("annuler", "cancel"):
+            await channel.send("Reroll annulé.")
+            return None
+        return content
+
+    async def _reroll_ask_positive_int(self, channel, staff, question: str):
+        """Demande un entier ≥ 1 (reboucle sur saisie invalide)."""
+        while True:
+            content = await self._reroll_wait_text(
+                channel, staff, f"❓ {question} (réponds par un nombre, ou « annuler »)")
+            if content is None:
+                return None
+            if content.isdigit() and int(content) >= 1:
+                return int(content)
+            await channel.send("Réponds par un entier positif (≥ 1), ou « annuler ».")
+
+    async def _reroll_pick_character(self, channel, staff, joueur, chars):
+        """Menu déroulant textuel si plusieurs personnages ; retourne la ligne choisie ou None."""
+        lignes = "\n".join(
+            f"**{c['slot_number']}.** {c['character_name']} "
+            f"({(c['clan'] or 'Sans clan').capitalize()})"
+            for c in chars
+        )
+        content = await self._reroll_wait_text(
+            channel, staff,
+            f"Plusieurs personnages pour {joueur.mention}. Indique le **numéro de slot** à corriger :\n"
+            f"{lignes}")
+        if content is None:
+            return None
+        if not content.isdigit():
+            await channel.send("Slot invalide, reroll annulé.")
+            return None
+        slot = int(content)
+        char = next((c for c in chars if c["slot_number"] == slot), None)
+        if char is None:
+            await channel.send("Aucun personnage sur ce slot, reroll annulé.")
+            return None
+        return char
+
+    async def _reroll_confirm_or_reroll(self, channel, staff, embed, edit_message=None):
+        """Affiche `embed` + boutons ✅/🔁 ; retourne 'confirm', 'refuse' ou None (délai)."""
+        view = _RerollConfirmView(staff.id)
+        if edit_message is not None:
+            await edit_message.edit(embed=embed, view=view)
+            msg = edit_message
+        else:
+            msg = await channel.send(embed=embed, view=view)
+        await view.wait()
+        try:
+            await msg.edit(view=None)
+        except discord.HTTPException:
+            pass
+        return view.value
+
+    def _reroll_reward_table_for_char(self, char):
+        """Table de récompense selon le camp / hybride_type du personnage (None si Humain/sans parcours)."""
+        camp = (char["camp"] or "").lower()
+        if camp == "exorciste":
+            return REWARD_TABLE
+        if camp == "hybride":
+            return REWARD_TABLE_BY_PATH.get(f"hybride_{char['hybride_type']}")
+        return None
+
+    def _reroll_remove_old_reward(self, char):
+        """Retire l'ANCIENNE récompense selon sa traçabilité. Retourne un texte descriptif (ou None)."""
+        rtype = char["recompense_type"]
+        detail = char["recompense_detail"] or ""
+        if not rtype:
+            return None
+        qty = _parse_trailing_qty(detail)
+        if rtype == "argent":
+            montant = qty or 0
+            if db.credit_character_bank(char["id"], -montant):
+                return (f"Ancienne récompense retirée : **{montant:,} ¥** débités du compte "
+                        "(peut passer en négatif, assumé).")
+            return "Ancienne récompense (argent) : aucun compte bancaire trouvé, rien à débiter."
+        if rtype == "xp":
+            return "Ancienne récompense (XP) : aucun système d'XP consommable câblé, rien à retirer."
+        if rtype.startswith(("parchemin_", "relique_", "arme_")):
+            return (f"Ancienne récompense ({rtype}) : pas de stock d'inventaire réel côté personnage "
+                    "(récompense symbolique à la création), rien à retirer concrètement.")
+        if rtype.startswith("reroll_"):
+            return "Ancienne récompense (droit à reroll) : action ponctuelle déjà consommée, rien à retirer."
+        return None
+
+    def _reroll_grant_new_reward(self, char, reward):
+        """Octroi de la NOUVELLE récompense au personnage réel. Seul l'argent a un stock concret
+        (bank_accounts) ; les autres types sont symboliques à la création -> uniquement tracés.
+        Retourne le détail lisible (avec suffixe xN)."""
+        key = reward["key"]
+        qty = reward.get("qty")
+        detail = reward["name"] if (not qty or qty == "x1") else f"{reward['name']} — {qty}"
+        if key == "argent":
+            db.credit_character_bank(char["id"], reward.get("amount") or 0)
+        return detail
+
+    async def _reroll_run_reward(self, channel, staff, char):
+        """Catégorie Récompense : retrait de l'ancienne, dilemme A/B (redraw possible), octroi de la
+        nouvelle. Retourne {'type', 'detail'} ou None (annulation)."""
+        table = self._reroll_reward_table_for_char(char)
+        if table is None:
+            await channel.send("Ce personnage (Humain / sans parcours) n'a pas de table de récompense : "
+                               "catégorie Récompense ignorée.")
+            return {"type": None, "detail": None}
+        removed = self._reroll_remove_old_reward(char)
+        if removed:
+            await channel.send(embed=_reward_embed(removed))
+        while True:
+            option_a, option_b = pick_two_distinct_rewards(table)
+            img = _tmp_image_path("recompense")
+            generate_recompense_image(option_a, option_b, img)
+            await channel.send(file=discord.File(img, filename="recompense.png"))
+            try:
+                os.remove(img)
+            except OSError:
+                pass
+            view = _RerollRewardView(staff.id)
+            emb = discord.Embed(
+                title="🎁 Reroll — Récompense",
+                description="Choisis **A** ou **B** (le choix vaut confirmation), ou refais le tirage.",
+                color=discord.Color.gold())
+            msg = await channel.send(embed=emb, view=view)
+            await view.wait()
+            try:
+                await msg.edit(view=None)
+            except discord.HTTPException:
+                pass
+            if view.value is None:
+                await channel.send("⏳ Temps écoulé, reroll annulé.")
+                return None
+            if view.value == "redraw":
+                continue
+            chosen = option_a if view.value == "option_a" else option_b
+            detail = self._reroll_grant_new_reward(char, chosen)
+            await channel.send(embed=_reward_embed(f"Nouvelle récompense accordée : **{detail}**"))
+            return {"type": chosen["key"], "detail": detail}
+
+    async def _reroll_run_category(self, channel, staff, interaction, char, session, cat):
+        """Boucle confirmer/refuser d'UNE catégorie. Retourne un payload confirmé, ou None (annulation)."""
+        guild = interaction.guild
+        if cat == "clan":
+            while True:
+                new_clan = _draw_reroll_clan()
+                label = "Sans clan" if new_clan == "sans_clan" else new_clan.capitalize()
+                emb = discord.Embed(title="🔁 Reroll — Clan",
+                                    description=f"Nouveau clan tiré : **{label}**", color=discord.Color.gold())
+                choice = await self._reroll_confirm_or_reroll(channel, staff, emb)
+                if choice is None:
+                    await channel.send("⏳ Temps écoulé, reroll annulé.")
+                    return None
+                if choice == "confirm":
+                    session["clan"] = new_clan
+                    return {"cat": "clan", "clan": new_clan, "label": label}
+
+        if cat == "sort":
+            while True:
+                sort_key, label = _draw_reroll_sort(session["clan"], guild)
+                emb = discord.Embed(title="🔁 Reroll — Sort",
+                                    description=f"Nouveau sort tiré : **{label}**\n"
+                                                f"*(basé sur le clan courant : "
+                                                f"{(session['clan'] or 'sans_clan').capitalize()})*",
+                                    color=discord.Color.gold())
+                choice = await self._reroll_confirm_or_reroll(channel, staff, emb)
+                if choice is None:
+                    await channel.send("⏳ Temps écoulé, reroll annulé.")
+                    return None
+                if choice == "confirm":
+                    session["sort"] = sort_key
+                    return {"cat": "sort", "sort": sort_key, "label": label}
+
+        if cat == "eo_classe":
+            while True:
+                classe, value = _draw_reroll_eo_class()
+                cd = classe.replace("classe_", "").upper()
+                emb = discord.Embed(title="🔁 Reroll — Classe de l'EO",
+                                    description=f"Nouvelle classe : **{cd}**\n"
+                                                f"Nouvelle quantité : **{value:,} EO**",
+                                    color=discord.Color.gold())
+                choice = await self._reroll_confirm_or_reroll(channel, staff, emb)
+                if choice is None:
+                    await channel.send("⏳ Temps écoulé, reroll annulé.")
+                    return None
+                if choice == "confirm":
+                    session["eo_classe"] = classe
+                    session["eo_value"] = value
+                    return {"cat": "eo", "eo_classe": classe, "eo_value": value}
+
+        if cat == "eo_value":
+            classe = session["eo_classe"]
+            if not classe:
+                await channel.send("Ce personnage n'a pas de classe d'EO : catégorie Quantité ignorée.")
+                return {"cat": "noop"}
+            cd = classe.replace("classe_", "").upper()
+            while True:
+                value = _draw_reroll_eo_value(classe)
+                emb = discord.Embed(
+                    title="🔁 Reroll — Quantité de l'EO",
+                    description=f"Classe actuelle (inchangée) : **{cd}**\n"
+                                f"Nouvelle quantité tirée : **{value:,} EO**",
+                    color=discord.Color.gold())
+                choice = await self._reroll_confirm_or_reroll(channel, staff, emb)
+                if choice is None:
+                    await channel.send("⏳ Temps écoulé, reroll annulé.")
+                    return None
+                if choice == "confirm":
+                    session["eo_value"] = value
+                    return {"cat": "eo", "eo_classe": classe, "eo_value": value}
+
+        if cat == "rct":
+            while True:
+                msg = await channel.send(embed=discord.Embed(
+                    title="❤️‍🩹 Tentative de RCT", description="🔎 Analyse en cours", color=discord.Color.red()))
+                for i in range(7):
+                    dots = "." * (i % 4)
+                    await msg.edit(embed=discord.Embed(
+                        title="❤️‍🩹 Tentative de RCT",
+                        description=f"🔎 Analyse en cours {dots}".rstrip(), color=discord.Color.red()))
+                    await asyncio.sleep(1)
+                success = random.random() < 0.01  # 1% — jamais falsifié
+                label = "Maîtrisé ✅" if success else "Non maîtrisé ❌"
+                emb = discord.Embed(
+                    title="❤️‍🩹 Résultat du RCT", description=f"Résultat : **{label}**",
+                    color=discord.Color.green() if success else discord.Color.dark_red())
+                choice = await self._reroll_confirm_or_reroll(channel, staff, emb, edit_message=msg)
+                if choice is None:
+                    await channel.send("⏳ Temps écoulé, reroll annulé.")
+                    return None
+                if choice == "confirm":
+                    session["rct"] = 1 if success else 0
+                    return {"cat": "rct", "rct": 1 if success else 0, "label": label}
+
+        if cat == "recompense":
+            reward = await self._reroll_run_reward(channel, staff, char)
+            if reward is None:
+                return None
+            return {"cat": "recompense", "reward": reward}
+        return {"cat": "noop"}
+
+    async def _reroll_apply_clan(self, guild, char, new_clan):
+        """Applique un changement de clan : base + rôles (réels slot 1 / virtuels slots 2-3) + points."""
+        character_id = char["id"]
+        old_clan = char["clan"]
+        slot = char["slot_number"]
+        _, old_clan_rid, _ = resolve_role_point_ids(None, old_clan, None)
+        _, new_clan_rid, _ = resolve_role_point_ids(None, new_clan, None)
+        db.update_validated_fields(character_id, clan=new_clan)
+
+        member = guild.get_member(char["user_id"]) if guild else None
+        if slot == 1 and member is not None:
+            remove, add = [], []
+            marker = guild.get_role(CLAN_MEMBER_ROLE_ID)
+            if old_clan_rid:
+                r = guild.get_role(old_clan_rid)
+                if r and r in member.roles:
+                    remove.append(r)
+            if new_clan == "sans_clan":
+                if marker and marker in member.roles:
+                    remove.append(marker)
+            else:
+                nr = guild.get_role(new_clan_rid)
+                if nr and nr not in member.roles:
+                    add.append(nr)
+                if marker and marker not in member.roles:
+                    add.append(marker)
+            try:
+                if remove:
+                    await member.remove_roles(*remove, reason="Reroll clan (staff)")
+                if add:
+                    await member.add_roles(*add, reason="Reroll clan (staff)")
+            except discord.Forbidden:
+                print(f"[reroll] Permission manquante pour modifier les rôles de {char['user_id']}.")
+        else:
+            # Slots 2/3 : rôles VIRTUELS uniquement.
+            if old_clan_rid:
+                db.remove_virtual_role(character_id, old_clan_rid)
+            if new_clan == "sans_clan":
+                db.remove_virtual_role(character_id, CLAN_MEMBER_ROLE_ID)
+                db.add_virtual_role(character_id, SANS_CLAN_ROLE_ID)
+            else:
+                db.remove_virtual_role(character_id, SANS_CLAN_ROLE_ID)
+                db.add_virtual_role(character_id, new_clan_rid)
+                db.add_virtual_role(character_id, CLAN_MEMBER_ROLE_ID)
+
+        await sync_role_points(character_id, "clan", new_clan_rid, bot=self.bot)
+
+    async def _reroll_apply_all(self, interaction, char, queue, session):
+        """Applique TOUS les rerolls confirmés d'un coup (base + rôles), puis réédite l'embed de fiche
+        une seule fois et récapitule au staff."""
+        guild = interaction.guild
+        character_id = char["id"]
+        changes = []
+        for payload in queue:
+            cat = payload.get("cat")
+            if cat == "clan":
+                await self._reroll_apply_clan(guild, char, payload["clan"])
+                # Rafraîchit la copie locale pour un éventuel reroll de clan suivant dans la même session.
+                char = db.get_validated_character_by_id(character_id)
+                changes.append(f"Clan → **{payload['label']}**")
+            elif cat == "sort":
+                db.update_validated_fields(character_id, sort=payload["sort"])
+                changes.append(f"Sort → **{payload['label']}**")
+            elif cat == "eo":
+                db.update_validated_fields(
+                    character_id, eo_classe=payload["eo_classe"], eo_value=payload["eo_value"])
+                db.update_fiche_record_eo(character_id, payload["eo_value"])
+                cd = payload["eo_classe"].replace("classe_", "").upper()
+                changes.append(f"Réserve → **Classe {cd}, {payload['eo_value']:,} EO**")
+            elif cat == "rct":
+                db.update_validated_fields(character_id, rct=payload["rct"])
+                changes.append(f"RCT → **{'Maîtrisé' if payload['rct'] else 'Non maîtrisé'}**")
+            elif cat == "recompense":
+                rw = payload.get("reward") or {}
+                if rw.get("type") is not None or rw.get("detail") is not None:
+                    db.set_recompense_trace(character_id, rw.get("type"), rw.get("detail"))
+                    changes.append(f"Récompense → **{rw.get('detail')}**")
+
+        # Réédition de l'embed de fiche (une seule fois) dans le salon des fiches validées.
+        await self._reroll_edit_fiche_message(interaction, character_id)
+
+        recap = "\n".join(f"• {c}" for c in changes) if changes else "Aucune modification concrète."
+        await interaction.channel.send(embed=discord.Embed(
+            title="✅ Reroll appliqué",
+            description=f"Personnage **{char['character_name']}** (Slot {char['slot_number']}) :\n{recap}",
+            color=discord.Color.green()))
+
+    async def _reroll_edit_fiche_message(self, interaction, character_id):
+        """Réédite l'embed du message de fiche (FICHE_VALIDATED_CHANNEL_ID) avec les valeurs à jour."""
+        char = db.get_validated_character_by_id(character_id)
+        if char is None:
+            return
+        msg_id = char["fiche_message_id"]
+        if not msg_id:
+            await interaction.channel.send(
+                "ℹ️ Impossible de rééditer l'embed de fiche : aucun `fiche_message_id` enregistré "
+                "(personnage validé avant l'ajout de cette traçabilité). Les valeurs en base sont à jour.")
+            return
+        # Reconstruit un dict compatible build_fiche_embed : base = progression existante (prénom/âge/
+        # histoire), surchargée par les valeurs AUTORITAIRES de la fiche validée.
+        progress = get_progress(char["user_id"]) or {}
+        merged = dict(progress)
+        merged.update({
+            "guild_id": char["guild_id"], "slot_number": char["slot_number"],
+            "camp": char["camp"], "clan": char["clan"], "sort": char["sort"],
+            "eo_classe": char["eo_classe"], "eo_value": char["eo_value"], "nature": char["nature"],
+            "hybride_type": char["hybride_type"], "grade_choisi": char["grade"],
+            "sera_heritier": 1 if char["grade"] == "Héritier" else 0,
+            "rct": char["rct"], "recompense": char["recompense_detail"],
+            "portrait_path": char["portrait_path"],
+        })
+        guild = interaction.guild
+        member = guild.get_member(char["user_id"]) if guild else None
+        embed = build_fiche_embed(merged, guild, member, char["user_id"],
+                                  statut_display="✅ Validée (corrigée)",
+                                  valide_par_display=interaction.user.mention)
+        channel = interaction.client.get_channel(FICHE_VALIDATED_CHANNEL_ID)
+        if channel is None:
+            return
+        try:
+            fiche_msg = await channel.fetch_message(msg_id)
+            await fiche_msg.edit(embed=embed)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            await interaction.channel.send(
+                "⚠️ Le message d'embed de fiche est introuvable/inaccessible ; les valeurs en base sont "
+                "à jour mais l'embed n'a pas pu être réédité.")
+
+    @app_commands.command(name="reroll",
+                          description="Corrige un ou plusieurs éléments de la fiche d'un personnage déjà validé")
+    @app_commands.describe(joueur="Le joueur dont on corrige la fiche")
+    async def reroll(self, interaction: discord.Interaction, joueur: discord.Member):
+        if not _is_fiche_staff(interaction.user):
+            await interaction.response.send_message(
+                "❌ Seul le staff peut utiliser cette commande.", ephemeral=True)
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "Cette commande s'utilise sur le serveur.", ephemeral=True)
+            return
+
+        chars = db.get_validated_characters_for_user(joueur.id, interaction.guild.id)
+        if not chars:
+            await interaction.response.send_message(
+                "❌ Ce personnage n'a pas de fiche validée, impossible de faire un reroll.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"🛠️ Reroll de fiche lancé pour {joueur.mention} par {interaction.user.mention}.")
+        channel = interaction.channel
+        staff = interaction.user
+
+        # Sélection du personnage (automatique si un seul, sinon menu par slot).
+        if len(chars) == 1:
+            char = chars[0]
+        else:
+            char = await self._reroll_pick_character(channel, staff, joueur, chars)
+            if char is None:
+                return
+        char = db.get_validated_character_by_id(char["id"])
+        if char is None:
+            await channel.send("❌ Ce personnage n'a pas de fiche validée, impossible de faire un reroll.")
+            return
+
+        n = await self._reroll_ask_positive_int(
+            channel, staff, "Combien de rerolls veux-tu effectuer sur cette fiche ?")
+        if n is None:
+            return
+
+        # État de session en mémoire, seedé depuis la base (dépendances : le sort suit le clan courant).
+        session = {
+            "clan": char["clan"], "sort": char["sort"],
+            "eo_classe": char["eo_classe"], "eo_value": char["eo_value"],
+            "rct": char["rct"],
+        }
+        queue = []
+        for i in range(1, n + 1):
+            choix = await self._reroll_wait_text(
+                channel, staff,
+                f"**Reroll {i}/{n}** — quelle catégorie corriger ?\n{REROLL_MENU_TEXT}\n"
+                "Réponds par un numéro (1-6), ou « annuler ».")
+            if choix is None:
+                return
+            cat = REROLL_CATEGORIES.get(choix.strip())
+            if cat is None:
+                await channel.send("Réponds par un numéro entre **1** et **6**. Reroll annulé.")
+                return
+            payload = await self._reroll_run_category(channel, staff, interaction, char, session, cat)
+            if payload is None:
+                return  # annulation / délai
+            queue.append(payload)
+
+        await self._reroll_apply_all(interaction, char, queue, session)
 
     @app_commands.command(name="départ", description="Démarre la création de ton personnage")
     async def depart(self, interaction: discord.Interaction):

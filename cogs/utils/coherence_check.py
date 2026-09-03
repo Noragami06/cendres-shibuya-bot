@@ -332,6 +332,11 @@ def _check_id_conflicts(by_id, errors):
                 f"(sources : {srcs}).")
 
 
+# Écarts de barème CONFIRMÉS comme volontaires (ne remontent plus en note « à confirmer »).
+# 1539169032324907048 = rôle « Sans clan » (125pts), délibérément plus bas que les 250pts des clans.
+CONFIRMED_BAREME_OUTLIERS = {1539169032324907048}
+
+
 def _cross_checks(by_id, barometer, errors, notes):
     if barometer is None:
         return
@@ -373,7 +378,10 @@ def _cross_checks(by_id, barometer, errors, notes):
             continue
         counts = Counter(values)
         majority_val, majority_n = counts.most_common(1)[0]
-        outliers = [(rid, p) for rid, p in entries if p != majority_val]
+        # Les écarts DÉJÀ confirmés comme volontaires (cf. CONFIRMED_BAREME_OUTLIERS, ex: 'Sans clan'
+        # à 125pts) ne remontent plus comme note à re-vérifier.
+        outliers = [(rid, p) for rid, p in entries
+                    if p != majority_val and rid not in CONFIRMED_BAREME_OUTLIERS]
         if outliers and majority_n >= len(values) - max(1, len(values) // 4):
             outlier_str = ", ".join(f"{rid}={p}pts" for rid, p in outliers)
             notes.append(
