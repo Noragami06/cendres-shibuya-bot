@@ -41,6 +41,7 @@ async def setup_hook():
     await bot.load_extension("cogs.inventaire")
     await bot.load_extension("cogs.shop")
     await bot.load_extension("cogs.profil")
+    await bot.load_extension("cogs.histoire")
     await bot.load_extension("cogs.ordre")
     await bot.load_extension("cogs.reservation")
     await bot.load_extension("cogs.welcome")

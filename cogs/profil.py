@@ -1024,8 +1024,13 @@ class Profil(commands.Cog):
                 pct = round(xp_actuel / xp_max * 100) if level < cap else 100
 
             else:
-                # Territoire : système de tranches par palier x10 inchangé.
-                _num, pct, tranche = compute_tranche(base)
+                # Territoire : Maîtrise dérivée de la stat, MÊME affichage adaptatif que les autres
+                # (« X point(s) manquant(s) » / « MAX » au plafond effectif : override staff ou constante).
+                # Migré de l'ancien compute_tranche() (paliers x10) vers get_mastery_territoire().
+                level, xp_actuel, xp_max = await get_mastery_territoire(character_id)
+                cap = await get_effective_max_level(character_id, "territoire", MASTERY_TERRITOIRE_MAX_LEVEL)
+                tranche = compute_points_manquants(xp_actuel, xp_max, level, cap)
+                pct = round(xp_actuel / xp_max * 100) if level < cap else 100
 
             stats.append((STAT_DISPLAY_NAMES[key], STAT_COLORS[key], base, total, pct, tranche,
                           show_tranche_text))
@@ -2266,6 +2271,137 @@ class Profil(commands.Cog):
             )
             if character_id is not None:
                 await self.send_profile(interaction.channel, character_id, interaction.user.id)
+
+    # =================================================================
+    # /technique (STAFF) — conversion des coûts en % vers des points fixes d'EO
+    # =================================================================
+    def _technique_gather(self, character_id):
+        """Éléments encore en % (cout_eo_fixe NULL) : sorts secondaires DÉBLOQUÉS (niveau du sort
+        principal parent >= leur niveau_requis), Territoire, Armes maudites. Retourne (secs, terr, armes)."""
+        with db.get_connection() as conn:
+            secs = conn.execute(
+                "SELECT css.id, css.cout_pct, css.name AS sort_secondaire_name, "
+                "cs.name AS sort_principal_name "
+                "FROM character_secondary_sorts css "
+                "JOIN character_sorts cs ON cs.id = css.sort_id "
+                "WHERE cs.character_id = ? AND css.cout_eo_fixe IS NULL "
+                "AND css.niveau_requis <= cs.level",
+                (character_id,)).fetchall()
+            terr = conn.execute(
+                "SELECT cout_eo_pct, name, appellation FROM character_territoire "
+                "WHERE character_id = ? AND cout_eo_fixe IS NULL",
+                (character_id,)).fetchone()
+            armes = conn.execute(
+                "SELECT id, name, classe, cout_eo_pct_override FROM character_armes_maudites "
+                "WHERE character_id = ? AND cout_eo_fixe IS NULL",
+                (character_id,)).fetchall()
+        return secs, terr, armes
+
+    async def _convert_technique_costs(self, channel, character_id):
+        """Applique la conversion coût % -> points fixes d'EO. Ne débite JAMAIS eo_actuel : c'est un pur
+        calcul qui fige une valeur d'usage futur (cout_eo_fixe = round(cout_pct / 100 * eo_max))."""
+        prof = db.get_or_create_profile(character_id)
+        eo_actuel = prof["eo_actuel"] or 0
+        eo_max = prof["eo_max"] or 0
+        secs, terr, armes = self._technique_gather(character_id)
+        terr_convertible = bool(terr) and terr["cout_eo_pct"] is not None
+
+        # §2 : seuil des 40% vérifié UNE SEULE FOIS pour tout le personnage.
+        seuil = round(0.40 * eo_max)
+        if eo_max == 0 or (eo_actuel / eo_max) < 0.40:
+            lignes = []
+            for s in secs:
+                lignes.append(
+                    f"• Sort principal {s['sort_principal_name']} → sort secondaire {s['sort_secondaire_name']}")
+            if terr_convertible:
+                lignes.append(f"• Territoire → {terr['name'] or terr['appellation'] or 'Territoire'}")
+            for a in armes:
+                lignes.append(f"• Arme maudite → {a['name']}")
+            liste = "\n".join(lignes) if lignes else "Aucun élément en attente de conversion."
+            await channel.send(embed=discord.Embed(
+                title="❌ Conversion impossible",
+                description=(
+                    f"La réserve actuelle ({eo_actuel:,}/{eo_max:,}) est en dessous du seuil des 40% "
+                    f"requis ({seuil:,}).\n\n**Éléments non transformés :**\n{liste}"),
+                color=discord.Color.red()))
+            return
+
+        # §3 : conversion de TOUT ce qui est encore en %. Formule unique : round(cout_pct / 100 * eo_max).
+        now = datetime.utcnow().isoformat()
+        conv_secs, conv_terr, conv_armes = [], None, []
+        with db.get_connection() as conn:
+            for s in secs:
+                pct = s["cout_pct"] or 0
+                fixe = round(pct / 100 * eo_max)
+                conn.execute(
+                    "UPDATE character_secondary_sorts SET cout_eo_fixe = ?, cout_converted_at = ? WHERE id = ?",
+                    (fixe, now, s["id"]))
+                conv_secs.append((s["sort_principal_name"], s["sort_secondaire_name"], pct, fixe))
+            if terr_convertible:
+                pct = terr["cout_eo_pct"]
+                fixe = round(pct / 100 * eo_max)
+                conn.execute(
+                    "UPDATE character_territoire SET cout_eo_fixe = ? WHERE character_id = ?",
+                    (fixe, character_id))
+                conv_terr = (pct, fixe)
+            for a in armes:
+                override = a["cout_eo_pct_override"]
+                if override is not None:
+                    pct = override
+                elif a["classe"] in SPELL_CLASS_VALUES:
+                    pct = SPELL_CLASS_VALUES[a["classe"]]["cout_pct"]
+                else:
+                    continue  # classe inconnue : on ne convertit pas (ne devrait pas arriver)
+                fixe = round(pct / 100 * eo_max)
+                conn.execute(
+                    "UPDATE character_armes_maudites SET cout_eo_fixe = ? WHERE id = ?", (fixe, a["id"]))
+                conv_armes.append((a["name"], pct, fixe))
+
+        # §4 : récapitulatif des NOUVELLES conversions uniquement.
+        if not (conv_secs or conv_terr or conv_armes):
+            await channel.send(embed=discord.Embed(
+                title="✅ Conversion effectuée",
+                description="Rien de nouveau à convertir : tout est déjà converti, ou aucun sort "
+                            "secondaire débloqué / territoire / arme maudite en attente.",
+                color=PHOENIX_COLOR))
+            return
+        desc = f"base : réserve max {eo_max:,}\n"
+        if conv_secs:
+            desc += "\n**Sorts :**\n" + "\n".join(
+                f"- {p} → {sec} : {pct}% → {fixe:,} points" for p, sec, pct, fixe in conv_secs)
+        if conv_terr:
+            desc += f"\n\n**Territoire :** {conv_terr[1]:,} points (était {conv_terr[0]}%)"
+        if conv_armes:
+            desc += "\n\n**Arme maudite :**\n" + "\n".join(
+                f"- {name} : {fixe:,} points (était {pct}%)" for name, pct, fixe in conv_armes)
+        await channel.send(embed=discord.Embed(
+            title="✅ Conversion effectuée", description=desc, color=PHOENIX_COLOR))
+
+    @app_commands.command(name="technique",
+                          description="Convertit les coûts en % d'un personnage en points fixes d'EO")
+    @app_commands.describe(joueur="Le joueur dont on convertit les coûts")
+    async def technique(self, interaction: discord.Interaction, joueur: discord.Member):
+        # Cette commande ne convertit que ce qui est débloqué AU MOMENT de son exécution. Si le personnage
+        # débloque un nouveau sort secondaire plus tard (niveau du sort principal qui progresse), le staff
+        # doit relancer /technique pour convertir ce nouveau sort — aucune conversion automatique en
+        # arrière-plan.
+        if not _is_staff(interaction.user):
+            await interaction.response.send_message(
+                "❌ Seul le staff peut utiliser cette commande.", ephemeral=True)
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "Cette commande s'utilise sur le serveur.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"🔧 Conversion des coûts lancée pour {joueur.mention} par {interaction.user.mention}.")
+        character_id = await self.select_character_await(
+            interaction.channel, joueur, interaction.user.id,
+            f"{joueur.mention} n'a aucun personnage validé.")
+        if character_id is None:
+            return
+        await self._convert_technique_costs(interaction.channel, character_id)
 
     # =================================================================
     # LISTENER

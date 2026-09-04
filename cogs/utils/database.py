@@ -361,6 +361,7 @@ CREATE TABLE IF NOT EXISTS character_territoire (
     appellation TEXT,      -- texte EXACT choisi : "Extension du Territoire" / "Ryōiki Tenkai" / "Domain Expansion"
     type TEXT,
     cout_eo_pct INTEGER,   -- coût en % de la réserve d'EO (valeur fixe, modifiable staff)
+    cout_eo_fixe INTEGER DEFAULT NULL,  -- coût converti en points fixes d'EO (via /technique) ; NULL = encore en %
     duree_tours INTEGER,   -- durée d'effet en tours (valeur fixe, modifiable staff)
     description TEXT,
     effets TEXT,
@@ -379,7 +380,16 @@ CREATE TABLE IF NOT EXISTS character_armes_maudites (
     image_path TEXT,
     degats_base INTEGER,  -- tiré une fois à la création, dans la fourchette de sa classe
     degats_actuel INTEGER,
-    cout_eo_pct_override INTEGER DEFAULT NULL  -- coût EO % forcé par le staff ; NULL = dérivé de la classe
+    cout_eo_pct_override INTEGER DEFAULT NULL,  -- coût EO % forcé par le staff ; NULL = dérivé de la classe
+    cout_eo_fixe INTEGER DEFAULT NULL  -- coût converti en points fixes d'EO (via /technique) ; NULL = encore en %
+);
+
+-- Histoire d'un personnage : lien Google Doc PUBLIC vérifié (commande /histoire).
+CREATE TABLE IF NOT EXISTS character_history (
+    character_id INTEGER PRIMARY KEY,
+    gdoc_url TEXT,
+    gdoc_id TEXT,
+    verified_at TEXT
 );
 
 -- Plafonds de niveau des Maîtrises modifiables PAR PERSONNAGE (staff). Absence de ligne = plafond par
@@ -870,6 +880,8 @@ def _ensure_character_armes_maudites_columns(conn):
         return
     if "cout_eo_pct_override" not in cols:
         conn.execute("ALTER TABLE character_armes_maudites ADD COLUMN cout_eo_pct_override INTEGER DEFAULT NULL")
+    if "cout_eo_fixe" not in cols:
+        conn.execute("ALTER TABLE character_armes_maudites ADD COLUMN cout_eo_fixe INTEGER DEFAULT NULL")
 
 
 def _ensure_character_territoire_columns(conn):
@@ -884,6 +896,8 @@ def _ensure_character_territoire_columns(conn):
         conn.execute("ALTER TABLE character_territoire ADD COLUMN image_path TEXT")
     if "is_unlocked" not in cols:
         conn.execute("ALTER TABLE character_territoire ADD COLUMN is_unlocked INTEGER DEFAULT 0")
+    if "cout_eo_fixe" not in cols:
+        conn.execute("ALTER TABLE character_territoire ADD COLUMN cout_eo_fixe INTEGER DEFAULT NULL")
 
 
 def _ensure_appearance_reservations_columns(conn):
@@ -1353,6 +1367,38 @@ def get_validated_character_by_message_id(fiche_message_id: int):
         return conn.execute(
             "SELECT * FROM validated_characters WHERE fiche_message_id = ?", (fiche_message_id,)
         ).fetchone()
+
+
+# ---------- Histoire d'un personnage (/histoire : lien Google Doc public vérifié) ----------
+def set_character_history(character_id: int, gdoc_url: str, gdoc_id: str, verified_at: str):
+    """Enregistre (ou remplace) le lien Google Doc vérifié de l'histoire d'un personnage."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO character_history (character_id, gdoc_url, gdoc_id, verified_at) "
+            "VALUES (?, ?, ?, ?)",
+            (character_id, gdoc_url, gdoc_id, verified_at),
+        )
+
+
+def get_character_history(character_id: int):
+    """Ligne d'histoire d'un personnage (ou None)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM character_history WHERE character_id = ?", (character_id,)
+        ).fetchone()
+
+
+def get_all_character_histories():
+    """Toutes les histoires enregistrées, jointes au personnage validé, UNE LIGNE PAR PERSONNAGE
+    (triées par joueur puis slot). Sert au flux staff « consulter une fiche existante »."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT ch.character_id, ch.gdoc_url, ch.gdoc_id, "
+            "vc.user_id, vc.character_name, vc.slot_number "
+            "FROM character_history ch "
+            "JOIN validated_characters vc ON vc.id = ch.character_id "
+            "ORDER BY vc.user_id, vc.slot_number"
+        ).fetchall()
 
 
 def get_validated_characters_for_user(user_id: int, guild_id: int):

@@ -3069,6 +3069,8 @@ def delete_character_cascade(character_id):
             "DELETE FROM educator_contracts WHERE disciple_character_id = ? OR educator_character_id = ?",
             (character_id, character_id),
         )
+        # Histoire du personnage (/histoire : lien Google Doc vérifié).
+        conn.execute("DELETE FROM character_history WHERE character_id = ?", (character_id,))
         # Réservations d'apparence (/réserv-appa) : découplées de character_id, on nettoie par le triplet
         # (user_id, guild_id, slot_number) résolu ci-dessus. Ainsi le joueur devra refaire valider une
         # apparence s'il recrée un personnage sur ce slot.
@@ -4607,27 +4609,98 @@ class Depart(commands.Cog):
             if new_role_id:
                 db.add_virtual_role(char["id"], new_role_id)
 
+    async def _modif_wait_message(self, channel, staff, question: str):
+        """Comme _reroll_wait_text mais retourne l'OBJET message (pour inspecter role_mentions).
+        Retourne None si « annuler » / délai."""
+        await channel.send(question)
+
+        def check(m):
+            return m.author.id == staff.id and m.channel.id == channel.id
+
+        try:
+            m = await self.bot.wait_for("message", check=check, timeout=300)
+        except asyncio.TimeoutError:
+            await channel.send("⏳ Temps écoulé, modification annulée.")
+            return None
+        if m.content.strip().lower() in ("annuler", "cancel"):
+            await channel.send("Modification annulée.")
+            return None
+        return m
+
+    def _modif_clan_key_from_role_id(self, role_id):
+        """role_id -> clé de clan (minuscule, comme en base) via les role_id DÉJÀ connus du barème
+        (CLAN_ROLES), ou 'sans_clan' pour SANS_CLAN_ROLE_ID. None si le rôle n'est pas un rôle de clan."""
+        if role_id == SANS_CLAN_ROLE_ID:
+            return "sans_clan"
+        from cogs.clans import CLAN_ROLES  # import paresseux (aucun cycle : clans n'importe pas depart)
+        for name, rid in CLAN_ROLES.items():
+            if rid == role_id:
+                return name.lower()  # clé de clan en base = minuscule ("Gojo" -> "gojo")
+        return None
+
     async def _modif_prepare(self, channel, staff, guild, char, element):
         """Demande + valide la nouvelle valeur d'un élément. Retourne (label, old_display, new_display,
         apply_coro) ou None (annulation / élément inapplicable). apply_coro applique base + rôles."""
         cid = char["id"]
 
-        # --- 1. Prénom / 2. Nom ---
-        if element in (1, 2):
-            label = "Prénom" if element == 1 else "Nom"
-            old = (char["prenom"] if element == 1 else char["nom"]) or "—"
-            val = await self._reroll_wait_text(channel, staff, f"✏️ Nouveau **{label}** ? (ou « annuler »)")
+        # --- 1. Prénom ---
+        if element == 1:
+            old = char["prenom"] or "—"
+            val = await self._reroll_wait_text(channel, staff, "✏️ Nouveau **Prénom** ? (ou « annuler »)")
             if val is None:
                 return None
-            prenom_part = (val if element == 1 else (char["prenom"] or "")).strip()
-            nom_part = (val if element == 2 else (char["nom"] or "")).strip()
-            character_name = f"{prenom_part} {nom_part}".strip()
+            val = val.strip()
+            nom_part = (char["nom"] or "").strip()
+            character_name = f"{val} {nom_part}".strip()
 
             async def apply():
-                fields = {"character_name": character_name}
-                fields["prenom" if element == 1 else "nom"] = val
-                db.update_validated_fields(cid, **fields)
-            return label, old, val, apply
+                db.update_validated_fields(cid, prenom=val, character_name=character_name)
+            return "Prénom", old, val, apply
+
+        # --- 2. Nom : mention d'un rôle de clan = VRAI changement de clan ; sinon = cosmétique ---
+        if element == 2:
+            msg = await self._modif_wait_message(
+                channel, staff,
+                "✏️ Quel est le nouveau nom ? (Pour un simple changement de nom de famille, écris le "
+                "texte normalement. Pour changer réellement de clan, MENTIONNE le rôle du clan concerné, "
+                "ex: @Gojo, ou @Sans clan.)")
+            if msg is None:
+                return None
+
+            # Détection d'une VRAIE mention de rôle de clan (barème CLAN_ROLES / SANS_CLAN_ROLE_ID).
+            detected = None
+            for role in msg.role_mentions:
+                key = self._modif_clan_key_from_role_id(role.id)
+                if key is not None:
+                    detected = key
+                    break
+
+            if detected is not None:
+                # Changement RÉEL de clan (rôles + points), pas un simple renommage.
+                old_clan_disp = self._modif_clan_display(char["clan"])
+                new_clan_disp = self._modif_clan_display(detected)
+                confirm_desc = (
+                    f"⚠️ Ceci va changer le **clan** de ce personnage vers **{new_clan_disp}**. "
+                    "Il perdra son clan actuel et les rôles/points associés. Confirmer ?")
+
+                async def apply():
+                    # nom repasse à NULL : l'affichage retombe sur le clan par défaut (comportement en place).
+                    db.update_validated_fields(cid, nom=None)
+                    # Retire l'ancien rôle de clan, attribue le nouveau (réel slot 1 / virtuel slots 2-3)
+                    # + sync_role_points('clan', nouveau_role_id) — logique partagée avec /reroll.
+                    await self._reroll_apply_clan(guild, char, detected)
+                # Label « Clan » -> le log du salon de modification enregistrera bien un changement de clan.
+                return "Clan", old_clan_disp, new_clan_disp, apply, confirm_desc
+
+            # Aucune mention de rôle -> PUREMENT cosmétique (aucune comparaison de texte avec les clans).
+            val = msg.content.strip()
+            old = char["nom"] or "—"
+            prenom_part = (char["prenom"] or "").strip()
+            character_name = f"{prenom_part} {val}".strip()
+
+            async def apply():
+                db.update_validated_fields(cid, nom=val, character_name=character_name)
+            return "Nom", old, val, apply
 
         # --- 3. Âge ---
         if element == 3:
@@ -4923,12 +4996,14 @@ class Depart(commands.Cog):
             if prepared is None:
                 cancelled += 1
                 continue  # annulation / élément inapplicable -> compte comme une modification
-            label, old_display, new_display, apply = prepared
+            label, old_display, new_display, apply = prepared[:4]
+            # 5e élément optionnel : texte de confirmation personnalisé (ex. avertissement changement de clan).
+            confirm_override = prepared[4] if len(prepared) > 4 else None
 
             # Confirmation AVANT l'UPDATE.
             emb = discord.Embed(
                 title="⚠️ Confirmes-tu ce changement ?",
-                description=f"**{label}** : {old_display} → {new_display}",
+                description=confirm_override or f"**{label}** : {old_display} → {new_display}",
                 color=discord.Color.gold())
             view = _ModifConfirmView(staff.id)
             await channel.send(embed=emb, view=view)
