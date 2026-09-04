@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands
 
+from cogs.utils import database as db
 from cogs.utils.coherence_check import run_coherence_check
 
 # ---------- IDs ----------
@@ -76,16 +77,21 @@ def build_clans_report(guild) -> str:
 
         clan_data[member_clan][member_grade].append(member.display_name)
 
+    # SOURCE UNIQUE d'occupation (validated_characters, tous slots + cap courant), partagée avec l'embed
+    # d'étape de /depart : l'en-tête « occupés / cap » ne dépend PLUS des rôles Discord (qui ignorent les
+    # slots 2/3 virtuels) ni d'un cap codé en dur — plus aucun écart avec le message du bot.
+    occupancy = db.get_clan_occupancy(guild.id)
+
     lines = []
     for index, clan_name in enumerate(CLAN_ROLES):
         grades = clan_data[clan_name]
-        total = sum(len(members) for members in grades.values())
+        occ, cap = occupancy.get(clan_name.lower(), (0, 0))
 
         if index > 0:
             lines.append("")  # ligne vide entre chaque clan
 
         lines.append(SEPARATOR)
-        lines.append(_pad_line(f"🏯  CLAN {clan_name.upper()}", f"{total} / 10", HEADER_WIDTH))
+        lines.append(_pad_line(f"🏯  CLAN {clan_name.upper()}", f"{occ} / {cap}", HEADER_WIDTH))
         lines.append(SEPARATOR)
 
         for grade_name, _grade_role_id, emoji, limit in GRADE_ROLES:

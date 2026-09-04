@@ -508,10 +508,12 @@ class Inventaire(commands.Cog):
         page_rows = pages[page]
         items = [
             (r["name"], r["description"] or "", r["classe"] or "sans", r["quantity"],
-             f"{(r['valeur_base'] or 0) * r['quantity']:,} ¥")
+             ("Non disponible à l'achat" if r["valeur_base"] is None
+              else f"{r['valeur_base'] * r['quantity']:,} ¥"))
             for r in page_rows
         ]
-        total_value = sum((r["valeur_base"] or 0) * r["quantity"] for r in rows)
+        # Valeur totale : les objets à prix NULL (non achetables) sont EXPLICITEMENT exclus de l'agrégat.
+        total_value = sum(r["valeur_base"] * r["quantity"] for r in rows if r["valeur_base"] is not None)
         char = get_character(character_id)
         name = char["character_name"] if char else "?"
         path = _tmp_inv("inv")
@@ -587,7 +589,11 @@ class Inventaire(commands.Cog):
             embed = discord.Embed(title=f"ℹ️ {item['name']}", color=PHOENIX_COLOR)
             embed.add_field(name="Description", value=item["description"] or "—", inline=False)
             embed.add_field(name="Classe", value=("Sans classe" if classe == "sans" else f"Classe {classe}"), inline=True)
-            embed.add_field(name="Valeur de base", value=f"{item['valeur_base'] or 0:,} ¥", inline=True)
+            embed.add_field(
+                name="Valeur de base",
+                value=("Non disponible à l'achat" if item["valeur_base"] is None
+                       else f"{item['valeur_base']:,} ¥"),
+                inline=True)
             embed.add_field(name="Quantité possédée", value=str(qty), inline=True)
             await channel.send(embed=embed)
         finally:

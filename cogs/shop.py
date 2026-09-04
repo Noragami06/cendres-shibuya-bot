@@ -15,7 +15,9 @@
 
 import asyncio
 import os
+import random
 import re
+import unicodedata
 import uuid
 
 import discord
@@ -44,6 +46,28 @@ NO_PERM_MSG = "Tu n'as pas la permission d'utiliser ce bouton."
 
 def _is_staff(member) -> bool:
     return any(r.id == FICHE_STAFF_ROLE_ID for r in getattr(member, "roles", []))
+
+
+# Pour ajouter une future catégorie à l'auto-remplissage de prix par classe, il suffit d'ajouter une
+# entrée ici avec les 5 fourchettes (4/3/2/1/S) — aucune autre modification de code nécessaire.
+SHOP_CLASS_PRICE_RANGES = {
+    "arme maudite": {"4": (8000, 20000), "3": (20000, 50000), "2": (50000, 120000), "1": (120000, 300000), "S": (300000, 700000)},
+    "relique": {"4": (14400, 36000), "3": (36000, 90000), "2": (90000, 216000), "1": (216000, 540000), "S": (540000, 1260000)},
+    "potion": {"4": (3200, 8000), "3": (8000, 20000), "2": (20000, 48000), "1": (48000, 120000), "S": (120000, 280000)},
+}
+
+
+def _normalize_cat_name(name: str) -> str:
+    """Normalise un nom de catégorie (minuscule + sans accents) pour matcher SHOP_CLASS_PRICE_RANGES
+    quel que soit l'orthographe stockée dans shop_categories (« Arme maudite », « Relique », …)."""
+    s = unicodedata.normalize("NFKD", name or "")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return s.strip().lower()
+
+
+def get_class_price_ranges_for_category(cat_name: str):
+    """Fourchettes de prix par classe pour cette catégorie, ou None si elle n'est pas auto-tarifée."""
+    return SHOP_CLASS_PRICE_RANGES.get(_normalize_cat_name(cat_name))
 
 
 def _tmp_shop(prefix: str) -> str:
@@ -202,9 +226,14 @@ def _clean_val(s: str) -> str:
     return s.strip().strip("/").strip()
 
 
-def parse_bulk_items(text: str):
+def parse_bulk_items(text: str, price_ranges=None):
     """Retourne (items_valides, erreurs). items_valides = liste de dicts
     {order, name, description, prix, classe}. erreurs = liste de tuples (numero_ordre, message).
+
+    `price_ranges` (optionnel) : le dict {classe: (lo, hi)} de la catégorie si elle est AUTO-tarifée
+    (Arme maudite / Relique / Potion). Dans ce cas le prix n'est PAS saisi mais tiré aléatoirement dans
+    la fourchette de la classe (qui doit alors être S/1/2/3/4). Sinon le prix est saisi manuellement, et
+    un prix de 0 signifie « jamais achetable » (prix = None -> valeur_base NULL).
 
     En plus de la validation champ par champ, détecte les DOUBLONS DE NOM au sein du même lot
     (insensible à la casse) : la 2e occurrence et les suivantes sont marquées en erreur. La
@@ -251,17 +280,7 @@ def parse_bulk_items(text: str):
                 item_errors.append(f'Un objet nommé "{name}" apparaît déjà plus haut dans ce même lot.')
             seen_names.add(name.lower())
 
-        raw_prix = values.get("prix")
-        prix = None
-        if not raw_prix:
-            item_errors.append("prix manquant")
-        else:
-            cleaned = raw_prix.replace(" ", "").replace(",", "").replace("¥", "")
-            if not cleaned.isdigit() or int(cleaned) <= 0:
-                item_errors.append(f"prix invalide (« {raw_prix} »)")
-            else:
-                prix = int(cleaned)
-
+        # Classe d'abord (toujours requise ; indispensable au prix auto des catégories tarifées).
         raw_classe = values.get("classe")
         classe = None
         if not raw_classe:
@@ -275,13 +294,52 @@ def parse_bulk_items(text: str):
             else:
                 item_errors.append(f"classe invalide (« {raw_classe} »)")
 
+        # Prix. Règle « 0 = jamais achetable » -> prix = None (valeur_base NULL) partout.
+        # Catégorie tarifée par classe : le prix n'est AUTO que si le champ est laissé vide ou vaut
+        # « auto » ; un montant précis est pris tel quel (fourchette ignorée).
+        prix = None
+        auto_priced = False
+        if price_ranges is not None:
+            if classe is None:
+                pass  # erreur de classe déjà signalée
+            elif classe not in price_ranges:
+                item_errors.append("classe requise (S, 1, 2, 3, 4) pour cette catégorie")
+            else:
+                raw_prix = values.get("prix")
+                token = (raw_prix or "").strip().lower()
+                if token in ("", "auto"):
+                    # Vide ou « auto » -> tirage automatique dans la fourchette de la classe.
+                    lo, hi = price_ranges[classe]
+                    prix = random.randint(lo, hi)
+                    auto_priced = True
+                else:
+                    cleaned = raw_prix.replace(" ", "").replace(",", "").replace("¥", "")
+                    if not cleaned.isdigit():
+                        item_errors.append(f"prix invalide (« {raw_prix} »)")
+                    elif int(cleaned) == 0:
+                        prix = None  # 0 = objet non achetable (valeur_base NULL)
+                    else:
+                        prix = int(cleaned)  # montant précis : la fourchette est ignorée
+        else:
+            raw_prix = values.get("prix")
+            if not raw_prix:
+                item_errors.append("prix manquant")
+            else:
+                cleaned = raw_prix.replace(" ", "").replace(",", "").replace("¥", "")
+                if not cleaned.isdigit():
+                    item_errors.append(f"prix invalide (« {raw_prix} »)")
+                elif int(cleaned) == 0:
+                    prix = None  # 0 = objet non achetable (valeur_base NULL)
+                else:
+                    prix = int(cleaned)
+
         description = values.get("desc", "") or ""
 
         if item_errors:
             errors.append((order, ", ".join(item_errors)))
         else:
             valid.append({"order": order, "name": name, "description": description,
-                          "prix": prix, "classe": classe})
+                          "prix": prix, "classe": classe, "auto": auto_priced})
 
     return valid, errors
 
@@ -577,7 +635,8 @@ class Shop(commands.Cog):
         page = max(0, min(page, total_pages - 1))
         page_rows = pages[page]
         items = [
-            (r["name"], r["description"] or "", r["classe"] or "sans", f"{(r['valeur_base'] or 0):,} ¥")
+            (r["name"], r["description"] or "", r["classe"] or "sans",
+             "Non disponible à l'achat" if r["valeur_base"] is None else f"{r['valeur_base']:,} ¥")
             for r in page_rows
         ]
         path = _tmp_shop("shop")
@@ -710,7 +769,9 @@ class Shop(commands.Cog):
             classe = item["classe"] or "sans"
             embed = discord.Embed(title=f"ℹ️ {item['name']}", color=PHOENIX_COLOR)
             embed.add_field(name="Description", value=item["description"] or "—", inline=False)
-            embed.add_field(name="Prix", value=f"{item['valeur_base'] or 0:,} ¥", inline=True)
+            prix_txt = ("Non disponible à l'achat" if item["valeur_base"] is None
+                        else f"{item['valeur_base']:,} ¥")
+            embed.add_field(name="Prix", value=prix_txt, inline=True)
             embed.add_field(
                 name="Classe", value=("Sans classe" if classe == "sans" else f"Classe {classe}"),
                 inline=True,
@@ -758,6 +819,10 @@ class Shop(commands.Cog):
             )
             if item is None:
                 await channel.send("⏳ Achat annulé.")
+                return
+            # Prix à l'infini (valeur_base NULL) : objet réservé aux give/récompenses, jamais achetable.
+            if item["valeur_base"] is None:
+                await channel.send("🔒 Cet objet n'est **pas disponible à l'achat**.")
                 return
 
             qty = await self.ask_quantity(channel, interaction.user, "Quelle quantité veux tu acheter ?")
@@ -829,6 +894,10 @@ class Shop(commands.Cog):
             fresh = get_item(item_id)
             if fresh is None:
                 await channel.send("Cet objet n'est plus disponible, l'achat a été annulé.")
+                return
+            # Robustesse #3 : si le prix a été mis à l'infini (NULL) entre-temps, on n'achète pas.
+            if fresh["valeur_base"] is None:
+                await channel.send("🔒 Cet objet n'est plus disponible à l'achat, l'achat a été annulé.")
                 return
             prix_unitaire = fresh["valeur_base"] or 0
             prix_total = prix_unitaire * qty
@@ -1053,6 +1122,8 @@ class Shop(commands.Cog):
                     (it["id"],),
                 ).fetchall()
             for h in holders:
+                # Un objet à prix NULL (non achetable) vaut 0 -> montant 0 -> EXCLU du remboursement
+                # par le garde `montant > 0` ci-dessous (jamais de crash, jamais de remboursement fantôme).
                 montant = (it["valeur_base"] or 0) * h["quantity"]
                 if montant > 0 and _refund_character(
                     h["character_id"], montant, f"Remboursement — suppression catégorie {cat_name}"
@@ -1103,16 +1174,32 @@ class Shop(commands.Cog):
                 await channel.send("⏳ Annulé.")
                 return
             cat_id = sview.result
-            await channel.send(
-                "Colle la liste des objets à créer, au format :\n"
-                "`N: nom / descr: description / prix: montant / classe: S,1,2,3,4 ou sans`\n\n"
-                "Tu peux en créer plusieurs d'un coup, un par ligne ou à la suite."
-            )
+            cat_row = get_shop_category(cat_id)
+            price_ranges = get_class_price_ranges_for_category(cat_row["name"]) if cat_row else None
+            if price_ranges is not None:
+                # Catégorie tarifée par classe : le champ prix est OPTIONNEL (auto si vide/'auto').
+                await channel.send(
+                    "Colle la liste des objets à créer, au format :\n"
+                    "`N: nom / descr: description / classe: S,1,2,3,4 / prix: montant`\n\n"
+                    "La **classe (S/1/2/3/4) est obligatoire**. Le champ **prix est optionnel** :\n"
+                    "• laissé vide ou `prix: auto` → prix **automatique** selon la classe\n"
+                    "• `prix: 0` → objet **jamais achetable** (give/récompenses manuelles)\n"
+                    "• `prix: <montant>` → **ce montant précis** (la fourchette de classe est ignorée)\n"
+                    "Tu peux en créer plusieurs d'un coup, un par ligne ou à la suite."
+                )
+            else:
+                await channel.send(
+                    "Colle la liste des objets à créer, au format :\n"
+                    "`N: nom / descr: description / prix: montant / classe: S,1,2,3,4 ou sans`\n\n"
+                    "🔒 Astuce : un **prix de 0** rend l'objet **jamais achetable** (réservé aux "
+                    "give/récompenses manuelles).\n"
+                    "Tu peux en créer plusieurs d'un coup, un par ligne ou à la suite."
+                )
             m = await self.wait_message(channel, interaction.user)
             if m is None:
                 await channel.send("⏳ Annulé.")
                 return
-            valid, errors = parse_bulk_items(m.content)
+            valid, errors = parse_bulk_items(m.content, price_ranges)
             if not valid and not errors:
                 await channel.send(
                     "❌ Format non reconnu : aucun champ « nom: » détecté. Réessaie via le bouton."
@@ -1121,6 +1208,7 @@ class Shop(commands.Cog):
 
             created = 0
             all_errors = list(errors)
+            created_items = []  # (name, classe, prix, auto) pour le récapitulatif
             for it in valid:
                 # Doublon avec un objet DÉJÀ en base (les doublons INTRA-lot sont gérés par le parseur).
                 if get_item_by_name_ci(it["name"]):
@@ -1128,8 +1216,20 @@ class Shop(commands.Cog):
                     continue
                 create_item(it["name"], it["description"], it["classe"], it["prix"], cat_id)
                 created += 1
+                created_items.append((it["name"], it["classe"], it["prix"], it.get("auto", False)))
 
             report = f"✅ {created} objet(s) créé(s) avec succès."
+            if created_items:
+                lignes = []
+                for n, c, p, auto in created_items:
+                    if p is None:
+                        # §3 : objet rendu non achetable (prix 0 -> NULL).
+                        lignes.append(f"🔒 {n} (Classe {c}) : non achetable (prix infini)")
+                    elif auto:
+                        lignes.append(f"💰 {n} (Classe {c}) : {p:,} ¥ (prix automatique)")
+                    else:
+                        lignes.append(f"• {n} (Classe {c}) : {p:,} ¥")
+                report += "\n" + "\n".join(lignes)
             if all_errors:
                 all_errors.sort(key=lambda e: e[0])
                 report += "\n⚠️ Les objets suivants n'ont pas pu être créés :\n" + "\n".join(
@@ -1171,13 +1271,21 @@ class Shop(commands.Cog):
             classe = item["classe"] or "sans"
             info = discord.Embed(title=f"✏️ {item['name']}", color=PHOENIX_COLOR)
             info.add_field(name="Description", value=item["description"] or "—", inline=False)
-            info.add_field(name="Prix", value=f"{item['valeur_base'] or 0:,} ¥", inline=True)
+            info.add_field(
+                name="Prix",
+                value=("Non disponible à l'achat" if item["valeur_base"] is None
+                       else f"{item['valeur_base']:,} ¥"),
+                inline=True)
             info.add_field(
                 name="Classe", value=("Sans classe" if classe == "sans" else f"Classe {classe}"),
                 inline=True,
             )
             await channel.send(embed=info)
 
+            # La modification d'objet ne permet PAS de changer la catégorie d'un objet existant. Et même
+            # si un tel outil était ajouté plus tard : le prix n'est jamais recalculé automatiquement lors
+            # d'un changement de catégorie après création — il reste celui déjà fixé, le staff doit le
+            # modifier manuellement s'il veut l'aligner sur la nouvelle catégorie.
             param = None
             while param is None:
                 await channel.send("Quel paramètre veux tu modifier ? (nom / description / prix / classe)")
@@ -1222,8 +1330,16 @@ class Shop(commands.Cog):
                     update_item(item["id"], description=val)
                 elif param == "prix":
                     cleaned = val.replace(" ", "").replace(",", "").replace("¥", "")
-                    if not cleaned.isdigit() or int(cleaned) <= 0:
-                        await channel.send("❌ Prix invalide (entier positif attendu). Opération annulée.")
+                    if not cleaned.isdigit():
+                        await channel.send("❌ Prix invalide (entier positif, ou 0 pour « jamais "
+                                           "achetable »). Opération annulée.")
+                        return
+                    if int(cleaned) == 0:
+                        # §3 : 0 = prix infini -> valeur_base NULL, plus jamais achetable.
+                        update_item(item["id"], valeur_base=None)
+                        await channel.send(
+                            "🔒 Prix mis à l'infini — cet objet ne sera jamais achetable par les joueurs "
+                            "(utile pour un objet réservé aux give/récompenses manuelles).")
                         return
                     update_item(item["id"], valeur_base=int(cleaned))
                 else:  # classe
@@ -1322,6 +1438,7 @@ class Shop(commands.Cog):
             ).fetchall()
         lines = []
         for h in holders:
+            # Prix NULL (non achetable) -> montant 0 -> EXCLU du remboursement par `montant > 0`.
             montant = (item["valeur_base"] or 0) * h["quantity"]
             if montant > 0 and _refund_character(
                 h["character_id"], montant, f"Remboursement — suppression de {item['name']}"

@@ -589,6 +589,9 @@ def build_clan_table_embed(guild: discord.Guild) -> discord.Embed:
     """Embed de l'étape 2 : tableau des clans avec pourcentages, occupation et sort héréditaire partiel."""
     data = load_clan_state()
     clans = data["clans"]
+    # SOURCE UNIQUE d'occupation (validated_characters, tous slots + cap courant), partagée avec le
+    # rapport terminal des clans (cogs/clans.py) -> plus aucun écart entre les deux affichages.
+    occupancy = db.get_clan_occupancy(guild.id if guild else None)
 
     embed = discord.Embed(
         title="🎲 Étape 2 — Tirage du clan et du sort",
@@ -597,7 +600,7 @@ def build_clan_table_embed(guild: discord.Guild) -> discord.Embed:
     )
 
     for clan_key, info in clans.items():
-        count = get_clan_member_count(guild, clan_key)
+        count, cap = occupancy.get(clan_key, (0, info["cap"]))
         partiel = "Oui" if info["partial_heredit"] else "Non"
         name = clan_key.capitalize()
 
@@ -609,7 +612,7 @@ def build_clan_table_embed(guild: discord.Guild) -> discord.Embed:
         embed.add_field(
             name=field_name,
             value=(
-                f"Occupation : **{count}/{info['cap']}**\n"
+                f"Occupation : **{count}/{cap}**\n"
                 f"Sort héréditaire partiel : {partiel}"
             ),
             inline=False,

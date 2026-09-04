@@ -1479,6 +1479,25 @@ def count_clan_members(guild_id: int, clan: str) -> int:
         ).fetchone()["n"]
 
 
+def get_clan_occupancy(guild_id: int) -> dict:
+    """SOURCE UNIQUE de l'occupation des clans, partagée par le bot (embed d'étape /depart) ET le
+    rapport terminal (cogs/clans.py). Retourne {clan_key: (occupés, cap)} pour les 7 clans.
+
+    - occupés : COUNT(*) sur validated_characters (TOUS slots, réels ET virtuels) — jamais les rôles
+      Discord (les slots 2/3 n'ont pas de rôle réel et seraient donc invisibles côté rôles).
+    - cap : la capacité COURANTE du clan lue dans clan_roll_state (dynamique : elle grandit de +5 à
+      chaque réouverture générale) — jamais une constante codée en dur.
+    Filtre par guild_id, comme count_clan_members."""
+    state = load_clan_state()
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT clan, COUNT(*) AS n FROM validated_characters WHERE guild_id = ? GROUP BY clan",
+            (guild_id,),
+        ).fetchall()
+    counts = {r["clan"]: r["n"] for r in rows}
+    return {key: (counts.get(key, 0), info["cap"]) for key, info in state["clans"].items()}
+
+
 def heir_exists(guild_id: int, clan: str) -> bool:
     """True si un personnage validé de ce clan porte déjà le grade 'Héritier' (réel OU virtuel).
     Source de vérité : la base, pas les rôles Discord (un héritier de slot 2/3 n'a pas de rôle)."""
