@@ -66,6 +66,11 @@ SANS_CLAN_ROLE_ID = 1539169032324907048           # Rôle "Sans clan" (barème :
 RCT_POSSEDE_ROLE_ID = 1522181335337402408
 RCT_NON_POSSEDE_ROLE_ID = 1522181321961635964
 
+# Salon de logs dédié aux modifications de fiche (/modification). Créé à la volée si absent, puis
+# mémorisé dans bot_state ('modification_logs_channel_id') pour ne le créer qu'une seule fois.
+MODIFICATION_LOGS_CATEGORY_ID = 1514876234461351957
+MODIFICATION_LOGS_BEFORE_CHANNEL_ID = 1521243703921086606
+
 # Grades de clan (ordre d'affichage)
 GRADE_ROLES = [
     ("Chef du clan", 1521963027925172344),
@@ -1513,7 +1518,18 @@ def build_fiche_embed(progress: dict, guild, member, uid: int,
     clan_key = progress.get("clan")
     has_clan = has_clan_from_progress(progress)
     clan_display = clan_key.capitalize() if has_clan else "Sans clan"
-    nom_final = clan_key.capitalize() if has_clan else (progress.get("nom") or "—")
+    # Ligne « Nom » de l'embed : la colonne `nom` (renseignée à la validation puis éditable via
+    # /modification) est PRIORITAIRE dès qu'elle a une valeur. Si elle est vide/NULL (ex. embed de
+    # création avant validation), on retombe EXACTEMENT sur l'ancien comportement : clan pour un
+    # personnage de clan, sinon « — ». Changement PUREMENT VISUEL : le vrai clan (et donc les points
+    # de clan) reste inchangé en base, aucune logique de rôle/barème/sync_role_points n'est touchée ici.
+    nom_modifie = progress.get("nom")
+    if nom_modifie:
+        nom_final = nom_modifie
+    elif has_clan:
+        nom_final = clan_key.capitalize()
+    else:
+        nom_final = "—"
     prenom = progress.get("prenom") or "—"
     age = progress.get("age")
     age_display = str(age) if age is not None else "—"
@@ -1798,6 +1814,12 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
         character_id = prof_row["id"]
         # Traçabilité de la récompense de départ (type + détail) pour un retrait exact au reroll.
         db.set_recompense_trace(character_id, progress.get("recompense_type"), progress.get("recompense"))
+        # Champs d'identité persistants (source de vérité pour /modification, plus robuste que la
+        # progression qui peut être écrasée par une création ultérieure). nom_final = clan pour un
+        # personnage de clan, sinon le nom libre.
+        db.update_validated_fields(
+            character_id, prenom=prenom, nom=nom_final,
+            age=progress.get("age"), histoire=progress.get("histoire"))
         db.create_profile_from_fiche(character_id, progress.get("eo_value"))
         # Source de vérité PERMANENTE de la réserve d'EO : même valeur que validated_characters.eo_value.
         # Resynchronisée à chaque affichage du profil (sync_eo_with_fiche), robuste aux redémarrages.
@@ -3575,6 +3597,68 @@ class _RerollRewardView(discord.ui.View):
         self.stop()
 
 
+class _ModifConfirmView(discord.ui.View):
+    """✅ Confirmer / ❌ Annuler avant CHAQUE modification de /modification. Réservé au staff qui pilote
+    la commande, avec protection anti double-clic (boutons désactivés au premier clic)."""
+
+    def __init__(self, staff_id: int):
+        super().__init__(timeout=600)
+        self.staff_id = staff_id
+        self.value = None  # "confirm" / "cancel" / None (timeout)
+
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.staff_id:
+            await interaction.response.send_message("Cette modification ne t'appartient pas.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirmer", emoji="✅", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        self.value = "confirm"
+        for it in self.children:
+            it.disabled = True
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+    @discord.ui.button(label="Annuler", emoji="❌", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        self.value = "cancel"
+        for it in self.children:
+            it.disabled = True
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+
+async def get_or_create_modification_logs_channel(guild):
+    """Salon de logs des modifications de fiche : renvoie l'existant (mémorisé dans bot_state) ou le crée
+    dans la bonne catégorie, positionné juste avant le salon de référence. None si impossible (catégorie
+    introuvable / permissions manquantes)."""
+    channel_id = db.get_bot_state("modification_logs_channel_id")
+    if channel_id:
+        channel = guild.get_channel(int(channel_id))
+        if channel is not None:
+            return channel  # déjà créé
+
+    category = guild.get_channel(MODIFICATION_LOGS_CATEGORY_ID)
+    if category is None:
+        return None
+    reference = guild.get_channel(MODIFICATION_LOGS_BEFORE_CHANNEL_ID)
+    try:
+        new_channel = await category.create_text_channel(
+            "❘・📝-modification-fiche",
+            position=reference.position if reference else None)
+        if reference is not None:
+            await new_channel.move(before=reference)
+    except discord.HTTPException:
+        return None
+    db.set_bot_state("modification_logs_channel_id", str(new_channel.id))
+    return new_channel
+
+
 class Depart(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -4347,6 +4431,11 @@ class Depart(commands.Cog):
             "rct": char["rct"], "recompense": char["recompense_detail"],
             "portrait_path": char["portrait_path"],
         })
+        # Champs d'identité : on privilégie les valeurs persistées sur la fiche validée (éditables via
+        # /modification) quand elles existent ; sinon on retombe sur la progression (fiches anciennes).
+        for col in ("prenom", "nom", "age", "histoire"):
+            if char[col] is not None:
+                merged[col] = char[col]
         guild = interaction.guild
         member = guild.get_member(char["user_id"]) if guild else None
         return build_fiche_embed(merged, guild, member, char["user_id"],
@@ -4464,6 +4553,410 @@ class Depart(commands.Cog):
             queue.append(payload)
 
         await self._reroll_apply_all(interaction, char, queue, session)
+
+    # =================================================================
+    # /modification (STAFF) — édition manuelle directe d'une fiche validée
+    # =================================================================
+    MODIF_MENU_TEXT = (
+        "**1.** Prénom\n**2.** Nom\n**3.** Âge\n**4.** Histoire\n**5.** Camp\n**6.** Clan\n"
+        "**7.** Sort\n**8.** Classe de l'EO\n**9.** Quantité de l'EO\n**10.** Nature\n"
+        "**11.** RCT\n**12.** Grade")
+
+    @staticmethod
+    def _modif_camp_display(camp):
+        return {"exorciste": "Exorciste", "hybride": "Hybride", "humain": "Humain"}.get(
+            (camp or "").lower(), camp or "—")
+
+    @staticmethod
+    def _modif_clan_display(clan):
+        return "Sans clan" if (not clan or clan == "sans_clan") else clan.capitalize()
+
+    def _modif_valid_sort_keys(self, char):
+        """Sorts autorisés pour ce personnage (mêmes règles que le tirage : jamais « Sans sort »)."""
+        clan = char["clan"]
+        if not clan or clan == "sans_clan":
+            return ["sort_inne", "restriction"]
+        info = load_clan_state()["clans"].get(clan)
+        if not info:
+            return ["sort_inne", "restriction"]
+        if info["partial_heredit"]:
+            return ["sort_inne", "sort_heredit", "sort_heredit_partiel", "restriction"]
+        return ["sort_inne", "sort_heredit", "restriction"]
+
+    async def _modif_swap_real_or_virtual_role(self, guild, char, old_role_id, new_role_id, reason):
+        """Retire old_role_id / ajoute new_role_id : rôles réels pour le slot 1, virtuels pour 2-3."""
+        if old_role_id == new_role_id:
+            return
+        slot = char["slot_number"]
+        member = guild.get_member(char["user_id"]) if guild else None
+        if slot == 1 and member is not None:
+            try:
+                if old_role_id:
+                    r = guild.get_role(old_role_id)
+                    if r and r in member.roles:
+                        await member.remove_roles(r, reason=reason)
+                if new_role_id:
+                    nr = guild.get_role(new_role_id)
+                    if nr and nr not in member.roles:
+                        await member.add_roles(nr, reason=reason)
+            except discord.Forbidden:
+                print(f"[modification] Permission manquante pour modifier les rôles de {char['user_id']}.")
+        else:
+            if old_role_id:
+                db.remove_virtual_role(char["id"], old_role_id)
+            if new_role_id:
+                db.add_virtual_role(char["id"], new_role_id)
+
+    async def _modif_prepare(self, channel, staff, guild, char, element):
+        """Demande + valide la nouvelle valeur d'un élément. Retourne (label, old_display, new_display,
+        apply_coro) ou None (annulation / élément inapplicable). apply_coro applique base + rôles."""
+        cid = char["id"]
+
+        # --- 1. Prénom / 2. Nom ---
+        if element in (1, 2):
+            label = "Prénom" if element == 1 else "Nom"
+            old = (char["prenom"] if element == 1 else char["nom"]) or "—"
+            val = await self._reroll_wait_text(channel, staff, f"✏️ Nouveau **{label}** ? (ou « annuler »)")
+            if val is None:
+                return None
+            prenom_part = (val if element == 1 else (char["prenom"] or "")).strip()
+            nom_part = (val if element == 2 else (char["nom"] or "")).strip()
+            character_name = f"{prenom_part} {nom_part}".strip()
+
+            async def apply():
+                fields = {"character_name": character_name}
+                fields["prenom" if element == 1 else "nom"] = val
+                db.update_validated_fields(cid, **fields)
+            return label, old, val, apply
+
+        # --- 3. Âge ---
+        if element == 3:
+            old = char["age"] if char["age"] is not None else "—"
+            while True:
+                val = await self._reroll_wait_text(channel, staff, "✏️ Nouvel **Âge** ? (entier positif, ou « annuler »)")
+                if val is None:
+                    return None
+                if val.isdigit() and int(val) >= 1:
+                    age = int(val)
+                    break
+                await channel.send("Réponds par un entier positif (≥ 1), ou « annuler ».")
+
+            async def apply():
+                db.update_validated_fields(cid, age=age)
+            return "Âge", str(old), str(age), apply
+
+        # --- 4. Histoire ---
+        if element == 4:
+            old = char["histoire"] or "—"
+            val = await self._reroll_wait_text(channel, staff, "✏️ Nouvelle **Histoire** ? (texte libre, ou « annuler »)")
+            if val is None:
+                return None
+
+            async def apply():
+                db.update_validated_fields(cid, histoire=val)
+            old_disp = (old[:60] + "…") if len(str(old)) > 60 else old
+            new_disp = (val[:60] + "…") if len(val) > 60 else val
+            return "Histoire", old_disp, new_disp, apply
+
+        # --- 5. Camp ---
+        if element == 5:
+            camp_map = {"exorciste": ROLE_EXORCISTE, "hybride": ROLE_HYBRIDE, "humain": ROLE_HUMAIN}
+            old = self._modif_camp_display(char["camp"])
+            while True:
+                val = await self._reroll_wait_text(
+                    channel, staff, "✏️ Nouveau **Camp** ? (Exorciste / Hybride / Humain, ou « annuler »)")
+                if val is None:
+                    return None
+                key = val.strip().lower()
+                if key in camp_map:
+                    break
+                await channel.send("Camp invalide. Réponds par **Exorciste**, **Hybride** ou **Humain**.")
+            old_rid = camp_map.get((char["camp"] or "").lower())
+            new_rid = camp_map[key]
+
+            async def apply():
+                db.update_validated_fields(cid, camp=key)
+                await self._modif_swap_real_or_virtual_role(guild, char, old_rid, new_rid, "Modification camp (staff)")
+                await sync_role_points(cid, "camp", new_rid, bot=self.bot)
+            return "Camp", old, self._modif_camp_display(key), apply
+
+        # --- 6. Clan ---
+        if element == 6:
+            clans = list(load_clan_state()["clans"].keys())
+            old = self._modif_clan_display(char["clan"])
+            liste = ", ".join(c.capitalize() for c in clans) + ", Sans clan"
+            while True:
+                val = await self._reroll_wait_text(
+                    channel, staff, f"✏️ Nouveau **Clan** ? ({liste}, ou « annuler »)")
+                if val is None:
+                    return None
+                key = val.strip().lower().replace(" ", "_")
+                if key in clans:
+                    new_clan = key
+                    break
+                if key in ("sans_clan",):
+                    new_clan = "sans_clan"
+                    break
+                await channel.send("Clan invalide. Choisis dans la liste proposée (ou « Sans clan »).")
+
+            async def apply():
+                # Réutilise EXACTEMENT la logique de reroll (base + rôles réels/virtuels + sync points).
+                await self._reroll_apply_clan(guild, char, new_clan)
+            return "Clan", old, self._modif_clan_display(new_clan), apply
+
+        # --- 7. Sort ---
+        if element == 7:
+            valid = self._modif_valid_sort_keys(char)
+            old = SORT_LABELS.get(char["sort"], "Aucun") if char["sort"] else "Aucun"
+            liste = "\n".join(f"**{i}.** {SORT_LABELS[k]}" for i, k in enumerate(valid, 1))
+            while True:
+                val = await self._reroll_wait_text(
+                    channel, staff, f"✏️ Nouveau **Sort** ? (réponds par le numéro, ou « annuler »)\n{liste}")
+                if val is None:
+                    return None
+                if val.isdigit() and 1 <= int(val) <= len(valid):
+                    sort_key = valid[int(val) - 1]
+                    break
+                await channel.send(f"Réponds par un numéro entre **1** et **{len(valid)}**.")
+
+            async def apply():
+                db.update_validated_fields(cid, sort=sort_key)
+            return "Sort", old, SORT_LABELS[sort_key], apply
+
+        # --- 8. Classe de l'EO (ne touche PAS eo_value) ---
+        if element == 8:
+            classe_map = {"4": "classe_4", "3": "classe_3", "2": "classe_2", "1": "classe_1", "s": "classe_s"}
+            old = char["eo_classe"].replace("classe_", "").upper() if char["eo_classe"] else "—"
+            while True:
+                val = await self._reroll_wait_text(
+                    channel, staff, "✏️ Nouvelle **Classe de l'EO** ? (4 / 3 / 2 / 1 / S, ou « annuler »)")
+                if val is None:
+                    return None
+                key = val.strip().lower()
+                if key in classe_map:
+                    classe = classe_map[key]
+                    break
+                await channel.send("Classe invalide. Réponds par **4**, **3**, **2**, **1** ou **S**.")
+
+            async def apply():
+                db.update_validated_fields(cid, eo_classe=classe)
+            return "Classe de l'EO", old, classe.replace("classe_", "").upper(), apply
+
+        # --- 9. Quantité de l'EO (validée dans la fourchette de la classe ACTUELLE) ---
+        if element == 9:
+            classe = char["eo_classe"]
+            if not classe:
+                await channel.send("Ce personnage n'a pas de classe d'EO enregistrée : quantité non modifiable.")
+                return None
+            info = EO_CLASS_TABLE[classe]
+            cd = classe.replace("classe_", "").upper()
+            old = f"{char['eo_value']:,} EO" if char["eo_value"] is not None else "—"
+            while True:
+                val = await self._reroll_wait_text(
+                    channel, staff,
+                    f"✏️ Nouvelle **Quantité d'EO** ? (entier, Classe {cd} = {info['min']:,}-{info['max']:,}, ou « annuler »)")
+                if val is None:
+                    return None
+                if val.isdigit() and info["min"] <= int(val) <= info["max"]:
+                    value = int(val)
+                    break
+                await channel.send(
+                    f"❌ Cette quantité ne correspond pas à la Classe {cd} ({info['min']:,}-{info['max']:,}).")
+
+            async def apply():
+                db.update_validated_fields(cid, eo_value=value)
+                db.set_fiche_record(cid, value)  # synchro vivante avec /profil
+            return "Quantité de l'EO", old, f"{value:,} EO", apply
+
+        # --- 10. Nature ---
+        if element == 10:
+            old = NATURE_DISPLAY_NAMES.get(char["nature"], "Aucune") if char["nature"] else "Aucune"
+            liste = ", ".join(NATURE_DISPLAY_NAMES[k] for k in EO_NATURE_TABLE)
+            # accepte la clé (sans_nature/brute/electrique/raffinee) OU le libellé affiché
+            display_to_key = {v.lower(): k for k, v in NATURE_DISPLAY_NAMES.items()}
+            while True:
+                val = await self._reroll_wait_text(
+                    channel, staff, f"✏️ Nouvelle **Nature** ? ({liste}, ou « annuler »)")
+                if val is None:
+                    return None
+                key = val.strip().lower()
+                if key in EO_NATURE_TABLE:
+                    nature = key
+                    break
+                if key in display_to_key:
+                    nature = display_to_key[key]
+                    break
+                await channel.send("Nature invalide. Choisis dans la liste proposée.")
+
+            async def apply():
+                db.update_validated_fields(cid, nature=nature)
+            return "Nature", old, NATURE_DISPLAY_NAMES[nature], apply
+
+        # --- 11. RCT ---
+        if element == 11:
+            old = "Possédé" if char["rct"] else "Non possédé"
+            while True:
+                val = await self._reroll_wait_text(
+                    channel, staff, "✏️ Nouveau **RCT** ? (Possédé / Non possédé, ou « annuler »)")
+                if val is None:
+                    return None
+                key = val.strip().lower()
+                if key in ("possédé", "possede", "oui", "1"):
+                    new_rct = 1
+                    break
+                if key in ("non possédé", "non possede", "non", "0"):
+                    new_rct = 0
+                    break
+                await channel.send("Réponds par **Possédé** ou **Non possédé**.")
+            old_rid = RCT_POSSEDE_ROLE_ID if char["rct"] else RCT_NON_POSSEDE_ROLE_ID
+            new_rid = RCT_POSSEDE_ROLE_ID if new_rct else RCT_NON_POSSEDE_ROLE_ID
+
+            async def apply():
+                db.update_validated_fields(cid, rct=new_rct)
+                await self._modif_swap_real_or_virtual_role(guild, char, old_rid, new_rid, "Modification RCT (staff)")
+            return "RCT", old, ("Possédé" if new_rct else "Non possédé"), apply
+
+        # --- 12. Grade (protection anti conflit d'Héritier) ---
+        if element == 12:
+            grade_names = [name for name, _ in GRADE_ROLES]
+            old = char["grade"] or "—"
+            liste = "\n".join(f"**{i}.** {n}" for i, n in enumerate(grade_names, 1))
+            while True:
+                val = await self._reroll_wait_text(
+                    channel, staff, f"✏️ Nouveau **Grade** ? (réponds par le numéro, ou « annuler »)\n{liste}")
+                if val is None:
+                    return None
+                if val.isdigit() and 1 <= int(val) <= len(grade_names):
+                    grade = grade_names[int(val) - 1]
+                    break
+                await channel.send(f"Réponds par un numéro entre **1** et **{len(grade_names)}**.")
+            # Anti conflit d'héritier : un héritier existe déjà pour ce clan -> repli Membres principaux.
+            heir_conflict = grade == "Héritier" and db.heir_exists(char["guild_id"], char["clan"])
+            effective_grade = "Membres principaux" if heir_conflict else grade
+            if heir_conflict:
+                await channel.send(
+                    "⚠️ Un héritier existe déjà pour ce clan : grade replié sur **Membres principaux**.")
+            old_rid = GRADE_LABEL_TO_ROLE_ID.get(char["grade"]) if char["grade"] else None
+            new_rid = GRADE_LABEL_TO_ROLE_ID.get(effective_grade)
+
+            async def apply():
+                db.update_validated_fields(cid, grade=effective_grade)
+                await self._modif_swap_real_or_virtual_role(guild, char, old_rid, new_rid, "Modification grade (staff)")
+                if new_rid:
+                    await sync_role_points(cid, "grade", new_rid, bot=self.bot)
+            return "Grade", old, effective_grade, apply
+
+        return None
+
+    async def _modif_log(self, guild, staff, char, element_label, old_display, new_display):
+        """Poste un embed de log par modification CONFIRMÉE dans le salon dédié (créé à la volée)."""
+        try:
+            log_channel = await get_or_create_modification_logs_channel(guild)
+        except discord.HTTPException:
+            log_channel = None
+        if log_channel is None:
+            return
+        embed = discord.Embed(
+            title="📝 Modification de fiche",
+            description=(
+                f"**Personnage :** {char['character_name']} (Slot {char['slot_number']})\n"
+                f"**Modifié par :** {staff.mention}\n"
+                f"**{element_label}** : {old_display} → {new_display}"),
+            color=discord.Color.orange())
+        try:
+            await log_channel.send(embed=embed)
+        except discord.HTTPException:
+            pass
+
+    @app_commands.command(name="modification",
+                          description="Modifie manuellement un ou plusieurs champs d'une fiche validée")
+    @app_commands.describe(message_id="ID du message d'embed de la fiche (salon des fiches validées)")
+    async def modification(self, interaction: discord.Interaction, message_id: str):
+        if not _is_fiche_staff(interaction.user):
+            await interaction.response.send_message(
+                "❌ Seul le staff peut utiliser cette commande.", ephemeral=True)
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "Cette commande s'utilise sur le serveur.", ephemeral=True)
+            return
+        try:
+            mid = int(message_id.strip())
+        except (TypeError, ValueError):
+            await interaction.response.send_message(
+                "❌ L'ID de message doit être un nombre entier.", ephemeral=True)
+            return
+
+        char = db.get_validated_character_by_message_id(mid)
+        if char is None:
+            await interaction.response.send_message(
+                "❌ Aucune fiche validée ne correspond à cet ID de message.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"🛠️ Modification de la fiche de **{char['character_name']}** (Slot {char['slot_number']}) "
+            f"lancée par {interaction.user.mention}.")
+        channel = interaction.channel
+        staff = interaction.user
+        guild = interaction.guild
+
+        n = await self._reroll_ask_positive_int(channel, staff, "Combien de modifications veux-tu effectuer ?")
+        if n is None:
+            return
+
+        applied = []    # (label, old, new)
+        cancelled = 0
+        for i in range(1, n + 1):
+            choix = await self._reroll_wait_text(
+                channel, staff,
+                f"**Modification {i}/{n}** — quel élément corriger ?\n{self.MODIF_MENU_TEXT}\n"
+                "Réponds par un numéro (1-12), ou « annuler ».")
+            if choix is None:
+                cancelled += 1
+                continue  # annulé -> compte comme une des N modifications
+            if not (choix.strip().isdigit() and 1 <= int(choix.strip()) <= 12):
+                await channel.send("Numéro invalide (1-12). Cette modification est passée.")
+                cancelled += 1
+                continue
+
+            prepared = await self._modif_prepare(channel, staff, guild, char, int(choix.strip()))
+            if prepared is None:
+                cancelled += 1
+                continue  # annulation / élément inapplicable -> compte comme une modification
+            label, old_display, new_display, apply = prepared
+
+            # Confirmation AVANT l'UPDATE.
+            emb = discord.Embed(
+                title="⚠️ Confirmes-tu ce changement ?",
+                description=f"**{label}** : {old_display} → {new_display}",
+                color=discord.Color.gold())
+            view = _ModifConfirmView(staff.id)
+            await channel.send(embed=emb, view=view)
+            await view.wait()
+            if view.value != "confirm":
+                await channel.send("❌ Modification annulée (elle compte quand même dans le total).")
+                cancelled += 1
+                continue
+
+            # Appliquée : UPDATE + rôles/sync, refresh de la copie locale, puis log dédié.
+            await apply()
+            char = db.get_validated_character_by_id(char["id"])
+            applied.append((label, old_display, new_display))
+            await self._modif_log(guild, staff, char, label, old_display, new_display)
+
+        # Application finale : réédite/repost l'embed de fiche (image intégrée), comme /reroll.
+        await self._reroll_refresh_fiche_message(interaction, char["id"])
+
+        if applied:
+            recap = "\n".join(f"• **{lbl}** : {o} → {n2}" for lbl, o, n2 in applied)
+        else:
+            recap = "Aucune modification appliquée."
+        if cancelled:
+            recap += f"\n\n*({cancelled} modification(s) annulée(s) sur {n})*"
+        await channel.send(embed=discord.Embed(
+            title="✅ Modifications terminées",
+            description=f"Fiche de **{char['character_name']}** (Slot {char['slot_number']}) :\n{recap}",
+            color=discord.Color.green()))
 
     @app_commands.command(name="départ", description="Démarre la création de ton personnage")
     async def depart(self, interaction: discord.Interaction):

@@ -120,7 +120,11 @@ CREATE TABLE IF NOT EXISTS validated_characters (
     validated_at TEXT,
     fiche_message_id INTEGER,        -- id du message d'embed posté dans FICHE_VALIDATED_CHANNEL_ID (édité par /reroll)
     recompense_type TEXT,            -- traçabilité de la récompense de départ (clé : argent / xp / relique_X / ...)
-    recompense_detail TEXT           -- détail lisible + montant/quantité (pour retrait exact au reroll)
+    recompense_detail TEXT,          -- détail lisible + montant/quantité (pour retrait exact au reroll)
+    prenom TEXT,                     -- champs d'identité persistants (éditables via /modification, sinon repris de la progression)
+    nom TEXT,
+    age INTEGER,
+    histoire TEXT
 );
 
 CREATE TABLE IF NOT EXISTS depart_character_progress (
@@ -628,6 +632,10 @@ _VALIDATED_EXTRA_COLUMNS = [
     ("fiche_message_id", "INTEGER"),
     ("recompense_type", "TEXT"),
     ("recompense_detail", "TEXT"),
+    ("prenom", "TEXT"),
+    ("nom", "TEXT"),
+    ("age", "INTEGER"),
+    ("histoire", "TEXT"),
 ]
 
 # Colonnes de bank_accounts ajoutées après coup.
@@ -1339,6 +1347,14 @@ def get_validated_character_by_id(character_id: int):
         ).fetchone()
 
 
+def get_validated_character_by_message_id(fiche_message_id: int):
+    """Personnage validé dont l'embed de fiche porte cet id de message (ou None). Sert à /modification."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM validated_characters WHERE fiche_message_id = ?", (fiche_message_id,)
+        ).fetchone()
+
+
 def get_validated_characters_for_user(user_id: int, guild_id: int):
     """Tous les personnages validés d'un joueur sur un serveur (triés par slot). Sert au menu /reroll."""
     with get_connection() as conn:
@@ -1369,7 +1385,8 @@ def update_validated_fields(character_id: int, **fields):
     """UPDATE ciblé de validated_characters (clan / sort / eo_classe / eo_value / rct / grade...).
     N'accepte qu'une liste blanche de colonnes pour éviter toute injection via un nom de champ."""
     allowed = {"clan", "sort", "eo_classe", "eo_value", "rct", "grade",
-               "recompense_type", "recompense_detail"}
+               "recompense_type", "recompense_detail",
+               "camp", "nature", "character_name", "prenom", "nom", "age", "histoire"}
     cols = {k: v for k, v in fields.items() if k in allowed}
     if not cols:
         return
