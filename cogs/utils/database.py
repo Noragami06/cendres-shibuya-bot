@@ -697,6 +697,23 @@ def _ensure_bank_transactions_columns(conn):
         conn.execute("ALTER TABLE bank_transactions ADD COLUMN category TEXT DEFAULT 'autre'")
 
 
+# Catégories de shop créées d'office au démarrage (en plus de « Parchemin » qui préexiste et reste à
+# prix manuel). Ces 3 catégories sont auto-tarifées par classe côté cogs/shop.py (SHOP_CLASS_PRICE_RANGES).
+DEFAULT_SHOP_CATEGORIES = ("Potion", "Arme maudite", "Relique")
+
+
+def _seed_default_shop_categories(conn):
+    """Crée les catégories de shop par défaut (Potion / Arme maudite / Relique) si elles n'existent pas
+    encore, en vérifiant l'absence de façon INSENSIBLE À LA CASSE pour ne jamais créer de doublon d'une
+    variante d'orthographe (« potion » vs « Potion »). Idempotent : sans effet si elles existent déjà."""
+    for name in DEFAULT_SHOP_CATEGORIES:
+        existing = conn.execute(
+            "SELECT 1 FROM shop_categories WHERE name = ? COLLATE NOCASE", (name,)
+        ).fetchone()
+        if existing is None:
+            conn.execute("INSERT INTO shop_categories (name) VALUES (?)", (name,))
+
+
 def _migrate_item_categorie_id(conn):
     """Migre item_definitions de l'ancienne colonne texte `categorie` vers `categorie_id`
     (référence shop_categories.id). Pour chaque valeur texte distincte, crée la catégorie
@@ -979,6 +996,7 @@ def init_db():
         # Unicité du ticket_uid (fonctionne aussi sur une base migrée ; NULL multiples autorisés).
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_uid ON tickets(ticket_uid)")
         _migrate_item_categorie_id(conn)
+        _seed_default_shop_categories(conn)
 
 
 # =====================================================================

@@ -1338,8 +1338,9 @@ class Shop(commands.Cog):
                         # §3 : 0 = prix infini -> valeur_base NULL, plus jamais achetable.
                         update_item(item["id"], valeur_base=None)
                         await channel.send(
-                            "🔒 Prix mis à l'infini — cet objet ne sera jamais achetable par les joueurs "
-                            "(utile pour un objet réservé aux give/récompenses manuelles).")
+                            "🔒 Prix mis à l'infini — cet objet ne sera JAMAIS achetable par un joueur "
+                            "(même avec une fortune illimitée), staff inclus. Seul un GIVE manuel du staff "
+                            "pourra le distribuer.")
                         return
                     update_item(item["id"], valeur_base=int(cleaned))
                 else:  # classe
