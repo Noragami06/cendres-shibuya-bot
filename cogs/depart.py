@@ -5086,6 +5086,139 @@ class Depart(commands.Cog):
             description=f"Fiche de **{char['character_name']}** (Slot {char['slot_number']}) :\n{recap}",
             color=discord.Color.green()))
 
+    @staticmethod
+    def _split_for_embed(text: str, limit: int = 4000):
+        """Découpe `text` en morceaux <= limit caractères, en respectant les sauts de ligne quand c'est
+        possible (la limite Discord d'une description d'embed est de 4096). Une ligne seule trop longue
+        est coupée brutalement."""
+        if len(text) <= limit:
+            return [text]
+        chunks, current = [], ""
+        for line in text.split("\n"):
+            while len(line) > limit:  # ligne unique plus longue que la limite : coupe brute
+                if current:
+                    chunks.append(current)
+                    current = ""
+                chunks.append(line[:limit])
+                line = line[limit:]
+            add = line if not current else "\n" + line
+            if len(current) + len(add) > limit:
+                chunks.append(current)
+                current = line
+            else:
+                current += add
+        if current:
+            chunks.append(current)
+        return chunks
+
+    @app_commands.command(
+        name="sync-roles",
+        description="Vérifie et corrige les rôles Discord de tous les personnages (Slot 1) par rapport à la base")
+    async def sync_roles(self, interaction: discord.Interaction):
+        if not _is_fiche_staff(interaction.user):
+            await interaction.response.send_message(
+                "❌ Seul le staff peut utiliser cette commande.", ephemeral=True)
+            return
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Cette commande s'utilise sur le serveur.", ephemeral=True)
+            return
+
+        # Peut être long (fetch_member pour chaque joueur absent du cache) : on diffère tout de suite.
+        await interaction.response.defer(thinking=True)
+
+        # Univers de TOUS les rôles gérés par le bot : sert à détecter les rôles à RETIRER, y compris
+        # ceux qui ne sont pas attendus pour ce personnage (ancien clan, ancien grade, mauvais camp…).
+        from cogs.clans import CLAN_ROLES  # import paresseux (aucun cycle : clans n'importe pas depart)
+        managed_role_ids = set(CAMP_ROLES)
+        managed_role_ids.update(CLAN_ROLES.values())
+        managed_role_ids.add(SANS_CLAN_ROLE_ID)
+        managed_role_ids.add(CLAN_MEMBER_ROLE_ID)
+        managed_role_ids.update(rid for _name, rid in GRADE_ROLES)
+        managed_role_ids.add(RCT_POSSEDE_ROLE_ID)
+        managed_role_ids.add(RCT_NON_POSSEDE_ROLE_ID)
+
+        with db.get_connection() as conn:
+            characters = conn.execute(
+                "SELECT id, user_id, character_name, camp, clan, grade, rct "
+                "FROM validated_characters WHERE guild_id = ? AND slot_number = 1",
+                (guild.id,),
+            ).fetchall()
+
+        corrections = []  # personnages effectivement corrigés
+        erreurs = []      # corrections tentées mais échouées (permission, erreur Discord)
+
+        for char in characters:
+            # 1) Membre, avec repli fetch_member (jamais de bascule silencieuse).
+            member = guild.get_member(char["user_id"])
+            if member is None:
+                try:
+                    member = await guild.fetch_member(char["user_id"])
+                except (discord.NotFound, discord.HTTPException):
+                    member = None
+            # 2) Joueur parti du serveur (cas normal) : on ignore, ni correction ni erreur.
+            if member is None:
+                continue
+
+            # 3) Rôles ATTENDUS d'après la base (mêmes dictionnaires que la validation / le retour).
+            camp_rid, clan_rid, grade_rid = resolve_role_point_ids(char["camp"], char["clan"], char["grade"])
+            expected = set()
+            if camp_rid:
+                expected.add(camp_rid)
+            if clan_rid:  # rôle de clan réel OU rôle « Sans clan »
+                expected.add(clan_rid)
+            if char["clan"] and char["clan"] != "sans_clan":
+                expected.add(CLAN_MEMBER_ROLE_ID)  # marqueur « membre de clan »
+            if grade_rid:  # pas de grade pour un Humain / sans-clan
+                expected.add(grade_rid)
+            expected.add(RCT_POSSEDE_ROLE_ID if char["rct"] else RCT_NON_POSSEDE_ROLE_ID)
+
+            # 4) Comparaison aux rôles réellement présents, restreinte aux rôles gérés par le bot.
+            member_role_ids = {r.id for r in member.roles}
+            to_remove_ids = (member_role_ids & managed_role_ids) - expected
+            to_add_ids = expected - member_role_ids
+            to_remove = [r for r in (guild.get_role(rid) for rid in to_remove_ids) if r is not None]
+            to_add = [r for r in (guild.get_role(rid) for rid in to_add_ids) if r is not None]
+
+            # 5) Rien à faire : déjà correct.
+            if not to_remove and not to_add:
+                continue
+
+            # 6) Application, avec remontée explicite des échecs.
+            try:
+                if to_remove:
+                    await member.remove_roles(*to_remove, reason="Synchronisation /sync-roles")
+                if to_add:
+                    await member.add_roles(*to_add, reason="Synchronisation /sync-roles")
+                corrections.append(
+                    f"**{char['character_name']}** : "
+                    f"−[{', '.join(r.name for r in to_remove) or '—'}] "
+                    f"+[{', '.join(r.name for r in to_add) or '—'}]")
+            except discord.Forbidden:
+                erreurs.append(
+                    f"**{char['character_name']}** : permission refusée "
+                    "(le bot n'a pas « Gérer les rôles », ou son rôle est sous les rôles à modifier)")
+            except discord.HTTPException as e:
+                erreurs.append(f"**{char['character_name']}** : erreur Discord ({e})")
+
+        # --- Récapitulatif (découpé si nécessaire pour la limite de 4096 caractères par description) ---
+        corr_txt = "\n".join(f"• {c}" for c in corrections) if corrections else "Aucune — tout était déjà correct."
+        err_txt = "\n".join(f"• {e}" for e in erreurs) if erreurs else "Aucune."
+        full = (
+            f"**{len(corrections)} personnage(s) corrigé(s), {len(erreurs)} erreur(s).**\n\n"
+            f"**Corrections :**\n{corr_txt}\n\n"
+            f"**Erreurs :**\n{err_txt}")
+
+        color = discord.Color.orange() if erreurs else discord.Color.green()
+        chunks = self._split_for_embed(full, limit=4000)
+        for i, chunk in enumerate(chunks):
+            emb = discord.Embed(
+                title="✅ Synchronisation terminée" if i == 0 else "✅ Synchronisation (suite)",
+                description=chunk,
+                color=color)
+            await interaction.followup.send(embed=emb)
+
     @app_commands.command(name="départ", description="Démarre la création de ton personnage")
     async def depart(self, interaction: discord.Interaction):
         # Aucune condition de rôle : la commande est ouverte à tous les membres du serveur.
