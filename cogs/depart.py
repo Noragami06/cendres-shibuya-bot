@@ -4329,7 +4329,11 @@ class Depart(commands.Cog):
         return {"cat": "noop"}
 
     async def _reroll_apply_clan(self, guild, char, new_clan):
-        """Applique un changement de clan : base + rôles (réels slot 1 / virtuels slots 2-3) + points."""
+        """Applique un changement de clan : base + rôles (réels slot 1 / virtuels slots 2-3) + points.
+        Retourne un STATUT sur les rôles Discord, à remonter visiblement au staff par l'appelant :
+        'ok' | 'forbidden' | 'http_error' | 'member_missing' | 'no_guild'. Ne jamais avaler une erreur
+        de permission en silence (bug historique : un slot 1 semblait « à jour » en base mais gardait
+        son vrai rôle de clan)."""
         character_id = char["id"]
         old_clan = char["clan"]
         slot = char["slot_number"]
@@ -4337,30 +4341,49 @@ class Depart(commands.Cog):
         _, new_clan_rid, _ = resolve_role_point_ids(None, new_clan, None)
         db.update_validated_fields(character_id, clan=new_clan)
 
-        member = guild.get_member(char["user_id"]) if guild else None
-        if slot == 1 and member is not None:
-            remove, add = [], []
-            marker = guild.get_role(CLAN_MEMBER_ROLE_ID)
-            if old_clan_rid:
-                r = guild.get_role(old_clan_rid)
-                if r and r in member.roles:
-                    remove.append(r)
-            if new_clan == "sans_clan":
-                if marker and marker in member.roles:
-                    remove.append(marker)
+        status = "ok"
+        if slot == 1:
+            # Slot 1 = VRAIS rôles Discord OBLIGATOIRES. On ne retombe JAMAIS sur la branche virtuelle
+            # en cas de cache manquant : on tente d'abord de récupérer le membre via l'API.
+            if guild is None:
+                status = "no_guild"
             else:
-                nr = guild.get_role(new_clan_rid)
-                if nr and nr not in member.roles:
-                    add.append(nr)
-                if marker and marker not in member.roles:
-                    add.append(marker)
-            try:
-                if remove:
-                    await member.remove_roles(*remove, reason="Reroll clan (staff)")
-                if add:
-                    await member.add_roles(*add, reason="Reroll clan (staff)")
-            except discord.Forbidden:
-                print(f"[reroll] Permission manquante pour modifier les rôles de {char['user_id']}.")
+                member = guild.get_member(char["user_id"])
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(char["user_id"])
+                    except (discord.NotFound, discord.HTTPException):
+                        member = None
+                if member is None:
+                    status = "member_missing"
+                else:
+                    remove, add = [], []
+                    marker = guild.get_role(CLAN_MEMBER_ROLE_ID)
+                    if old_clan_rid:
+                        r = guild.get_role(old_clan_rid)
+                        if r and r in member.roles:
+                            remove.append(r)
+                    if new_clan == "sans_clan":
+                        if marker and marker in member.roles:
+                            remove.append(marker)
+                    else:
+                        nr = guild.get_role(new_clan_rid)
+                        if nr and nr not in member.roles:
+                            add.append(nr)
+                        if marker and marker not in member.roles:
+                            add.append(marker)
+                    try:
+                        if remove:
+                            await member.remove_roles(*remove, reason="Changement de clan (staff)")
+                        if add:
+                            await member.add_roles(*add, reason="Changement de clan (staff)")
+                    except discord.Forbidden:
+                        status = "forbidden"
+                        print(f"[clan] Forbidden en modifiant les rôles de {char['user_id']} "
+                              "(permission Gérer les rôles manquante, ou rôle de clan au-dessus du bot).")
+                    except discord.HTTPException as e:
+                        status = "http_error"
+                        print(f"[clan] Erreur Discord en modifiant les rôles de {char['user_id']} : {e}")
         else:
             # Slots 2/3 : rôles VIRTUELS uniquement.
             if old_clan_rid:
@@ -4374,6 +4397,24 @@ class Depart(commands.Cog):
                 db.add_virtual_role(character_id, CLAN_MEMBER_ROLE_ID)
 
         await sync_role_points(character_id, "clan", new_clan_rid, bot=self.bot)
+        return status
+
+    @staticmethod
+    def _clan_role_warning(status):
+        """Message d'avertissement VISIBLE à envoyer au staff selon le statut de _reroll_apply_clan
+        (ou None si tout s'est bien passé)."""
+        if status == "forbidden":
+            return ("⚠️ **Le rôle de clan n'a PAS pu être modifié sur Discord** : le bot n'a pas la "
+                    "permission *Gérer les rôles*, ou le rôle de clan est plus haut que le rôle du bot "
+                    "dans la hiérarchie. La fiche est à jour en base ; **corrige le rôle manuellement** "
+                    "(ou remonte le rôle du bot au-dessus des rôles de clan).")
+        if status == "member_missing":
+            return ("⚠️ Le membre est introuvable sur le serveur : son rôle de clan n'a pas pu être posé. "
+                    "La fiche est à jour ; le rôle devra être corrigé quand il reviendra.")
+        if status in ("http_error", "no_guild"):
+            return ("⚠️ Erreur Discord lors du changement de rôle de clan. La fiche est à jour ; "
+                    "vérifie/corrige le rôle manuellement.")
+        return None
 
     async def _reroll_apply_all(self, interaction, char, queue, session):
         """Applique TOUS les rerolls confirmés d'un coup (base + rôles), puis réédite l'embed de fiche
@@ -4384,10 +4425,13 @@ class Depart(commands.Cog):
         for payload in queue:
             cat = payload.get("cat")
             if cat == "clan":
-                await self._reroll_apply_clan(guild, char, payload["clan"])
+                status = await self._reroll_apply_clan(guild, char, payload["clan"])
                 # Rafraîchit la copie locale pour un éventuel reroll de clan suivant dans la même session.
                 char = db.get_validated_character_by_id(character_id)
                 changes.append(f"Clan → **{payload['label']}**")
+                warn = self._clan_role_warning(status)
+                if warn:
+                    await interaction.channel.send(warn)
             elif cat == "sort":
                 db.update_validated_fields(character_id, sort=payload["sort"])
                 changes.append(f"Sort → **{payload['label']}**")
@@ -4691,7 +4735,10 @@ class Depart(commands.Cog):
                     db.update_validated_fields(cid, nom=None)
                     # Retire l'ancien rôle de clan, attribue le nouveau (réel slot 1 / virtuel slots 2-3)
                     # + sync_role_points('clan', nouveau_role_id) — logique partagée avec /reroll.
-                    await self._reroll_apply_clan(guild, char, detected)
+                    status = await self._reroll_apply_clan(guild, char, detected)
+                    warn = self._clan_role_warning(status)
+                    if warn:
+                        await channel.send(warn)
                 # Label « Clan » -> le log du salon de modification enregistrera bien un changement de clan.
                 return "Clan", old_clan_disp, new_clan_disp, apply, confirm_desc
 
@@ -4777,7 +4824,10 @@ class Depart(commands.Cog):
 
             async def apply():
                 # Réutilise EXACTEMENT la logique de reroll (base + rôles réels/virtuels + sync points).
-                await self._reroll_apply_clan(guild, char, new_clan)
+                status = await self._reroll_apply_clan(guild, char, new_clan)
+                warn = self._clan_role_warning(status)
+                if warn:
+                    await channel.send(warn)
             return "Clan", old, self._modif_clan_display(new_clan), apply
 
         # --- 7. Sort ---
