@@ -6,7 +6,7 @@ import os
 from cogs.clans import build_clans_report
 from cogs.depart import (
     retroactive_departure_check, backfill_role_points, backfill_fiche_message_ids,
-    fix_detached_fiche_images,
+    fix_detached_fiche_images, backfill_nom_frozen_to_clan,
 )
 from cogs.utils.database import get_bot_state, set_bot_state
 from cogs.profil import (
@@ -57,6 +57,9 @@ async def on_ready():
     # risque à relancer : ne traite que ceux sans ligne dans character_role_point_grants).
     for guild in bot.guilds:
         await backfill_role_points(guild)
+    # Rattrapage UNIQUE (DB seule, global) : remet à NULL tout `nom` figé au nom de son clan actuel
+    # (bug historique de création). Sa propre clé bot_state 'nom_frozen_backfill_done' garantit l'unicité.
+    await backfill_nom_frozen_to_clan()
     # Rattrapage UNIQUE des fiche_message_id manquants (personnages validés avant cette colonne) :
     # scan complet de l'historique du salon des fiches validées, coûteux -> une seule fois par base.
     if get_bot_state("fiche_message_backfill_done") != "1":

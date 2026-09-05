@@ -1818,10 +1818,14 @@ async def handle_fiche_valide(interaction: discord.Interaction, custom_id: str):
         # Traçabilité de la récompense de départ (type + détail) pour un retrait exact au reroll.
         db.set_recompense_trace(character_id, progress.get("recompense_type"), progress.get("recompense"))
         # Champs d'identité persistants (source de vérité pour /modification, plus robuste que la
-        # progression qui peut être écrasée par une création ultérieure). nom_final = clan pour un
-        # personnage de clan, sinon le nom libre.
+        # progression qui peut être écrasée par une création ultérieure).
+        # IMPORTANT : la colonne `nom` reste NULL pour un personnage de clan — build_fiche_embed retombe
+        # alors EN DIRECT sur le clan ACTUEL (jamais figé). On ne la renseigne que pour un patronyme libre
+        # (personnage SANS clan), ou plus tard via /modification (patronyme personnalisé explicite). Le
+        # clan continue d'apparaître dans `character_name` (nom du dossier), pas dans `nom`.
+        nom_libre = None if has_clan else (progress.get("nom") or None)
         db.update_validated_fields(
-            character_id, prenom=prenom, nom=nom_final,
+            character_id, prenom=prenom, nom=nom_libre,
             age=progress.get("age"), histoire=progress.get("histoire"))
         db.create_profile_from_fiche(character_id, progress.get("eo_value"))
         # Source de vérité PERMANENTE de la réserve d'EO : même valeur que validated_characters.eo_value.
@@ -3334,6 +3338,33 @@ def _fiche_message_full_text(message) -> str:
     return "\n".join(parts)
 
 
+async def backfill_nom_frozen_to_clan():
+    """Rattrapage unique : remet à NULL la colonne `nom` de tout personnage dont `nom` était figé
+    EXACTEMENT (insensible à la casse/espaces) au nom de son clan ACTUEL — séquelle du bug de création
+    qui écrivait le clan dans `nom` au lieu de le laisser NULL. Après quoi build_fiche_embed retombera
+    toujours en direct sur le clan actuel, sans jamais se figer.
+
+    Ne touche JAMAIS :
+      • un vrai patronyme personnalisé (différent du clan) — préservé tel quel ;
+      • un `nom` figé à un ANCIEN clan devenu différent (ex. Izana : nom='Zenin', clan='gojo') — cas à
+        part, corrigé spécifiquement à la main, pas par ce rattrapage automatique.
+    Idempotent via bot_state ('nom_frozen_backfill_done') ; sans danger à relancer."""
+    if db.get_bot_state("nom_frozen_backfill_done"):
+        return
+    corriges = []
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, nom, clan FROM validated_characters "
+            "WHERE nom IS NOT NULL AND clan IS NOT NULL"
+        ).fetchall()
+        for r in rows:
+            if r["nom"].strip().lower() == r["clan"].strip().lower():
+                conn.execute("UPDATE validated_characters SET nom = NULL WHERE id = ?", (r["id"],))
+                corriges.append(r["id"])
+    db.set_bot_state("nom_frozen_backfill_done", "1")
+    print(f"🔍 [backfill nom] {len(corriges)} personnage(s) avaient 'nom' figé à leur clan, remis à NULL.")
+
+
 async def backfill_fiche_message_ids(guild):
     """Retrouve les embeds de fiche DÉJÀ postés pour les personnages validés AVANT l'ajout de
     fiche_message_id (colonne NULL), en scannant l'historique du salon des fiches validées. Coûteux
@@ -4340,6 +4371,12 @@ class Depart(commands.Cog):
         _, old_clan_rid, _ = resolve_role_point_ids(None, old_clan, None)
         _, new_clan_rid, _ = resolve_role_point_ids(None, new_clan, None)
         db.update_validated_fields(character_id, clan=new_clan)
+        # Anti-désynchronisation nom/clan : si `nom` valait EXACTEMENT l'ANCIEN clan (nom figé
+        # automatiquement à la création, jamais un patronyme choisi), on le remet à NULL en même temps
+        # que le changement de clan -> l'affichage retombera en direct sur le NOUVEAU clan. Un vrai
+        # patronyme personnalisé (différent du clan) n'est JAMAIS touché.
+        if self._nom_is_frozen_clan(char["nom"], old_clan):
+            db.update_validated_fields(character_id, nom=None)
 
         status = "ok"
         if slot == 1:
@@ -4398,6 +4435,14 @@ class Depart(commands.Cog):
 
         await sync_role_points(character_id, "clan", new_clan_rid, bot=self.bot)
         return status
+
+    @staticmethod
+    def _nom_is_frozen_clan(nom, clan) -> bool:
+        """True si `nom` correspond EXACTEMENT (insensible à la casse et aux espaces) à `clan` : c'était un
+        nom figé automatiquement au nom du clan, pas un patronyme personnalisé volontairement différent."""
+        if not nom or not clan:
+            return False
+        return nom.strip().lower() == clan.strip().lower()
 
     @staticmethod
     def _clan_role_warning(status):
@@ -4516,7 +4561,11 @@ class Depart(commands.Cog):
             except discord.NotFound:
                 pass  # supprimé entre-temps : on reposte ci-dessous
             except (discord.Forbidden, discord.HTTPException):
-                return "error"
+                # Édition impossible (permission, message trop ancien, panne API…) : on ne renonce PAS
+                # silencieusement — on tente un repost complet ci-dessous (comme pour NotFound). L'embed
+                # est ainsi corrigé automatiquement dans la quasi-totalité des cas ; le statut 'error'
+                # (et l'avertissement côté /modification) ne sert plus qu'aux échecs vraiment exceptionnels.
+                pass
 
         # 2) NULL ou supprimé -> NOUVEAU message + mémorisation de son id (pour les futurs rerolls).
         member = interaction.guild.get_member(char["user_id"]) if interaction.guild else None
@@ -4731,10 +4780,10 @@ class Depart(commands.Cog):
                     "Il perdra son clan actuel et les rôles/points associés. Confirmer ?")
 
                 async def apply():
-                    # nom repasse à NULL : l'affichage retombe sur le clan par défaut (comportement en place).
-                    db.update_validated_fields(cid, nom=None)
                     # Retire l'ancien rôle de clan, attribue le nouveau (réel slot 1 / virtuel slots 2-3)
-                    # + sync_role_points('clan', nouveau_role_id) — logique partagée avec /reroll.
+                    # + sync_role_points('clan', nouveau_role_id) — logique partagée avec /reroll. C'est
+                    # _reroll_apply_clan qui gère `nom` : remis à NULL SEULEMENT s'il valait l'ancien clan
+                    # (nom figé) ; un patronyme personnalisé volontairement différent est préservé.
                     status = await self._reroll_apply_clan(guild, char, detected)
                     warn = self._clan_role_warning(status)
                     if warn:
@@ -5073,7 +5122,9 @@ class Depart(commands.Cog):
             await self._modif_log(guild, staff, char, label, old_display, new_display)
 
         # Application finale : réédite/repost l'embed de fiche (image intégrée), comme /reroll.
-        await self._reroll_refresh_fiche_message(interaction, char["id"])
+        # On EXPLOITE le statut retourné (comme /reroll) : sinon un échec d'édition (salon introuvable,
+        # Forbidden/HTTPException) resterait invisible et donnerait un faux « terminé » sans embed à jour.
+        status = await self._reroll_refresh_fiche_message(interaction, char["id"])
 
         if applied:
             recap = "\n".join(f"• **{lbl}** : {o} → {n2}" for lbl, o, n2 in applied)
@@ -5081,6 +5132,12 @@ class Depart(commands.Cog):
             recap = "Aucune modification appliquée."
         if cancelled:
             recap += f"\n\n*({cancelled} modification(s) annulée(s) sur {n})*"
+        if status == "reposted":
+            recap += ("\n\nℹ️ L'ancien embed de fiche n'a pas pu être retrouvé/édité ; un nouvel embed "
+                      "à jour a été posté à la place.")
+        elif status in ("no_channel", "error"):
+            recap += ("\n\n⚠️ L'embed de fiche n'a **pas** pu être mis à jour (salon introuvable ou erreur "
+                      "d'envoi/permission) ; les valeurs en base restent à jour.")
         await channel.send(embed=discord.Embed(
             title="✅ Modifications terminées",
             description=f"Fiche de **{char['character_name']}** (Slot {char['slot_number']}) :\n{recap}",
