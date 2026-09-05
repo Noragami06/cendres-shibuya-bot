@@ -13,6 +13,7 @@ from cogs.profil import (
     backfill_pv_system, backfill_secondary_sort_values, backfill_sort_unlock_status,
     backfill_territoire_defaults, backfill_fiche_record,
 )
+from cogs.shop import backfill_shop_prices_new_ranges
 from cogs.utils.database import init_db
 
 load_dotenv()
@@ -83,6 +84,10 @@ async def on_ready():
         # Rattrapage UNIQUE de fiche_record (source de vérité permanente de l'EO). Ensuite, la
         # resynchronisation est VIVANTE via sync_eo_with_fiche() à chaque affichage du profil.
         await backfill_fiche_record()
+    # Rattrapage UNIQUE des prix du shop sur les nouvelles fourchettes (Option B) : re-tire un prix pour
+    # les objets déjà créés en Potion / Arme maudite / Relique. Sa clé bot_state 'shop_price_rerange_done'
+    # garantit l'unicité ; ne touche jamais un objet volontairement mis à l'infini (prix NULL).
+    await backfill_shop_prices_new_ranges()
     if not status_loop.is_running():
         status_loop.start()
 

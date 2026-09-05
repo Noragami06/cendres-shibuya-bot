@@ -51,9 +51,9 @@ def _is_staff(member) -> bool:
 # Pour ajouter une future catégorie à l'auto-remplissage de prix par classe, il suffit d'ajouter une
 # entrée ici avec les 5 fourchettes (4/3/2/1/S) — aucune autre modification de code nécessaire.
 SHOP_CLASS_PRICE_RANGES = {
-    "arme maudite": {"4": (8000, 20000), "3": (20000, 50000), "2": (50000, 120000), "1": (120000, 300000), "S": (300000, 700000)},
-    "relique": {"4": (14400, 36000), "3": (36000, 90000), "2": (90000, 216000), "1": (216000, 540000), "S": (540000, 1260000)},
-    "potion": {"4": (3200, 8000), "3": (8000, 20000), "2": (20000, 48000), "1": (48000, 120000), "S": (120000, 280000)},
+    "potion": {"4": (100000, 250000), "3": (1000000, 2500000), "2": (10000000, 24000000), "1": (100000000, 240000000), "S": (480000000, 1120000000)},
+    "arme maudite": {"4": (250000, 625000), "3": (2500000, 6250000), "2": (25000000, 60000000), "1": (250000000, 600000000), "S": (1200000000, 2800000000)},
+    "relique": {"4": (450000, 1125000), "3": (4500000, 11250000), "2": (45000000, 108000000), "1": (450000000, 1080000000), "S": (2160000000, 5040000000)},
 }
 
 
@@ -342,6 +342,45 @@ def parse_bulk_items(text: str, price_ranges=None):
                           "prix": prix, "classe": classe, "auto": auto_priced})
 
     return valid, errors
+
+
+async def backfill_shop_prices_new_ranges():
+    """Rattrapage PONCTUEL : re-tire un prix aléatoire, dans les NOUVELLES fourchettes, pour tous les
+    objets déjà créés dans les catégories auto-tarifées (Potion / Arme maudite / Relique).
+
+    Garde-fous :
+      • ne touche QUE les objets à prix déjà défini (valeur_base NOT NULL) — un objet volontairement mis
+        à l'infini (prix=0 -> NULL) par le staff RESTE à l'infini, jamais retiré au hasard ;
+      • ignore un objet dont la classe n'est pas S/1/2/3/4 (classe « sans » / manquante) par sécurité ;
+      • la catégorie est lue via categorie_id -> shop_categories.name (source de vérité ; l'ancienne
+        colonne texte `categorie` est NULL pour les objets créés après la migration).
+    Idempotent via bot_state 'shop_price_rerange_done' : ne s'exécute qu'une seule fois."""
+    if db.get_bot_state("shop_price_rerange_done"):
+        return
+    corriges = []
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT d.id, d.name, d.classe, d.valeur_base, s.name AS cat "
+            "FROM item_definitions d JOIN shop_categories s ON d.categorie_id = s.id "
+            "WHERE d.valeur_base IS NOT NULL"
+        ).fetchall()
+        for r in rows:
+            ranges = SHOP_CLASS_PRICE_RANGES.get(_normalize_cat_name(r["cat"]))
+            if ranges is None:
+                continue  # catégorie non auto-tarifée (ex. Parchemin) : prix manuel, jamais retiré
+            classe = r["classe"]
+            if classe not in ranges:
+                continue  # classe invalide/manquante (ex. « sans ») : on ignore par sécurité
+            lo, hi = ranges[classe]
+            nouveau = random.randint(lo, hi)
+            conn.execute(
+                "UPDATE item_definitions SET valeur_base = ? WHERE id = ?", (nouveau, r["id"])
+            )
+            corriges.append((r["name"], r["valeur_base"], nouveau))
+    db.set_bot_state("shop_price_rerange_done", "1")
+    print(f"🔍 [rattrapage prix shop] {len(corriges)} objet(s) retirés sur la nouvelle fourchette :")
+    for nom, ancien, nouveau in corriges:
+        print(f"   - {nom} : {ancien:,} ¥ → {nouveau:,} ¥")
 
 
 # =====================================================================
