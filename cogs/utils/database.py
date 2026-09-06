@@ -240,7 +240,8 @@ CREATE TABLE IF NOT EXISTS character_inventory (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     character_id INTEGER,
     item_id INTEGER,
-    quantity INTEGER DEFAULT 0
+    quantity INTEGER DEFAULT 0,
+    gifted_quantity INTEGER DEFAULT 0   -- unités reçues GRATUITEMENT (give staff) : jamais remboursables
 );
 
 CREATE TABLE IF NOT EXISTS pending_trades (
@@ -713,6 +714,14 @@ def _ensure_bank_transactions_columns(conn):
 DEFAULT_SHOP_CATEGORIES = ("Potion", "Arme maudite", "Relique")
 
 
+def _ensure_character_inventory_columns(conn):
+    """Ajoute gifted_quantity (unités reçues gratuitement via give staff) à une table
+    character_inventory déjà existante. Idempotent."""
+    cols = _column_names(conn, "character_inventory")
+    if cols and "gifted_quantity" not in cols:
+        conn.execute("ALTER TABLE character_inventory ADD COLUMN gifted_quantity INTEGER DEFAULT 0")
+
+
 def _seed_default_shop_categories(conn):
     """Crée les catégories de shop par défaut (Potion / Arme maudite / Relique) si elles n'existent pas
     encore, en vérifiant l'absence de façon INSENSIBLE À LA CASSE pour ne jamais créer de doublon d'une
@@ -1011,6 +1020,7 @@ def init_db():
         # Unicité du ticket_uid (fonctionne aussi sur une base migrée ; NULL multiples autorisés).
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_uid ON tickets(ticket_uid)")
         _migrate_item_categorie_id(conn)
+        _ensure_character_inventory_columns(conn)
         _seed_default_shop_categories(conn)
 
 

@@ -187,6 +187,29 @@ def inv_add(character_id: int, item_id: int, qty: int):
             )
 
 
+def inv_give(character_id: int, item_id: int, qty: int):
+    """Comme inv_add, mais marque ces `qty` unités comme REÇUES GRATUITEMENT (give staff) via la colonne
+    gifted_quantity. Ces unités ne seront JAMAIS remboursées si la catégorie/l'objet est supprimé plus
+    tard (le joueur n'a rien dépensé pour les obtenir)."""
+    with db.get_connection() as conn:
+        r = conn.execute(
+            "SELECT id FROM character_inventory WHERE character_id = ? AND item_id = ?",
+            (character_id, item_id),
+        ).fetchone()
+        if r:
+            conn.execute(
+                "UPDATE character_inventory SET quantity = quantity + ?, "
+                "gifted_quantity = COALESCE(gifted_quantity, 0) + ? WHERE id = ?",
+                (qty, qty, r["id"]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO character_inventory (character_id, item_id, quantity, gifted_quantity) "
+                "VALUES (?, ?, ?, ?)",
+                (character_id, item_id, qty, qty),
+            )
+
+
 def _refund_character(character_id: int, montant: int, label: str) -> bool:
     """Rembourse un personnage sur son compte courant (si le compte existe). Retourne True si
     le remboursement a bien été crédité."""
@@ -562,6 +585,11 @@ class ShopCategoryPageView(discord.ui.View):
         self.add_item(discord.ui.Button(
             label="Achat", emoji="🛒", style=discord.ButtonStyle.success,
             custom_id=f"shop_buy:{cat_id}:{user_id}", row=1))
+        # Bouton « Give » : VISIBLE pour tout le monde, mais le clic est réservé au staff (contrôle
+        # FICHE_STAFF_ROLE_ID dans handle_give). On ne le masque donc pas selon is_staff.
+        self.add_item(discord.ui.Button(
+            label="Give", emoji="🎁", style=discord.ButtonStyle.primary,
+            custom_id=f"shop_give:{cat_id}:{user_id}", row=1))
         if is_staff:
             self.add_item(discord.ui.Button(
                 label="Modifier un item", emoji="✏️", style=discord.ButtonStyle.secondary,
@@ -569,6 +597,73 @@ class ShopCategoryPageView(discord.ui.View):
             self.add_item(discord.ui.Button(
                 label="Supprimer un item", emoji="🗑️", style=discord.ButtonStyle.danger,
                 custom_id=f"shop_delete_item:{cat_id}:{user_id}", row=2))
+
+
+GIVE_ITEMS_PER_PAGE = 15  # objets par page de la liste numérotée du give
+
+
+class GiveItemPageView(discord.ui.View):
+    """Pagination (◀️/▶️) de la liste NUMÉROTÉE des objets d'une catégorie, pour le give staff.
+    Elle ne 'stoppe' jamais le flux : le staff choisit en TAPANT le numéro (validé contre la liste
+    COMPLÈTE, pas seulement la page affichée). Les boutons se contentent d'éditer l'embed.
+    Réservée au staff (revérifié au clic) et au staff qui a lancé le flux (owner_id)."""
+
+    def __init__(self, owner_id, entries, title):
+        super().__init__(timeout=WAIT_TIMEOUT)
+        self.owner_id = owner_id
+        self.entries = entries          # liste de tuples (numero_1based, nom, prix_txt)
+        self.title = title
+        self.page = 0
+        self.total_pages = max(1, (len(entries) + GIVE_ITEMS_PER_PAGE - 1) // GIVE_ITEMS_PER_PAGE)
+        self.prev_btn = discord.ui.Button(label="Page précédente", emoji="◀️",
+                                          style=discord.ButtonStyle.secondary)
+        self.next_btn = discord.ui.Button(label="Page suivante", emoji="▶️",
+                                          style=discord.ButtonStyle.secondary)
+        self.prev_btn.callback = self._prev
+        self.next_btn.callback = self._next
+        # Boutons uniquement s'il y a plus d'une page (même logique que la pagination existante).
+        if self.total_pages > 1:
+            self.add_item(self.prev_btn)
+            self.add_item(self.next_btn)
+        self._sync()
+
+    def _sync(self):
+        self.prev_btn.disabled = self.page <= 0
+        self.next_btn.disabled = self.page >= self.total_pages - 1
+
+    def build_embed(self):
+        start = self.page * GIVE_ITEMS_PER_PAGE
+        chunk = self.entries[start:start + GIVE_ITEMS_PER_PAGE]
+        lines = [f"**{num}.** {nom} — {prix}" for num, nom, prix in chunk]
+        return discord.Embed(
+            title=self.title,
+            description="\n".join(lines) + f"\n\nPage {self.page + 1}/{self.total_pages}\n\n"
+                        "Réponds avec le **numéro** de l'objet à donner.",
+            color=PHOENIX_COLOR,
+        )
+
+    async def _guard(self, interaction) -> bool:
+        if not _is_staff(interaction.user):
+            await interaction.response.send_message("❌ Réservé au staff.", ephemeral=True)
+            return False
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Ce flux n'est pas le tien.", ephemeral=True)
+            return False
+        return True
+
+    async def _prev(self, interaction: discord.Interaction):
+        if not await self._guard(interaction):
+            return
+        self.page = max(0, self.page - 1)
+        self._sync()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _next(self, interaction: discord.Interaction):
+        if not await self._guard(interaction):
+            return
+        self.page = min(self.total_pages - 1, self.page + 1)
+        self._sync()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
 
 # =====================================================================
@@ -745,6 +840,8 @@ class Shop(commands.Cog):
             await self.handle_info(interaction, cid)
         elif cid.startswith("shop_buy:"):
             await self.handle_buy(interaction, cid)
+        elif cid.startswith("shop_give:"):
+            await self.handle_give(interaction, cid)
         elif cid.startswith("shop_edit_item:"):
             await self.handle_edit_item(interaction, cid)
         elif cid.startswith("shop_delete_item:"):
@@ -1167,6 +1264,135 @@ class Shop(commands.Cog):
         finally:
             self._release(user_id)
 
+    # =================================================================
+    # STAFF : GIVE (donner un objet sans achat)
+    # =================================================================
+    async def _give_resolve_member(self, channel, staff):
+        """Demande et résout le membre destinataire : d'abord un ID brut (int), sinon une mention
+        <@ID>/<@!ID>. Redemande tant que le membre n'est pas trouvé sur le serveur. None si annulé/délai."""
+        guild = channel.guild
+        while True:
+            await channel.send(
+                "À qui veux tu donner un objet ? (mentionne le joueur ou donne son ID, "
+                "ou écris « cancel » pour annuler)")
+            m = await self.wait_message(channel, staff)
+            if m is None:
+                return None
+            raw = m.content.strip()
+            if raw.lower() in ("cancel", "annuler"):
+                return None
+            member = None
+            # 1) ID brut.
+            try:
+                member = guild.get_member(int(raw))
+            except ValueError:
+                member = None
+            # 2) Sinon, extraction depuis une mention <@ID> / <@!ID>.
+            if member is None:
+                mt = re.search(r"<@!?(\d+)>", raw)
+                if mt:
+                    member = guild.get_member(int(mt.group(1)))
+                elif m.mentions:
+                    member = m.mentions[0]
+            # 3) Repli API (membre absent du cache) sur l'id détecté.
+            if member is None:
+                idm = re.search(r"(\d{5,})", raw)
+                if idm:
+                    try:
+                        member = await guild.fetch_member(int(idm.group(1)))
+                    except (discord.NotFound, discord.HTTPException):
+                        member = None
+            if member is not None:
+                return member
+            await channel.send("❌ Membre introuvable sur ce serveur. Réessaie.")
+
+    async def handle_give(self, interaction, cid):
+        _, cat_id, _panel_user_id = cid.split(":")
+        cat_id = int(cat_id)
+        # §1 : bouton visible pour tous, mais clic RÉSERVÉ au staff (revérifié au clic, règle #1).
+        if not _is_staff(interaction.user):
+            await interaction.response.send_message("❌ Réservé au staff.", ephemeral=True)
+            return
+        staff = interaction.user
+        if not self._acquire(staff.id):
+            await interaction.response.send_message(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True)
+            return
+        try:
+            await interaction.response.send_message("🎁 Give en cours…", ephemeral=True)
+            channel = interaction.channel
+            cat = get_shop_category(cat_id)
+            if cat is None:
+                await channel.send("Cette catégorie n'existe plus.")
+                return
+
+            # §2.1-2 : destinataire (ID brut ou mention), redemandé tant qu'introuvable.
+            member = await self._give_resolve_member(channel, staff)
+            if member is None:
+                await channel.send("⏳ Give annulé.")
+                return
+
+            # §2.3 : objets de la catégorie ACTUELLE, numérotés dans l'ordre id (liste stable).
+            with db.get_connection() as conn:
+                items = conn.execute(
+                    "SELECT id, name, valeur_base FROM item_definitions "
+                    "WHERE categorie_id = ? ORDER BY id",
+                    (cat_id,),
+                ).fetchall()
+            if not items:
+                await channel.send("Cette catégorie ne contient aucun objet.")
+                return
+
+            # §2.4 : liste numérotée paginée (15/page). Le numéro est validé contre la liste COMPLÈTE.
+            entries = [
+                (i + 1, it["name"],
+                 "Non disponible à l'achat" if it["valeur_base"] is None else f"{it['valeur_base']:,} ¥")
+                for i, it in enumerate(items)
+            ]
+            view = GiveItemPageView(staff.id, entries, f"🎁 Give — {cat['name']}")
+            await channel.send(embed=view.build_embed(), view=view if view.total_pages > 1 else None)
+
+            # §2.5 : réponse par numéro (isolation par utilisateur), validée sur toute la liste.
+            chosen = None
+            while chosen is None:
+                m = await self.wait_message(channel, staff)
+                if m is None:
+                    view.stop()
+                    await channel.send("⏳ Give annulé.")
+                    return
+                c = m.content.strip()
+                if c.isdigit() and 1 <= int(c) <= len(items):
+                    chosen = items[int(c) - 1]
+                else:
+                    await channel.send(f"Réponds avec un numéro entre 1 et {len(items)}.")
+            view.stop()
+
+            # §2.6 : quantité (entier positif).
+            qty = await self.ask_quantity(channel, staff, "Quelle quantité veux tu donner ?")
+            if qty is None:
+                await channel.send("⏳ Give annulé.")
+                return
+
+            # §2.7 : personnage cible du joueur mentionné (menu si plusieurs, refus si aucun).
+            character_id = await self.select_character_await(
+                channel, member, staff.id, "❌ Ce joueur n'a aucun personnage validé.")
+            if character_id is None:
+                return
+
+            # §2.8 + §3 : ajout à l'inventaire, SANS aucun débit. Le give ne débite jamais d'argent. Ces
+            # unités sont marquées « gratuites » (gifted_quantity) : si la catégorie/l'objet est supprimé
+            # plus tard, elles ne seront JAMAIS remboursées (le joueur n'a rien dépensé pour les obtenir),
+            # contrairement aux unités réellement ACHETÉES qui, elles, restent remboursées à la suppression.
+            inv_give(character_id, chosen["id"], qty)
+
+            # §2.9 : confirmation.
+            char = get_character(character_id)
+            cname = char["character_name"] if char else f"#{character_id}"
+            await channel.send(
+                f"✅ {qty}x {chosen['name']} donné(s) à {member.mention} ({cname}).")
+        finally:
+            self._release(staff.id)
+
     def _delete_category_with_refunds(self, cat_id) -> str:
         """Rembourse chaque possesseur de chaque item de la catégorie, puis supprime items,
         lignes d'inventaire et la catégorie. Retourne un récapitulatif des remboursements."""
@@ -1178,20 +1404,23 @@ class Shop(commands.Cog):
         for it in items:
             with db.get_connection() as conn:
                 holders = conn.execute(
-                    "SELECT character_id, quantity FROM character_inventory "
-                    "WHERE item_id = ? AND quantity > 0",
+                    "SELECT character_id, quantity, COALESCE(gifted_quantity, 0) AS gifted "
+                    "FROM character_inventory WHERE item_id = ? AND quantity > 0",
                     (it["id"],),
                 ).fetchall()
             for h in holders:
-                # Un objet à prix NULL (non achetable) vaut 0 -> montant 0 -> EXCLU du remboursement
-                # par le garde `montant > 0` ci-dessous (jamais de crash, jamais de remboursement fantôme).
-                montant = (it["valeur_base"] or 0) * h["quantity"]
+                # On ne rembourse QUE les unités réellement ACHETÉES : quantity - gifted_quantity. Les
+                # unités reçues gratuitement (give staff) ne sont JAMAIS remboursées (rien n'a été dépensé).
+                # Clamp >= 0 : si des unités ont été retirées/échangées depuis, on ne sur-rembourse jamais.
+                refundable_qty = max(0, h["quantity"] - h["gifted"])
+                # Un objet à prix NULL (non achetable) vaut 0 -> montant 0 -> EXCLU par le garde `> 0`.
+                montant = (it["valeur_base"] or 0) * refundable_qty
                 if montant > 0 and _refund_character(
                     h["character_id"], montant, f"Remboursement — suppression catégorie {cat_name}"
                 ):
                     char = get_character(h["character_id"])
                     cname = char["character_name"] if char else f"#{h['character_id']}"
-                    refund_lines.append(f"• {cname} : +{montant:,} ¥ ({h['quantity']} × {it['name']})")
+                    refund_lines.append(f"• {cname} : +{montant:,} ¥ ({refundable_qty} × {it['name']})")
         with db.get_connection() as conn:
             if item_ids:
                 placeholders = ",".join("?" * len(item_ids))
@@ -1509,20 +1738,23 @@ class Shop(commands.Cog):
         PAR PERSONNAGE sur SON propre compte), puis supprime l'item et ses lignes d'inventaire."""
         with db.get_connection() as conn:
             holders = conn.execute(
-                "SELECT character_id, quantity FROM character_inventory "
-                "WHERE item_id = ? AND quantity > 0",
+                "SELECT character_id, quantity, COALESCE(gifted_quantity, 0) AS gifted "
+                "FROM character_inventory WHERE item_id = ? AND quantity > 0",
                 (item["id"],),
             ).fetchall()
         lines = []
         for h in holders:
+            # On ne rembourse QUE les unités ACHETÉES (quantity - gifted_quantity) ; les unités reçues
+            # gratuitement (give staff) ne sont jamais remboursées. Clamp >= 0 (jamais de sur-remboursement).
+            refundable_qty = max(0, h["quantity"] - h["gifted"])
             # Prix NULL (non achetable) -> montant 0 -> EXCLU du remboursement par `montant > 0`.
-            montant = (item["valeur_base"] or 0) * h["quantity"]
+            montant = (item["valeur_base"] or 0) * refundable_qty
             if montant > 0 and _refund_character(
                 h["character_id"], montant, f"Remboursement — suppression de {item['name']}"
             ):
                 char = get_character(h["character_id"])
                 cname = char["character_name"] if char else f"#{h['character_id']}"
-                lines.append(f"• {cname} : +{montant:,} ¥ ({h['quantity']} × {item['name']})")
+                lines.append(f"• {cname} : +{montant:,} ¥ ({refundable_qty} × {item['name']})")
         with db.get_connection() as conn:
             conn.execute("DELETE FROM character_inventory WHERE item_id = ?", (item["id"],))
             conn.execute("DELETE FROM item_definitions WHERE id = ?", (item["id"],))
