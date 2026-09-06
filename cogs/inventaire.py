@@ -9,6 +9,7 @@ from discord.ext import commands
 
 from cogs.utils import database as db
 from cogs.utils.image_gen import generate_inventaire_image
+from cogs.utils.coherence_check import POTION_EFFECTS_TABLE
 # Réutilise les helpers bancaires (personnages, comptes, crédit, transactions) déjà existants.
 from cogs.banque import (
     get_characters, get_character, get_account, add_transaction, credit_compte_courant, PHOENIX_COLOR,
@@ -307,6 +308,9 @@ class MainInventoryView(discord.ui.View):
         self.add_item(discord.ui.Button(
             label="Vendre", emoji="💰", style=discord.ButtonStyle.success,
             custom_id=f"inv_sell:{character_id}:{user_id}", row=1))
+        self.add_item(discord.ui.Button(
+            label="Utiliser une potion", emoji="🧪", style=discord.ButtonStyle.secondary,
+            custom_id=f"inv_potion:{character_id}:{user_id}", row=1))
         if is_staff:
             # La création/ajout d'objets se fait maintenant exclusivement via la commande /shop (à venir).
             self.add_item(discord.ui.Button(
@@ -476,6 +480,23 @@ class Inventaire(commands.Cog):
         )
 
     # =================================================================
+    # LISTENER — décompte des potions durables (force / force_sort) par message
+    # =================================================================
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or message.guild is None:
+            return
+        # Pré-filtre bon marché : n'écrit rien si ce joueur n'a aucun effet actif dans CE salon.
+        if not db.has_active_potions_in_channel(message.author.id, message.channel.id):
+            return
+        expired = db.tick_active_potions(message.author.id, message.channel.id)
+        for e in expired:
+            label = "force du sort" if e["potion_type"] == "force_sort" else e["potion_type"]
+            await message.channel.send(
+                f"⏳ L'effet de la potion {label} (Classe {e['classe']}) de "
+                f"<@{message.author.id}> vient de se terminer.")
+
+    # =================================================================
     # LISTENER
     # =================================================================
     @commands.Cog.listener()
@@ -495,6 +516,8 @@ class Inventaire(commands.Cog):
             await self.handle_trade(interaction, cid)
         elif cid.startswith("inv_sell:"):
             await self.handle_sell(interaction, cid)
+        elif cid.startswith("inv_potion:"):
+            await self.handle_use_potion(interaction, cid)
         elif cid.startswith("inv_remove:"):
             await self.handle_remove(interaction, cid)
 
@@ -604,6 +627,108 @@ class Inventaire(commands.Cog):
             "🔧 Le système de vente est actuellement en maintenance, en attente de la commande /shop.",
             ephemeral=False,
         )
+
+    # ---------- UTILISER UNE POTION ----------
+    async def handle_use_potion(self, interaction, cid):
+        _, character_id, user_id = cid.split(":")
+        character_id, user_id = int(character_id), int(user_id)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Cet inventaire n'est pas le tien.", ephemeral=True)
+            return
+
+        # §3.1 : potions possédées (catégorie Potion, quantité > 0).
+        potions = db.get_owned_potions(character_id)
+        # §3.2 : aucune potion -> le clic ne fait RIEN (ephemeral silencieux).
+        if not potions:
+            await interaction.response.send_message("Tu n'as aucune potion à utiliser.", ephemeral=True)
+            return
+
+        if not self._acquire(user_id):
+            await interaction.response.send_message(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True)
+            return
+        try:
+            await interaction.response.send_message("🧪 Utilisation d'une potion…", ephemeral=True)
+            channel = interaction.channel
+
+            # §3.3 : une seule sorte -> directement ; §3.4 : plusieurs -> choix numéroté (isolé par joueur).
+            if len(potions) == 1:
+                potion = potions[0]
+            else:
+                lignes = "\n".join(
+                    f"**{i}.** {p['quantity']}x {p['name']}" for i, p in enumerate(potions, 1))
+                await channel.send(embed=discord.Embed(
+                    title="🧪 Quelle potion utiliser ?",
+                    description=lignes + "\n\nRéponds avec le **numéro** correspondant.",
+                    color=PHOENIX_COLOR))
+                potion = None
+                while potion is None:
+                    m = await self.wait_message(channel, interaction.user)
+                    if m is None:
+                        await channel.send("⏳ Utilisation annulée.")
+                        return
+                    c = m.content.strip()
+                    if c.isdigit() and 1 <= int(c) <= len(potions):
+                        potion = potions[int(c) - 1]
+                    else:
+                        await channel.send(f"Réponds avec un numéro entre 1 et {len(potions)}.")
+
+            # §3.5 : type + classe de la potion choisie.
+            potion_type = potion["potion_type"]
+            classe = potion["classe"]
+            item_id = potion["item_id"]
+            table = POTION_EFFECTS_TABLE.get(potion_type or "", {})
+            info = table.get(classe)
+            if potion_type not in POTION_EFFECTS_TABLE or info is None:
+                await channel.send(
+                    "❌ Cette potion n'a pas de type/classe reconnu (à corriger côté staff). Aucune action.")
+                return
+
+            if potion_type == "soin":
+                await self._use_potion_soin(channel, interaction.user, character_id, potion, classe, info)
+            else:
+                await self._use_potion_duree(channel, character_id, potion, potion_type, classe, info,
+                                             channel.id, interaction.user.id)
+        finally:
+            self._release(user_id)
+
+    async def _use_potion_soin(self, channel, player, character_id, potion, classe, info):
+        """Potion de soin (instantanée, cumulable) : demande la quantité, restaure les PV, retire du stock."""
+        owned = potion["quantity"]
+        nb = await self.ask_quantity(
+            channel, player, f"Combien de potions veux tu utiliser ? (tu en as {owned})", maximum=owned)
+        if nb is None:
+            await channel.send("⏳ Utilisation annulée.")
+            return
+        prof = db.get_or_create_profile(character_id)
+        pv_max = prof["pv_max"]
+        if classe == "S":
+            # Classe S : chaque potion soigne 75% de la vie MAX (cumulable).
+            soin_total = round(pv_max * info["effet_pct"] / 100) * nb
+        else:
+            soin_total = info["effet"] * nb
+        new_pv = db.heal_character(character_id, soin_total)
+        inv_remove(character_id, potion["item_id"], nb)
+        await channel.send(
+            f"✅ +{soin_total:,} PV restaurés ({nb}x {potion['name']}). "
+            f"PV : {new_pv:,}/{pv_max:,}.")
+
+    async def _use_potion_duree(self, channel, character_id, potion, potion_type, classe, info,
+                                channel_id, user_id):
+        """Potion à effet durable (force / force_sort) : une seule active par type, jamais de cumul."""
+        # Un effet de CE type est-il déjà actif ?
+        if db.get_active_potion(character_id, potion_type):
+            await channel.send(
+                "❌ Un effet de ce type est déjà actif, attends qu'il se termine avant d'en utiliser "
+                "une autre.")
+            return
+        bonus = info["bonus"]
+        duree = info["duree_messages"]
+        db.add_active_potion(character_id, potion_type, classe, bonus, duree, channel_id)
+        inv_remove(character_id, potion["item_id"], 1)
+        label = "force du sort" if potion_type == "force_sort" else "force"
+        await channel.send(
+            f"✅ Effet activé : +{bonus} ({label}), pendant {duree} messages.")
 
     # ---------- ÉCHANGE ----------
     async def handle_trade(self, interaction, cid):

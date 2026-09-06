@@ -43,6 +43,42 @@ SPELL_CLASS_VALUES = {
 # Ordre croissant de puissance des classes de sorts (4 = plus faible … S = ultime).
 SPELL_CLASS_ORDER = ["4", "3", "2", "1", "S"]
 
+# --- Potions (barème validé) -----------------------------------------------------------------------
+# 3 types de potions ; chaque type a ses 5 classes (4/3/2/1/S).
+#   • 'soin'       : instantané (duree_messages = 0). Classe S = pourcentage de la vie MAX (effet_pct),
+#                    les autres classes = points de vie fixes (effet).
+#   • 'force_sort' : bonus temporaire aux dégâts des sorts (bonus + duree_messages).
+#   • 'force'      : bonus temporaire à la stat Force (bonus + duree_messages).
+# Ces valeurs sont la SOURCE DE VÉRITÉ, lues telles quelles par cogs/shop.py (usage d'une potion) et
+# cogs/profil.py (affichage des effets actifs).
+POTION_EFFECTS_TABLE = {
+    "soin": {
+        "4": {"effet": 500, "duree_messages": 0},        # instantané, pas de durée
+        "3": {"effet": 1000, "duree_messages": 0},
+        "2": {"effet": 2000, "duree_messages": 0},
+        "1": {"effet": 3500, "duree_messages": 0},
+        "S": {"effet_pct": 75, "duree_messages": 0},     # 75% de la vie max, pas un point fixe
+    },
+    "force_sort": {
+        "4": {"bonus": 50, "duree_messages": 3},
+        "3": {"bonus": 150, "duree_messages": 5},
+        "2": {"bonus": 400, "duree_messages": 8},
+        "1": {"bonus": 900, "duree_messages": 12},
+        "S": {"bonus": 2000, "duree_messages": 20},
+    },
+    "force": {
+        "4": {"bonus": 50, "duree_messages": 3},
+        "3": {"bonus": 150, "duree_messages": 5},
+        "2": {"bonus": 400, "duree_messages": 8},
+        "1": {"bonus": 900, "duree_messages": 12},
+        "S": {"bonus": 2000, "duree_messages": 20},
+    },
+}
+# Types de potions à effet DURABLE (une ligne character_active_potions, décomptée en messages). 'soin'
+# en est exclu (instantané).
+POTION_DURATION_TYPES = ("force_sort", "force")
+POTION_CLASSES = ["4", "3", "2", "1", "S"]
+
 # Valeurs validées le 2026-08-21. Maîtrise EO : -1%/niveau, plafond -30% à niveau 30 (réduction du coût
 # énergétique des techniques). Maîtrise Sort : progression linéaire vers +1000 dégâts max à niveau 150.
 # Maîtrise RCT : 3 stades avec rôle Discord dédié (réel slot 1 / virtuel slot 2-3), bonus PV linéaire par
@@ -275,6 +311,33 @@ def _check_spell_classes(errors):
             errors.append(f"Fourchette de dégâts incohérente entre classe {k1} et {k2}.")
 
 
+def _check_potions(errors):
+    """Vérifie que les 3 types de potions ont bien leurs 5 classes (4/3/2/1/S), sans valeur manquante :
+      • 'soin'  : chaque classe expose soit 'effet' (points fixes) soit 'effet_pct' (% vie max), + 'duree_messages' ;
+      • 'force_sort' / 'force' : chaque classe expose 'bonus' > 0 et 'duree_messages' > 0.
+    Basé sur la constante POTION_EFFECTS_TABLE."""
+    expected_types = {"soin", "force_sort", "force"}
+    missing_types = expected_types - set(POTION_EFFECTS_TABLE)
+    if missing_types:
+        errors.append(f"POTION_EFFECTS_TABLE : type(s) de potion manquant(s) : {sorted(missing_types)}.")
+    for ptype, table in POTION_EFFECTS_TABLE.items():
+        missing = [c for c in POTION_CLASSES if c not in table]
+        if missing:
+            errors.append(f"Potion '{ptype}' : classe(s) manquante(s) {missing} (attendu 4/3/2/1/S).")
+        for classe, info in table.items():
+            if "duree_messages" not in info:
+                errors.append(f"Potion '{ptype}' classe {classe} : 'duree_messages' manquant.")
+            if ptype == "soin":
+                if "effet" not in info and "effet_pct" not in info:
+                    errors.append(f"Potion 'soin' classe {classe} : ni 'effet' ni 'effet_pct' défini.")
+            else:
+                bonus = info.get("bonus")
+                if not isinstance(bonus, int) or bonus <= 0:
+                    errors.append(f"Potion '{ptype}' classe {classe} : 'bonus' manquant ou non positif.")
+                if info.get("duree_messages", 0) <= 0:
+                    errors.append(f"Potion '{ptype}' classe {classe} : 'duree_messages' doit être > 0.")
+
+
 def _check_masteries(errors):
     """Vérifie les valeurs plafonds des maîtrises (EO / Sort / RCT / Territoire). Basé sur les constantes
     ci-dessus."""
@@ -416,6 +479,7 @@ def run_coherence_check() -> list:
     _check_eo(depart, errors)
     _check_clan_base(depart, errors)
     _check_spell_classes(errors)
+    _check_potions(errors)
     _check_masteries(errors)
 
     # Vérifications barème <-> code.

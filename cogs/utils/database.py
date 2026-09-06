@@ -222,7 +222,18 @@ CREATE TABLE IF NOT EXISTS item_definitions (
     description TEXT,
     classe TEXT,
     valeur_base INTEGER,
-    categorie_id INTEGER
+    categorie_id INTEGER,
+    potion_type TEXT          -- NULL sauf catégorie Potion : 'soin' | 'force_sort' | 'force'
+);
+
+CREATE TABLE IF NOT EXISTS character_active_potions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id INTEGER,
+    potion_type TEXT,         -- 'force_sort' ou 'force' uniquement (jamais 'soin', instantané)
+    classe TEXT,
+    bonus INTEGER,
+    messages_restants INTEGER,
+    channel_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS character_inventory (
@@ -726,6 +737,10 @@ def _migrate_item_categorie_id(conn):
     if "categorie_id" not in cols:
         conn.execute("ALTER TABLE item_definitions ADD COLUMN categorie_id INTEGER")
         cols.append("categorie_id")
+    # Colonne potion_type (NULL sauf catégorie Potion : 'soin' | 'force_sort' | 'force').
+    if "potion_type" not in cols:
+        conn.execute("ALTER TABLE item_definitions ADD COLUMN potion_type TEXT")
+        cols.append("potion_type")
     # Migration des anciennes catégories texte, uniquement si l'ancienne colonne existe encore.
     if "categorie" in cols:
         rows = conn.execute(
@@ -1796,8 +1811,8 @@ def get_territoire(character_id: int):
     """Territoire (/profil → 🗺️ Territoire) d'un personnage, ou None si aucune ligne n'existe encore."""
     with get_connection() as conn:
         return conn.execute(
-            "SELECT character_id, name, appellation, type, cout_eo_pct, duree_tours, description, "
-            "effets, image_path, is_unlocked "
+            "SELECT character_id, name, appellation, type, cout_eo_pct, cout_eo_fixe, duree_tours, "
+            "description, effets, image_path, is_unlocked "
             "FROM character_territoire WHERE character_id = ?",
             (character_id,),
         ).fetchone()
@@ -1870,7 +1885,7 @@ def get_character_armes(character_id: int):
     with get_connection() as conn:
         return conn.execute(
             "SELECT id, name, classe, description, image_path, degats_base, degats_actuel, "
-            "cout_eo_pct_override FROM character_armes_maudites WHERE character_id = ? ORDER BY id",
+            "cout_eo_pct_override, cout_eo_fixe FROM character_armes_maudites WHERE character_id = ? ORDER BY id",
             (character_id,),
         ).fetchall()
 
@@ -1892,6 +1907,118 @@ def get_arme_category_id():
             "SELECT id FROM shop_categories WHERE name = 'Arme maudite'"
         ).fetchone()
     return row["id"] if row else None
+
+
+# =====================================================================
+# POTIONS
+# =====================================================================
+def set_item_potion_type(item_id: int, potion_type):
+    """Fixe (ou efface, si None) le type de potion d'un objet ('soin' | 'force_sort' | 'force')."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE item_definitions SET potion_type = ? WHERE id = ?", (potion_type, item_id)
+        )
+
+
+def get_owned_potions(character_id: int):
+    """Potions POSSÉDÉES (catégorie « Potion », quantité > 0) par ce personnage, avec item_id, nom,
+    classe, potion_type et quantité. Le nom de catégorie vient de shop_categories (categorie_id)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT ci.item_id, ci.quantity, item.name, item.classe, item.potion_type "
+            "FROM character_inventory ci "
+            "JOIN item_definitions item ON item.id = ci.item_id "
+            "JOIN shop_categories s ON item.categorie_id = s.id "
+            "WHERE ci.character_id = ? AND LOWER(s.name) = 'potion' AND ci.quantity > 0 "
+            "ORDER BY item.name",
+            (character_id,),
+        ).fetchall()
+
+
+def heal_character(character_id: int, amount: int) -> int:
+    """Ajoute `amount` PV à un personnage sans jamais dépasser pv_max. Retourne le pv_actuel final.
+    Crée la ligne character_profiles au besoin (valeurs par défaut)."""
+    with get_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO character_profiles (character_id) VALUES (?)", (character_id,))
+        conn.execute(
+            "UPDATE character_profiles SET pv_actuel = MIN(pv_max, pv_actuel + ?) WHERE character_id = ?",
+            (amount, character_id),
+        )
+        row = conn.execute(
+            "SELECT pv_actuel FROM character_profiles WHERE character_id = ?", (character_id,)
+        ).fetchone()
+    return row["pv_actuel"] if row else 0
+
+
+def get_active_potion(character_id: int, potion_type: str):
+    """Effet durable de CE type actuellement actif pour ce personnage (ou None)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM character_active_potions WHERE character_id = ? AND potion_type = ? LIMIT 1",
+            (character_id, potion_type),
+        ).fetchone()
+
+
+def get_active_potions(character_id: int):
+    """Tous les effets durables actifs d'un personnage (pour l'affichage /profil)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM character_active_potions WHERE character_id = ? ORDER BY potion_type",
+            (character_id,),
+        ).fetchall()
+
+
+def get_active_potion_bonus(character_id: int, potion_type: str) -> int:
+    """Bonus total actuellement actif de ce type (0 si aucun). Sert aux affichages « (+X) »."""
+    row = get_active_potion(character_id, potion_type)
+    return row["bonus"] if row else 0
+
+
+def add_active_potion(character_id: int, potion_type: str, classe: str, bonus: int,
+                      messages_restants: int, channel_id: int):
+    """Enregistre un nouvel effet durable (un seul par type à la fois : la vérification d'unicité est
+    faite par l'appelant via get_active_potion)."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO character_active_potions "
+            "(character_id, potion_type, classe, bonus, messages_restants, channel_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (character_id, potion_type, classe, bonus, messages_restants, channel_id),
+        )
+
+
+def has_active_potions_in_channel(user_id: int, channel_id: int) -> bool:
+    """True si un personnage de ce joueur a au moins un effet actif dans ce salon (pré-filtre bon marché
+    du listener on_message, pour éviter une écriture à chaque message)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM character_active_potions cap "
+            "JOIN validated_characters vc ON vc.id = cap.character_id "
+            "WHERE vc.user_id = ? AND cap.channel_id = ? LIMIT 1",
+            (user_id, channel_id),
+        ).fetchone()
+    return row is not None
+
+
+def tick_active_potions(user_id: int, channel_id: int):
+    """Décrémente d'1 message les effets actifs des personnages de CE joueur dans CE salon, supprime
+    ceux arrivés à 0, et retourne la liste des effets expirés [{potion_type, classe}]."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE character_active_potions SET messages_restants = messages_restants - 1 "
+            "WHERE channel_id = ? AND character_id IN "
+            "(SELECT id FROM validated_characters WHERE user_id = ?)",
+            (channel_id, user_id),
+        )
+        expired = conn.execute(
+            "SELECT id, potion_type, classe FROM character_active_potions "
+            "WHERE channel_id = ? AND messages_restants <= 0 AND character_id IN "
+            "(SELECT id FROM validated_characters WHERE user_id = ?)",
+            (channel_id, user_id),
+        ).fetchall()
+        for e in expired:
+            conn.execute("DELETE FROM character_active_potions WHERE id = ?", (e["id"],))
+    return [{"potion_type": e["potion_type"], "classe": e["classe"]} for e in expired]
 
 
 def get_inventory_armes(character_id: int, categorie_id: int):
@@ -1940,7 +2067,7 @@ def get_arme(arme_id: int):
     with get_connection() as conn:
         return conn.execute(
             "SELECT id, character_id, name, classe, description, image_path, degats_base, degats_actuel, "
-            "cout_eo_pct_override FROM character_armes_maudites WHERE id = ?",
+            "cout_eo_pct_override, cout_eo_fixe FROM character_armes_maudites WHERE id = ?",
             (arme_id,),
         ).fetchone()
 

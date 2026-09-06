@@ -971,6 +971,21 @@ class Profil(commands.Cog):
             os.remove(path)
         except OSError:
             pass
+        # §5 : petite section « effets de potion actifs », À CÔTÉ du pillow principal (jamais dans les
+        # ronds Force/Sort, qui restent 100% inchangés). Un effet de chaque type peut être actif à la fois.
+        actives = db.get_active_potions(character_id)
+        if actives:
+            labels = {"force": "Force", "force_sort": "Force du sort"}
+            lignes = [
+                f"⚡ Potion {labels.get(a['potion_type'], a['potion_type'])} Classe {a['classe']} "
+                f"active (+{a['bonus']}, {a['messages_restants']} message(s) restant(s))"
+                for a in actives
+            ]
+            await channel.send(embed=discord.Embed(
+                title="⚡ Effets de potion actifs",
+                description="\n".join(lignes),
+                color=PHOENIX_COLOR,
+            ))
 
     # ---------- rendu de l'image Stats ----------
     async def _render_stats(self, character_id, guild=None):
@@ -1032,8 +1047,11 @@ class Profil(commands.Cog):
                 tranche = compute_points_manquants(xp_actuel, xp_max, level, cap)
                 pct = round(xp_actuel / xp_max * 100) if level < cap else 100
 
+            # §5 : bonus temporaire « force » (potion) affiché en (+X) UNIQUEMENT sur la stat Force,
+            # sans jamais l'inclure dans le calcul du rond/jauge (pct/level restent sur les points permanents).
+            force_bonus = db.get_active_potion_bonus(character_id, "force") if key == "force" else 0
             stats.append((STAT_DISPLAY_NAMES[key], STAT_COLORS[key], base, total, pct, tranche,
-                          show_tranche_text))
+                          show_tranche_text, force_bonus))
         buffs = []
         for bname, effects in db.get_buffs_with_effects(character_id):
             parts = " · ".join(
@@ -1154,6 +1172,8 @@ class Profil(commands.Cog):
         base_tours = terr["duree_tours"] or TERRITOIRE_DEFAULT_DUREE_TOURS
         cout_final = compute_territoire_cout(base_cout, level, eo_reserve)
         tours_final = compute_territoire_tours(base_tours, level)
+        # §7 : si le coût a été converti via /technique (cout_eo_fixe non NULL), on affiche les POINTS.
+        cout_fixe = terr["cout_eo_fixe"] if "cout_eo_fixe" in terr.keys() else None
 
         path = _tmp_profile("territoire")
         generate_territoire_image(
@@ -1165,7 +1185,7 @@ class Profil(commands.Cog):
             terr["description"] or "—",
             terr["effets"] or "—",
             path, portrait_path=portrait_path, background_path=background_path,
-            is_max=is_max,
+            is_max=is_max, cout_eo_fixe=cout_fixe,
         )
         return path
 
@@ -1600,13 +1620,19 @@ class Profil(commands.Cog):
         bg = db.get_background(character_id)
         background_path = bg["image_path"] if bg else None
         classe = arme["classe"]
-        # Coût EO : override staff s'il existe, sinon valeur dérivée de la classe.
-        override = arme["cout_eo_pct_override"] if "cout_eo_pct_override" in arme.keys() else None
-        cout_pct = override if override is not None else SPELL_CLASS_VALUES.get(classe, {}).get("cout_pct", 0)
+        # §7 : une fois le coût converti via /technique (cout_eo_fixe non NULL), on affiche les POINTS
+        # d'EO fixes au lieu du %. Sinon : override staff s'il existe, sinon valeur dérivée de la classe.
+        cout_fixe = arme["cout_eo_fixe"] if "cout_eo_fixe" in arme.keys() else None
+        if cout_fixe is not None:
+            cout_txt = f"{cout_fixe} points d'EO"
+        else:
+            override = arme["cout_eo_pct_override"] if "cout_eo_pct_override" in arme.keys() else None
+            cout_pct = override if override is not None else SPELL_CLASS_VALUES.get(classe, {}).get("cout_pct", 0)
+            cout_txt = f"{cout_pct}% de la réserve"
         path = _tmp_profile("arme")
         generate_arme_maudite_image(
             char_name, arme["name"] or "—", classe,
-            f"{cout_pct}% de la réserve", f"{arme['degats_actuel']:,} pts",
+            cout_txt, f"{arme['degats_actuel']:,} pts",
             arme["description"] or "—", arme["image_path"], path,
             portrait_path=portrait_path, background_path=background_path,
         )
@@ -2128,12 +2154,16 @@ class Profil(commands.Cog):
         # Slots secondaires -> tuples (nom, classe, niveau_requis, debloque, cout_pct, degats). L'image
         # complète elle-même jusqu'à 8 slots (None, None, 999, False, None, None). Un slot sans nom est
         # considéré verrouillé/vide ; cout_pct et degats viennent de character_secondary_sorts.
+        # §5 : bonus temporaire « force du sort » actif (0 si aucun), affiché en (+X) sur les dégâts.
+        bonus_sort = db.get_active_potion_bonus(character_id, "force_sort")
         secondaires = []
         for row in db.get_secondary_sorts(principal["id"]):
             debloque = row["name"] is not None
             niveau = row["niveau_requis"] if row["niveau_requis"] is not None else 999
+            cout_fixe = row["cout_eo_fixe"] if "cout_eo_fixe" in row.keys() else None
+            deg_bonus = bonus_sort if (debloque and row["degats"] is not None) else 0
             secondaires.append((row["name"], row["classe"], niveau, debloque,
-                                row["cout_pct"], row["degats"]))
+                                row["cout_pct"], row["degats"], cout_fixe, deg_bonus))
         bg = db.get_background(character_id)
         background_path = bg["image_path"] if bg else None
         char = get_character(character_id)
@@ -2240,14 +2270,19 @@ class Profil(commands.Cog):
             color=discord.Color.from_rgb(*rgb),
         )
         embed.add_field(name="Classe", value=f"{classe} ({label})", inline=True)
-        # Coût : le complément « converti en X points d'EO fixes… » n'apparaît que si la conversion a eu
-        # lieu (cout_eo_fixe non NULL) — ce qui n'arrive jamais tant qu'aucun système de combat n'existe.
-        cout = f"{sec['cout_pct']}% de la réserve"
+        # §7 : dès que le coût a été converti via /technique (cout_eo_fixe non NULL), on affiche les
+        # POINTS d'EO fixes, PLUS le %. Tant que la conversion n'a pas eu lieu, on garde le %.
         if sec["cout_eo_fixe"] is not None:
-            cout += (f", converti en {sec['cout_eo_fixe']} points d'EO fixes une fois utilisé pour la "
-                     "première fois")
+            cout = f"{sec['cout_eo_fixe']} points d'EO"
+        else:
+            cout = f"{sec['cout_pct']}% de la réserve"
         embed.add_field(name="Coût en énergie occulte", value=cout, inline=True)
-        degats = f"{sec['degats']} pts" if sec["degats"] is not None else "—"
+        # §5 : bonus temporaire « force du sort » ajouté entre parenthèses tant qu'un effet est actif.
+        if sec["degats"] is not None:
+            bonus_sort = db.get_active_potion_bonus(principal["character_id"], "force_sort")
+            degats = f"{sec['degats']} pts" + (f" (+{bonus_sort})" if bonus_sort else "")
+        else:
+            degats = "—"
         embed.add_field(name="Dégâts", value=degats, inline=True)
         embed.add_field(name="Point faible", value=sec["faiblesse"] or "—", inline=False)
         embed.add_field(

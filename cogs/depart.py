@@ -3009,6 +3009,8 @@ def delete_character_cascade(character_id):
         conn.execute("DELETE FROM bank_sessions WHERE character_id = ?", (character_id,))
         # Inventaire
         conn.execute("DELETE FROM character_inventory WHERE character_id = ?", (character_id,))
+        # Effets de potions durables actifs (force / force_sort)
+        conn.execute("DELETE FROM character_active_potions WHERE character_id = ?", (character_id,))
         # Échanges (le personnage peut être proposeur OU cible)
         conn.execute(
             "DELETE FROM pending_trades WHERE proposer_character_id = ? OR target_character_id = ?",

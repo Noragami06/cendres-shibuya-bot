@@ -205,6 +205,11 @@ NAME_ALIASES = ["n", "ndi", "nom", "nom de l'item"]
 DESC_ALIASES = ["descr", "desc", "description"]
 PRIX_ALIASES = ["prix", "price"]
 CLASSE_ALIASES = ["classe", "class"]
+# Type de potion (catégorie Potion uniquement) : 'soin' | 'force_sort' | 'force'.
+TYPE_ALIASES = ["type", "effet"]
+POTION_TYPE_VALUES = {"soin", "force_sort", "force"}
+_POTION_TYPE_LABELS = {"soin": "soin", "force sort": "force_sort", "force_sort": "force_sort",
+                       "force": "force"}
 
 
 def _marker_regex(aliases):
@@ -219,6 +224,7 @@ _NAME_RE = _marker_regex(NAME_ALIASES)
 _DESC_RE = _marker_regex(DESC_ALIASES)
 _PRIX_RE = _marker_regex(PRIX_ALIASES)
 _CLASSE_RE = _marker_regex(CLASSE_ALIASES)
+_TYPE_RE = _marker_regex(TYPE_ALIASES)
 
 
 def _clean_val(s: str) -> str:
@@ -226,9 +232,13 @@ def _clean_val(s: str) -> str:
     return s.strip().strip("/").strip()
 
 
-def parse_bulk_items(text: str, price_ranges=None):
+def parse_bulk_items(text: str, price_ranges=None, potion_category=False):
     """Retourne (items_valides, erreurs). items_valides = liste de dicts
-    {order, name, description, prix, classe}. erreurs = liste de tuples (numero_ordre, message).
+    {order, name, description, prix, classe, potion_type}. erreurs = liste de tuples (numero, message).
+
+    `potion_category` : si True (catégorie Potion), le champ `type:` est OBLIGATOIRE et doit valoir
+    'soin', 'force_sort' (ou « force sort ») ou 'force' ; il alimente item_definitions.potion_type.
+    Pour les autres catégories, potion_type reste None.
 
     `price_ranges` (optionnel) : le dict {classe: (lo, hi)} de la catégorie si elle est AUTO-tarifée
     (Arme maudite / Relique / Potion). Dans ce cas le prix n'est PAS saisi mais tiré aléatoirement dans
@@ -251,9 +261,9 @@ def parse_bulk_items(text: str, price_ranges=None):
         seg_end = name_markers[idx + 1].start() if idx + 1 < len(name_markers) else len(text)
         segment = text[seg_start:seg_end]
 
-        # Marqueurs de champ (desc/prix/classe) présents dans ce segment, triés par position.
+        # Marqueurs de champ (desc/prix/classe/type) présents dans ce segment, triés par position.
         field_hits = []
-        for kind, rgx in (("desc", _DESC_RE), ("prix", _PRIX_RE), ("classe", _CLASSE_RE)):
+        for kind, rgx in (("desc", _DESC_RE), ("prix", _PRIX_RE), ("classe", _CLASSE_RE), ("type", _TYPE_RE)):
             for fm in rgx.finditer(segment):
                 field_hits.append((fm.start(), fm.end(), kind))
         field_hits.sort(key=lambda t: t[0])
@@ -335,11 +345,23 @@ def parse_bulk_items(text: str, price_ranges=None):
 
         description = values.get("desc", "") or ""
 
+        # Type de potion (catégorie Potion uniquement) : obligatoire, dans {soin, force_sort, force}.
+        potion_type = None
+        if potion_category:
+            raw_type = (values.get("type") or "").strip().lower().replace("-", " ")
+            if not raw_type:
+                item_errors.append("type de potion manquant (soin / force_sort / force)")
+            else:
+                potion_type = _POTION_TYPE_LABELS.get(raw_type)
+                if potion_type is None:
+                    item_errors.append(f"type de potion invalide (« {values.get('type')} »)")
+
         if item_errors:
             errors.append((order, ", ".join(item_errors)))
         else:
             valid.append({"order": order, "name": name, "description": description,
-                          "prix": prix, "classe": classe, "auto": auto_priced})
+                          "prix": prix, "classe": classe, "auto": auto_priced,
+                          "potion_type": potion_type})
 
     return valid, errors
 
@@ -1215,7 +1237,20 @@ class Shop(commands.Cog):
             cat_id = sview.result
             cat_row = get_shop_category(cat_id)
             price_ranges = get_class_price_ranges_for_category(cat_row["name"]) if cat_row else None
-            if price_ranges is not None:
+            is_potion = cat_row is not None and _normalize_cat_name(cat_row["name"]) == "potion"
+            if is_potion:
+                # Catégorie Potion : tarifée par classe ET type de potion obligatoire.
+                await channel.send(
+                    "Colle la liste des potions à créer, au format :\n"
+                    "`N: nom / descr: description / classe: S,1,2,3,4 / type: soin / prix: montant`\n\n"
+                    "La **classe (S/1/2/3/4)** et le **type** sont **obligatoires**.\n"
+                    "• `type:` → **soin**, **force_sort** ou **force**\n"
+                    "• prix laissé vide ou `prix: auto` → prix **automatique** selon la classe\n"
+                    "• `prix: 0` → objet **jamais achetable** (give/récompenses manuelles)\n"
+                    "• `prix: <montant>` → **ce montant précis** (la fourchette de classe est ignorée)\n"
+                    "Tu peux en créer plusieurs d'un coup, un par ligne ou à la suite."
+                )
+            elif price_ranges is not None:
                 # Catégorie tarifée par classe : le champ prix est OPTIONNEL (auto si vide/'auto').
                 await channel.send(
                     "Colle la liste des objets à créer, au format :\n"
@@ -1238,7 +1273,7 @@ class Shop(commands.Cog):
             if m is None:
                 await channel.send("⏳ Annulé.")
                 return
-            valid, errors = parse_bulk_items(m.content, price_ranges)
+            valid, errors = parse_bulk_items(m.content, price_ranges, potion_category=is_potion)
             if not valid and not errors:
                 await channel.send(
                     "❌ Format non reconnu : aucun champ « nom: » détecté. Réessaie via le bouton."
@@ -1253,7 +1288,9 @@ class Shop(commands.Cog):
                 if get_item_by_name_ci(it["name"]):
                     all_errors.append((it["order"], f"un objet nommé « {it['name']} » existe déjà"))
                     continue
-                create_item(it["name"], it["description"], it["classe"], it["prix"], cat_id)
+                new_id = create_item(it["name"], it["description"], it["classe"], it["prix"], cat_id)
+                if it.get("potion_type"):
+                    db.set_item_potion_type(new_id, it["potion_type"])
                 created += 1
                 created_items.append((it["name"], it["classe"], it["prix"], it.get("auto", False)))
 

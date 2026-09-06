@@ -922,9 +922,12 @@ def _stats_hexagon(d, img, cx, cy, r, gold, portrait_path=None):
     d.polygon(pts, outline=gold, width=3)
 
 
-def _stats_row(d, x, y, w, name, color, base, total, pct, tranche, show_tranche_text=True):
+def _stats_row(d, x, y, w, name, color, base, total, pct, tranche, show_tranche_text=True, bonus=0):
     d.text((x, y), name.upper(), font=font(14, True), fill=color)
     ptxt = f"{base:,} pts ({total:,})".replace(",", " ") if total != base else f"{base:,} pts".replace(",", " ")
+    # §5 : bonus temporaire (potion « force ») affiché entre parenthèses, sans jamais toucher la jauge/pct.
+    if bonus:
+        ptxt += f" (+{bonus:,})".replace(",", " ")
     pw = text_w(d, ptxt, font(12, True))
     pctw = text_w(d, f"{pct}%", font(12, True))
     d.text((x + w - pw - pctw - 14, y), ptxt, font=font(12, True), fill=TEXT_STATS)
@@ -993,11 +996,12 @@ def generate_stats_image(name, stats, buffs, points_restants, out_path, portrait
     for i, row_data in enumerate(stats[:8]):
         sname, color, base, total, pct, tranche = row_data[:6]
         show_tranche_text = row_data[6] if len(row_data) > 6 else True  # 7e élément optionnel (rétro-compatible)
+        bonus = row_data[7] if len(row_data) > 7 else 0  # 8e élément optionnel : bonus temporaire (+X)
         col, row = i % 2, i // 2
         x = 40 + col * (col_w + 30)
         y = y0 + row * 84
         _stats_row(d, x, y, col_w, sname, color, base, total, pct, tranche,
-                   show_tranche_text=show_tranche_text)
+                   show_tranche_text=show_tranche_text, bonus=bonus)
 
     buffs_y = y0 + 4 * 84 + 16
     _stats_buffs_frame(d, (40, buffs_y, W - 40, H - 88), GOLD_STATS, buffs)
@@ -2130,7 +2134,7 @@ def _techdet_class_badge(d, x, y, classe, size=30):
     d.text((x + size / 2 - lw / 2, y + size / 2 - 8), label, font=f, fill=(15, 15, 18, 255))
 
 def _techdet_secondary_card(d, x, y, w, h, name, classe, niveau_requis, debloque, principal_level,
-                            cout_pct=None, degats=None):
+                            cout_pct=None, degats=None, cout_eo_fixe=None, degats_bonus=0):
     locked = not debloque or (principal_level < niveau_requis)
     color = TECHDET_CLASS_COLORS.get(classe, (90, 88, 100)) if not locked else (70, 68, 80)
     d.rounded_rectangle((x, y, x + w, y + h), radius=10, fill=(22, 20, 28, 255))
@@ -2151,8 +2155,18 @@ def _techdet_secondary_card(d, x, y, w, h, name, classe, niveau_requis, debloque
         display_name = display_name + "..."
     d.text((x + 18, y + 18), display_name, font=font(13, True), fill=TECHDET_TEXT)
     d.text((x + 18, y + 44), f"Niveau requis : {niveau_requis}", font=font(13), fill=TECHDET_SUB)
-    cout_txt = f"Coût EO : {cout_pct}%" if cout_pct is not None else "Coût EO : —"
-    degats_txt = f"Dégâts : {degats} pts" if degats is not None else "Dégâts : —"
+    # §7 : coût en POINTS d'EO fixes dès qu'il a été converti (cout_eo_fixe non NULL), sinon en %.
+    if cout_eo_fixe is not None:
+        cout_txt = f"Coût EO : {cout_eo_fixe} pts"
+    elif cout_pct is not None:
+        cout_txt = f"Coût EO : {cout_pct}%"
+    else:
+        cout_txt = "Coût EO : —"
+    # §5 : bonus temporaire « force du sort » ajouté entre parenthèses tant qu'un effet est actif.
+    if degats is not None:
+        degats_txt = f"Dégâts : {degats} pts" + (f" (+{degats_bonus})" if degats_bonus else "")
+    else:
+        degats_txt = "Dégâts : —"
     d.text((x + 18, y + h - 56), cout_txt, font=font(13), fill=TECHDET_SUB)
     d.text((x + 18, y + h - 30), degats_txt, font=font(13), fill=TECHDET_SUB)
 
@@ -2161,10 +2175,13 @@ def generate_technique_detail_image(sort_principal_name: str, sort_principal_lev
                                      sorts_secondaires: list, out_path: str, background_path=None,
                                      portrait_path=None):
     """
-    sorts_secondaires : liste de jusqu'à 8 tuples (nom, classe, niveau_requis, debloque, cout_pct, degats)
+    sorts_secondaires : liste de jusqu'à 8 tuples
+                         (nom, classe, niveau_requis, debloque, cout_pct, degats, cout_eo_fixe, degats_bonus)
                          classe est une chaîne parmi "S", "1", "2", "3", "4", ou None si le slot est vide.
                          nom est None si le slot n'a pas encore de sort assigné (vide, même déverrouillable).
                          cout_pct / degats sont None si inconnus (affiche « — »).
+                         cout_eo_fixe : coût converti en points d'EO (affiché à la place du %) ou None.
+                         degats_bonus : bonus temporaire « force du sort » à afficher entre parenthèses (0 = aucun).
     """
     W, H = 1300, 1300
     if background_path and os.path.exists(background_path):
@@ -2200,13 +2217,18 @@ def generate_technique_detail_image(sort_principal_name: str, sort_principal_lev
     row_h = 150
     gap = 20
     y0 = 90
-    padded = (sorts_secondaires + [(None, None, 999, False, None, None)] * 8)[:8]
-    for i, (name, classe, niveau, debloque, cout_pct, degats) in enumerate(padded):
+    padded = (sorts_secondaires + [(None, None, 999, False, None, None, None, 0)] * 8)[:8]
+    for i, slot in enumerate(padded):
+        # Tuples à 6 (ancien format) ou 8 éléments : on complète les manquants (cout_eo_fixe, degats_bonus).
+        name, classe, niveau, debloque, cout_pct, degats = slot[:6]
+        cout_eo_fixe = slot[6] if len(slot) > 6 else None
+        degats_bonus = slot[7] if len(slot) > 7 else 0
         col, row = i % 2, i // 2
         x = 300 + col * (col_w + gap)
         y = y0 + row * (row_h + gap)
         _techdet_secondary_card(d, x, y, col_w, row_h, name, classe, niveau, debloque,
-                                sort_principal_level, cout_pct=cout_pct, degats=degats)
+                                sort_principal_level, cout_pct=cout_pct, degats=degats,
+                                cout_eo_fixe=cout_eo_fixe, degats_bonus=degats_bonus)
 
     img.save(out_path)
     return out_path
@@ -2261,10 +2283,11 @@ def generate_territoire_image(character_name: str, terr_name: str, terr_type: st
                                cout_eo_pct: int, duree_tours: int,
                                description: str, effets: str,
                                out_path: str, portrait_path=None, background_path=None,
-                               is_max: bool = False):
+                               is_max: bool = False, cout_eo_fixe=None):
     """
     terr_type : chaîne libre, ex "Sans barrière", "Non maîtrisé", "Barrière active"...
     cout_eo_pct : coût en % de la réserve (valeur finale déjà calculée : base + paliers de niveau).
+    cout_eo_fixe : si non None, coût converti en POINTS d'EO fixes -> affiché à la place du % (§/technique).
     duree_tours : durée d'effet en tours (valeur finale déjà calculée : base + paliers de niveau).
     is_max : True -> affiche « MAX » au lieu du pourcentage et remplit la jauge (Maîtrise au plafond).
     description, effets : texte libre, jusqu'à 500 caractères chacun.
@@ -2310,7 +2333,9 @@ def generate_territoire_image(character_name: str, terr_name: str, terr_type: st
     box_y0, box_y1 = 60, 200
     _terr_frame(d, (box_x0, box_y0, box_x1, box_y1), TERR_GOLD, width=2, radius=10)
     d.text((box_x0 + 14, box_y0 + 12), "COÛT EO", font=font(11, True), fill=TERR_HEADER_COLOR)
-    d.text((box_x0 + 14, box_y0 + 32), f"{cout_eo_pct}%", font=font(18, True), fill=(230, 90, 90, 255))
+    # §7 : coût en POINTS d'EO fixes une fois converti (cout_eo_fixe non NULL), sinon en %.
+    cout_terr_txt = f"{cout_eo_fixe} pts" if cout_eo_fixe is not None else f"{cout_eo_pct}%"
+    d.text((box_x0 + 14, box_y0 + 32), cout_terr_txt, font=font(18, True), fill=(230, 90, 90, 255))
     d.line((box_x0 + 14, box_y0 + 68, box_x1 - 14, box_y0 + 68), fill=(50, 47, 58, 255), width=1)
     d.text((box_x0 + 14, box_y0 + 78), "DURÉE", font=font(11, True), fill=TERR_HEADER_COLOR)
     d.text((box_x0 + 14, box_y0 + 98), f"{duree_tours} tours", font=font(18, True), fill=(120, 220, 170, 255))

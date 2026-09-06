@@ -26,6 +26,7 @@ from cogs.utils.coherence_check import (  # noqa: E402  (import après ajustemen
     MASTERY_SORT_MAX_LEVEL, compute_mastery_sort_bonus,
     MASTERY_TERRITOIRE_MAX_LEVEL,
     RCT_STAGES, compute_rct_pv_bonus,
+    POTION_EFFECTS_TABLE, POTION_CLASSES,
 )
 
 
@@ -168,8 +169,31 @@ def section_masteries():
           f"(+1 tour et réduction du coût EO par palier de 15 niveaux, appliqués à l'affichage)")
 
 
+def section_potions():
+    header("7. POTIONS (soin / force_sort / force)")
+    print("  3 types de potions, 5 classes chacun (4/3/2/1/S). 'soin' est instantané (durée 0) ;")
+    print("  'force_sort' et 'force' donnent un bonus temporaire décompté en messages.")
+    for ptype in ("soin", "force_sort", "force"):
+        table = POTION_EFFECTS_TABLE.get(ptype, {})
+        print(f"\n  [{ptype}]")
+        for classe in POTION_CLASSES:
+            info = table.get(classe)
+            if info is None:
+                print(f"      Classe {classe:>1s} : (absente !)")
+                continue
+            duree = info.get("duree_messages", "?")
+            if ptype == "soin":
+                if "effet_pct" in info:
+                    effet = f"{info['effet_pct']}% de la vie max"
+                else:
+                    effet = f"+{info.get('effet', '?')} PV"
+                print(f"      Classe {classe:>1s} : {effet:22s} (durée {duree} message(s))")
+            else:
+                print(f"      Classe {classe:>1s} : +{info.get('bonus', '?'):<5} (durée {duree} message(s))")
+
+
 def section_code_roles(mods, barometer):
-    header("7. RÔLES UTILISÉS DANS LE CODE")
+    header("8. RÔLES UTILISÉS DANS LE CODE")
     by_id = group_roles_by_id(collect_code_roles(mods))
     if not by_id:
         print("  (aucun rôle codé en dur collecté — imports de cogs indisponibles ?)")
@@ -221,9 +245,13 @@ def main():
     except Exception as e:
         print(f"  ⚠️  Section 6 ignorée : {e}")
     try:
-        section_code_roles(mods, barometer)
+        section_potions()
     except Exception as e:
         print(f"  ⚠️  Section 7 ignorée : {e}")
+    try:
+        section_code_roles(mods, barometer)
+    except Exception as e:
+        print(f"  ⚠️  Section 8 ignorée : {e}")
 
     if conn is not None:
         conn.close()
