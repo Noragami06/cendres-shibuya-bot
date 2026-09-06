@@ -1930,6 +1930,36 @@ def set_item_potion_type(item_id: int, potion_type):
         )
 
 
+def get_owned_items_by_names(character_id: int, names):
+    """Items possédés (quantity > 0) par ce personnage dont le nom exact figure dans `names`.
+    Retourne des lignes (item_id, name, quantity). Utilisé par /parchemin."""
+    names = list(names or [])
+    if not names:
+        return []
+    placeholders = ",".join("?" * len(names))
+    with get_connection() as conn:
+        return conn.execute(
+            f"SELECT ci.item_id, item.name, ci.quantity "
+            f"FROM character_inventory ci JOIN item_definitions item ON item.id = ci.item_id "
+            f"WHERE ci.character_id = ? AND item.name IN ({placeholders}) AND ci.quantity > 0 "
+            f"ORDER BY item.name",
+            (character_id, *names),
+        ).fetchall()
+
+
+def consume_inventory_item(character_id: int, item_id: int, qty: int):
+    """Retire `qty` unités d'un item de l'inventaire ; supprime la ligne si la quantité tombe à 0."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE character_inventory SET quantity = quantity - ? WHERE character_id = ? AND item_id = ?",
+            (qty, character_id, item_id),
+        )
+        conn.execute(
+            "DELETE FROM character_inventory WHERE character_id = ? AND item_id = ? AND quantity <= 0",
+            (character_id, item_id),
+        )
+
+
 def get_owned_potions(character_id: int):
     """Potions POSSÉDÉES (catégorie « Potion », quantité > 0) par ce personnage, avec item_id, nom,
     classe, potion_type et quantité. Le nom de catégorie vient de shop_categories (categorie_id)."""
