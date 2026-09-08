@@ -179,3 +179,14 @@ generate_arme_maudite_image(
     out_path="temp/preview_arme_maudite.png",
 )
 print("Arme maudite générée dans temp/")
+
+from cogs.utils.image_gen import generate_daily_enemy_image
+
+generate_daily_enemy_image(
+    "Fléau Errant", "S",
+    pv=45000, eo=320000,
+    force=8500, vitesse=6200, arme_maudite=7300, rct=4100, territoire=9800,
+    coffres_pct={"commun": 45, "rare": 30, "epic": 15, "legendaire": 8, "mythique": 2},
+    out_path="temp/preview_daily_enemy.png",
+)
+print("Daily enemy générée dans temp/")

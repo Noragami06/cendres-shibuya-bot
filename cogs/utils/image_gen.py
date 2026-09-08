@@ -2487,3 +2487,128 @@ def generate_arme_maudite_image(character_name: str, arme_name: str, classe: str
 
     img.save(out_path)
     return out_path
+
+
+# ---------------------------------------------------------------------------
+# Ennemi du jour (/daily)
+# ---------------------------------------------------------------------------
+DAILY_BG = (10, 9, 15, 255)
+DAILY_TEXT = (235, 235, 240, 255)
+DAILY_SUB = (150, 148, 160, 255)
+DAILY_GOLD = (232, 197, 121, 255)
+DAILY_HEADER_COLOR = (255, 200, 60, 255)
+
+DAILY_CLASS_COLORS = {"S": (255, 165, 0), "1": (235, 60, 100), "2": (170, 80, 240), "3": (60, 130, 240), "4": (40, 200, 150)}
+DAILY_COFFRE_COLORS = {
+    "commun": (170, 170, 175), "rare": (90, 160, 240), "epic": (170, 80, 240),
+    "legendaire": (255, 165, 0), "mythique": (235, 60, 100),
+}
+DAILY_COFFRE_LABELS = {"commun": "Commun", "rare": "Rare", "epic": "Épique", "legendaire": "Légendaire", "mythique": "Mythique"}
+DAILY_COFFRE_ORDER = ["commun", "rare", "epic", "legendaire", "mythique"]
+
+DAILY_STAT_COLORS = {"force": (170, 100, 240, 255), "vitesse": (90, 200, 220, 255),
+                      "arme": (240, 150, 80, 255), "rct": (230, 90, 90, 255), "territoire": (150, 100, 230, 255)}
+DAILY_STAT_LABELS = {"force": "FORCE", "vitesse": "VITESSE", "arme": "ARME MAUDITE", "rct": "RCT", "territoire": "TERRITOIRE"}
+DAILY_STAT_ORDER = ["force", "vitesse", "arme", "rct", "territoire"]
+
+def _daily_frame(d, xy, gold, width=3, radius=14):
+    d.rounded_rectangle(xy, radius=radius, outline=gold, width=width)
+
+def _daily_bar_gauge(d, x0, y0, x1, y1, pct, color, bg):
+    d.rounded_rectangle((x0, y0, x1, y1), radius=(y1 - y0) // 2, fill=bg)
+    w = (x1 - x0) * (pct / 100)
+    if w > 4:
+        d.rounded_rectangle((x0, y0, x0 + w, y1), radius=(y1 - y0) // 2, fill=color)
+
+def _daily_class_badge(d, x, y, classe, size=32):
+    color = DAILY_CLASS_COLORS.get(classe, (100, 100, 110))
+    txt = f"Classe {classe}"
+    tw = text_w(d, txt, font(14, True))
+    bw = tw + 28
+    d.rounded_rectangle((x, y, x + bw, y + size), radius=size // 2, fill=color)
+    d.text((x + 14, y + size / 2 - 9), txt, font=font(14, True), fill=(15, 15, 18, 255))
+    return bw
+
+def _daily_pv_eo_row(d, x0, x1, y, label, color, val_txt):
+    d.text((x0, y), label, font=font(36, True), fill=color)
+    _daily_bar_gauge(d, x0, y + 50, x1, y + 66, 100, color, (35, 33, 42, 255))
+    d.text((x0, y + 76), val_txt, font=font(33), fill=DAILY_SUB)
+
+def _daily_stat_ring(d, cx, cy, r, key, val_txt):
+    col = DAILY_STAT_COLORS[key]
+    label = DAILY_STAT_LABELS[key]
+    d.ellipse((cx - r, cy - r, cx + r, cy + r), outline=(35, 33, 42, 255), width=10)
+    d.arc((cx - r, cy - r, cx + r, cy + r), start=-90, end=270, fill=col, width=10)
+    lw = text_w(d, label, font(33, True))
+    d.text((cx - lw / 2, cy + r + 16), label, font=font(33, True), fill=col)
+    vw = text_w(d, val_txt, font(36, True))
+    d.text((cx - vw / 2, cy - 14), val_txt, font=font(36, True), fill=DAILY_TEXT)
+
+def _daily_coffre_row(d, x0, x1, y, key, pct):
+    col = DAILY_COFFRE_COLORS[key]
+    d.text((x0, y), DAILY_COFFRE_LABELS[key], font=font(33, True), fill=col)
+    _daily_bar_gauge(d, x0 + 300, y + 6, x1 - 90, y + 26, pct, col, (35, 33, 42, 255))
+    d.text((x1 - 80, y), f"{pct}%", font=font(24, True), fill=col)
+
+
+def generate_daily_enemy_image(enemy_name: str, enemy_class: str,
+                                pv: int, eo: int,
+                                force: int, vitesse: int, arme_maudite: int, rct: int, territoire: int,
+                                coffres_pct: dict, out_path: str):
+    """
+    enemy_class : "4", "3", "2", "1", ou "S"
+    coffres_pct : dict avec les clés "commun", "rare", "epic", "legendaire", "mythique" (valeurs en %, doivent
+                  sommer à 100)
+    """
+    CM = 38  # ~1cm a 96dpi
+    W = 2400
+
+    top_margin = 130
+    pv_eo_h = 190
+    gap_pveo_stats = 40
+    stats_h = 400
+    gap_stats_taux = 2 * CM
+    taux_header_h = 50
+    taux_row_h = 64
+    taux_h = taux_header_h + 5 * taux_row_h + 30
+    bottom_margin = 40
+
+    fy = top_margin
+    stats_top = fy + pv_eo_h + gap_pveo_stats
+    stats_bottom = stats_top + stats_h
+    taux_top = stats_bottom + gap_stats_taux
+    taux_bottom = taux_top + taux_h
+    H = taux_bottom + bottom_margin
+
+    img = Image.new("RGBA", (W, H), DAILY_BG)
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, W, H), outline=DAILY_GOLD, width=2)
+    d.rectangle((0, 0, W, 100), fill=(18, 16, 24, 255))
+    d.text((40, 26), enemy_name, font=font(28, True), fill=DAILY_HEADER_COLOR)
+    _daily_class_badge(d, 40, 66, enemy_class)
+
+    _daily_frame(d, (40, fy, W - 40, fy + pv_eo_h), DAILY_GOLD)
+    d.text((60, fy + 14), "PV & ÉNERGIE OCCULTE", font=font(16, True), fill=DAILY_HEADER_COLOR)
+    half_w = (W - 80 - 40 - 60) // 2
+    _daily_pv_eo_row(d, 60, 60 + half_w, fy + 56, "PV", (230, 70, 70, 255), f"{pv:,}".replace(",", " "))
+    _daily_pv_eo_row(d, 60 + half_w + 40, W - 60, fy + 56, "ÉNERGIE OCCULTE", (90, 160, 240, 255), f"{eo:,}".replace(",", " "))
+
+    _daily_frame(d, (40, stats_top, W - 40, stats_bottom), DAILY_GOLD)
+    d.text((60, stats_top + 14), "STATISTIQUES", font=font(16, True), fill=DAILY_HEADER_COLOR)
+    stat_values = {"force": force, "vitesse": vitesse, "arme": arme_maudite, "rct": rct, "territoire": territoire}
+    seg_w = (W - 120) / 5
+    ring_cy = stats_top + 50 + 110
+    for i, key in enumerate(DAILY_STAT_ORDER):
+        cx = 60 + seg_w * i + seg_w / 2
+        val_txt = f"{stat_values[key]:,}".replace(",", " ")
+        _daily_stat_ring(d, cx, ring_cy, 110, key, val_txt)
+
+    _daily_frame(d, (40, taux_top, W - 40, taux_bottom), DAILY_GOLD)
+    d.text((60, taux_top + 14), "TAUX D'OBTENTION DES COFFRES", font=font(16, True), fill=DAILY_HEADER_COLOR)
+    yy = taux_top + taux_header_h
+    for key in DAILY_COFFRE_ORDER:
+        _daily_coffre_row(d, 60, W - 60, yy, key, coffres_pct[key])
+        yy += taux_row_h
+
+    img.save(out_path)
+    return out_path
