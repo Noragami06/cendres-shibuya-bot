@@ -190,3 +190,9 @@ generate_daily_enemy_image(
     out_path="temp/preview_daily_enemy.png",
 )
 print("Daily enemy générée dans temp/")
+
+from cogs.utils.image_gen import generate_coffre_image
+
+for rarete in ["commun", "rare", "epic", "legendaire", "mythique"]:
+    generate_coffre_image(rarete, f"temp/preview_coffre_{rarete}.png")
+    print(f"Coffre {rarete} généré dans temp/")

@@ -174,6 +174,15 @@ def best_spell_ratio(spells: list):
     return max(spells, key=ratio)
 
 
+def _daily_bar(cur: int, mx: int, n: int = 10) -> str:
+    """Barre de progression textuelle à blocs (█ pleins / ░ vides), longueur n. Sûre si mx <= 0."""
+    if mx <= 0:
+        filled = 0
+    else:
+        filled = max(0, min(n, round(cur / mx * n)))
+    return "█" * filled + "░" * (n - filled)
+
+
 def _time_left_str(delta: timedelta) -> str:
     total = int(delta.total_seconds())
     h = total // 3600
@@ -439,9 +448,12 @@ class Daily(commands.Cog):
     async def _run_combat(self, channel, user, character_id, classe, pnj):
         prof = db.get_or_create_profile(character_id)
         stats = self._player_stats(character_id)
+        char = get_character(character_id)
 
         # État de combat.
         st = {
+            "name_j": (char["character_name"] if char else None) or "Toi",
+            "name_p": pnj["name"],
             "pv_j": prof["pv_actuel"], "pv_max_j": prof["pv_max"],
             "eo_j": prof["eo_actuel"], "eo_max_j": prof["eo_max"],
             "force_base_j": stats["force"],
@@ -488,11 +500,11 @@ class Daily(commands.Cog):
             # --- Action du PNJ. ---
             action_p = self._pnj_turn(classe, st)
 
-            # --- §7 : résolution simultanée du tour. ---
-            self._resolve_round(st, action_j, action_p, gains, joueur_priorite)
+            # --- §7 : résolution simultanée du tour (retourne texte de résultat + couleur). ---
+            result_text, color_key = self._resolve_round(st, action_j, action_p, gains, joueur_priorite)
 
-            # Récap de tour concis (jamais de % ni d'états cachés).
-            await channel.send(embed=self._round_embed(tour, st, action_j, action_p))
+            # §3 : embed UNIQUE et structuré, identique pour toutes les actions.
+            await channel.send(embed=self._round_embed(tour, st, result_text, color_key))
 
             # --- §8 : fin de combat. ---
             if st["pv_p"] <= DAILY_PV_FLOOR:
@@ -572,14 +584,15 @@ class Daily(commands.Cog):
                 gains["sorts"] += 1  # §9 : sort utilisé = +points Sorts
                 sort_xp[spell["principal_id"]] = sort_xp.get(spell["principal_id"], 0) + spell["damage"]
                 return {"kind": "sort", "attacking": True, "damage": spell["damage"], "dtype": "spell",
-                        "blocking": False, "spell_name": spell["name"]}
+                        "blocking": False, "spell_name": spell["name"], "force_actuelle": f_act}
 
             if act == "attaquer":
                 return {"kind": "attaquer", "attacking": True, "damage": physical_damage(f_act),
-                        "dtype": "phys", "blocking": False}
+                        "dtype": "phys", "blocking": False, "force_actuelle": f_act}
 
             if act == "bloquer":
-                return {"kind": "bloquer", "attacking": False, "damage": 0, "dtype": None, "blocking": True}
+                return {"kind": "bloquer", "attacking": False, "damage": 0, "dtype": None,
+                        "blocking": True, "force_actuelle": f_act}
 
     async def _pick_spell(self, channel, user, character_id, st):
         """§6 : liste TEXTE (pas embed) des sorts débloqués + suggestion du meilleur ratio. Retourne le
@@ -654,30 +667,75 @@ class Daily(commands.Cog):
 
     # ---------- §7 : résolution d'un tour ----------
     def _resolve_round(self, st, aj, ap, gains, joueur_priorite):
-        f_j = current_force(st["force_base_j"], st["pv_j"], st["pv_max_j"])
-        f_p = ap.get("force_actuelle", current_force(st["force_base_p"], st["pv_p"], st["pv_max_p"]))
+        """Applique le tour et retourne (texte_de_résultat, clé_couleur) pour l'embed unique.
+        clé_couleur : 'green' (le joueur a placé une action offensive), 'red' (le joueur a subi des
+        dégâts), 'blue' (neutre : blocage, potion, esquive sans dégât)."""
+        nj, npnj = st["name_j"], st["name_p"]
+        pvj0, pvp0 = st["pv_j"], st["pv_p"]  # PV AVANT dégâts (pour l'affichage du clash)
+        f_j = aj.get("force_actuelle", current_force(st["force_base_j"], pvj0, st["pv_max_j"]))
+        f_p = ap.get("force_actuelle", current_force(st["force_base_p"], pvp0, st["pv_max_p"]))
+        player_dealt = 0
+        player_took = 0
 
-        # §7.2 : les DEUX attaquent -> seul le total (force_actuelle + pv_actuel) le plus haut inflige,
-        # l'autre ne riposte pas (aucun blocage puisque personne ne bloque).
+        # §2 / §7.2 : les DEUX attaquent -> clash sur (force_actuelle + PV), seul le plus haut inflige.
         if aj["attacking"] and ap["attacking"]:
-            total_j = f_j + st["pv_j"]
-            total_p = f_p + st["pv_p"]
-            if total_j > total_p or (total_j == total_p and joueur_priorite):
+            total_j, total_p = f_j + pvj0, f_p + pvp0
+            joueur_gagne = total_j > total_p or (total_j == total_p and joueur_priorite)
+            if joueur_gagne:
                 st["pv_p"] -= aj["damage"]
-                gains["force"] += 1  # attaque réussie du joueur (un sort compte aussi comme attaque)
+                player_dealt = aj["damage"]
+                gains["force"] += 1
+                gagnant, perdant, deg = nj, npnj, aj["damage"]
             else:
                 st["pv_j"] -= ap["damage"]
-            return
+                player_took = ap["damage"]
+                gagnant, perdant, deg = npnj, nj, ap["damage"]
+            text = (
+                "⚔️ **Les deux camps attaquent !**\n\n"
+                f"**{nj}** : {f_j:,} Force + {pvj0:,} PV = **{total_j:,} points de puissance**\n"
+                f"**{npnj}** : {f_p:,} Force + {pvp0:,} PV = **{total_p:,} points de puissance**\n\n"
+                f"🏆 **{gagnant}** remporte le clash et inflige **{deg:,}** dégâts à {perdant} !\n"
+                f"{perdant} ne riposte pas ce tour-ci.")
+            return text, ("green" if joueur_gagne else "red")
 
-        # Sinon : au plus un camp attaque -> résolution indépendante avec blocage éventuel du défenseur.
+        # Sinon : au plus un camp attaque -> résolution indépendante avec blocage éventuel.
+        parts = []
+        if aj["kind"] == "potion":
+            parts.append(f"🧪 **{nj}** utilise une potion et récupère de l'énergie occulte.")
+
         if aj["attacking"]:  # le joueur attaque le PNJ ; le PNJ bloque-t-il ?
             dealt, _ = self._apply_attack(st, aj, defender="p", defender_blocking=ap["blocking"])
             if dealt > 0:
+                player_dealt += dealt
                 gains["force"] += 1
+                if aj["dtype"] == "spell":
+                    sn = aj.get("spell_name") or "un sort"
+                    parts.append(f"✨ **{nj}** lance **{sn}** et inflige **{dealt:,}** dégâts à {npnj} !")
+                else:
+                    parts.append(f"🗡️ **{nj}** attaque et inflige **{dealt:,}** dégâts à {npnj} !")
+            else:
+                parts.append(f"🛡️ {npnj} bloque l'attaque de **{nj}** — aucun dégât.")
+
         if ap["attacking"]:  # le PNJ attaque le joueur ; le joueur bloque-t-il ?
-            _, block_ok = self._apply_attack(st, ap, defender="j", defender_blocking=aj["blocking"])
+            dealt, block_ok = self._apply_attack(st, ap, defender="j", defender_blocking=aj["blocking"])
             if block_ok:
-                gains["endurance"] += 1  # blocage RÉUSSI du joueur
+                gains["endurance"] += 1
+                parts.append(f"🛡️ **Blocage réussi !** {nj} n'a subi aucun dégât de {npnj}.")
+            elif dealt > 0:
+                player_took += dealt
+                parts.append(f"💥 **{npnj}** attaque et inflige **{dealt:,}** dégâts à {nj} !")
+
+        if not aj["attacking"] and not ap["attacking"] and aj["kind"] != "potion":
+            parts.append(f"🌀 **{nj}** se met en garde tandis que **{npnj}** temporise.")
+
+        text = "\n".join(parts) if parts else f"{nj} et {npnj} s'observent."
+        if player_dealt > 0:
+            color = "green"
+        elif player_took > 0:
+            color = "red"
+        else:
+            color = "blue"
+        return text, color
 
     def _apply_attack(self, st, attack, defender, defender_blocking):
         """Applique `attack` sur le défenseur 'p' (PNJ) ou 'j' (joueur). Retourne (dégâts_infligés,
@@ -703,18 +761,26 @@ class Daily(commands.Cog):
             st["pv_j"] -= dmg
         return dmg, block_ok
 
-    def _round_embed(self, tour, st, aj, ap):
-        libelle = {"attaquer": "Attaque", "bloquer": "Blocage", "sort": "Sort", "potion": "Potion",
-                   "renfort": "Renforcement"}
-        pv_j_aff = max(st["pv_j"], DAILY_PV_FLOOR)
-        return discord.Embed(
-            title=f"— Tour {tour} —",
-            description=(f"Toi : {libelle.get(aj['kind'], aj['kind'])}"
-                        + (f" ({aj.get('spell_name')})" if aj.get("spell_name") else "")
-                        + f"\nAdversaire : {libelle.get(ap['kind'], ap['kind'])}\n\n"
-                        f"❤️ Tes PV : **{pv_j_aff:,}** · 🔵 Ton EO : **{st['eo_j']:,}**\n"
-                        f"💀 PV adversaire : **{max(st['pv_p'], 0):,}**"),
-            color=PHOENIX_COLOR)
+    def _round_embed(self, tour, st, result_text, color_key):
+        """§3 : embed UNIQUE et de structure FIXE pour tous les tours (attaque / blocage / renforcement /
+        sort / potion / clash). Barres textuelles à blocs (aucune image). Couleur selon color_key."""
+        colors = {"green": discord.Color.green(), "red": discord.Color.red(),
+                  "blue": discord.Color.blue()}
+        pvj = max(st["pv_j"], DAILY_PV_FLOOR)   # §8 : jamais moins de 100 côté joueur
+        pvp = max(st["pv_p"], 0)                # le PNJ peut réellement tomber à 0
+        eoj = max(st["eo_j"], 0)
+        eop = max(st["eo_p"], 0)
+        desc = (
+            f"**{st['name_j']}**\n"
+            f"❤️ PV : {_daily_bar(pvj, st['pv_max_j'])} {pvj:,} / {st['pv_max_j']:,}\n"
+            f"🔵 EO : {_daily_bar(eoj, st['eo_max_j'])} {eoj:,} / {st['eo_max_j']:,}\n\n"
+            f"**{st['name_p']}**\n"
+            f"❤️ PV : {_daily_bar(pvp, st['pv_max_p'])} {pvp:,} / {st['pv_max_p']:,}\n"
+            f"🔵 EO : {_daily_bar(eop, st['eo_max_p'])} {eop:,} / {st['eo_max_p']:,}\n\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            f"📢 **Résultat de ce tour :**\n{result_text}")
+        return discord.Embed(title=f"⚔️ Tour {tour}", description=desc,
+                             color=colors.get(color_key, discord.Color.blue()))
 
     # ---------- §9 : fin + récompenses ----------
     async def _finish_combat(self, channel, user, character_id, classe, st, gains, sort_xp, issue):

@@ -1495,9 +1495,18 @@ def update_validated_fields(character_id: int, **fields):
 
 
 def update_fiche_record_eo(character_id: int, eo_value):
-    """Met à jour la source de vérité permanente de l'EO (fiche_record) — appelée par /reroll pour que
-    sync_eo_with_fiche() reflète la nouvelle valeur au prochain /profil."""
+    """Met à jour la source de vérité permanente de l'EO (fiche_record) — appelée par /reroll et
+    /modification. Comme sync_eo_with_fiche ne recharge plus eo_actuel de force (elle se contente de le
+    borner), un changement DÉLIBÉRÉ de réserve doit RECHARGER explicitement le profil à la nouvelle
+    réserve pleine (sinon eo_actuel resterait à l'ancienne valeur, plus basse)."""
     set_fiche_record(character_id, eo_value)
+    if eo_value is not None:
+        with get_connection() as conn:
+            conn.execute("INSERT OR IGNORE INTO character_profiles (character_id) VALUES (?)", (character_id,))
+            conn.execute(
+                "UPDATE character_profiles SET eo_actuel = ?, eo_max = ? WHERE character_id = ?",
+                (eo_value, eo_value, character_id),
+            )
 
 
 def credit_character_bank(character_id: int, montant: int) -> bool:
@@ -2967,18 +2976,26 @@ def get_fiche_record(character_id: int):
 
 
 def sync_eo_with_fiche(character_id: int):
-    """Réaligne eo_actuel/eo_max du profil sur la fiche (fiche_record), source de vérité permanente.
-    Appelée à CHAQUE affichage du pillow /profil : garantit l'EO à jour peu importe l'âge du personnage
-    ou un redémarrage entre-temps. Personnage sans réserve (eo_value NULL) -> aucune action."""
+    """Réaligne la réserve MAX d'EO du profil sur la fiche (fiche_record), source de vérité permanente de
+    la taille de réserve. Appelée à CHAQUE affichage du pillow /profil : garantit un eo_max à jour peu
+    importe l'âge du personnage ou un redémarrage.
+
+    IMPORTANT : ne RECHARGE PLUS eo_actuel de force. Elle fixe eo_max = réserve de la fiche et se contente
+    de BORNER eo_actuel à ce plafond. Ainsi une dépense réelle d'EO (ex: combat /daily) PERSISTE d'un
+    affichage à l'autre, au lieu d'être écrasée par la valeur pleine de la fiche. Un rechargement délibéré
+    (reroll / modification d'EO) est fait explicitement par update_fiche_record_eo. Réserve NULL -> no-op."""
     with get_connection() as conn:
         fiche = conn.execute(
             "SELECT eo_value FROM fiche_record WHERE character_id = ?", (character_id,)
         ).fetchone()
         if fiche is None or fiche["eo_value"] is None:
             return  # Humain / Hybride chez les humains : pas de réserve à synchroniser
+        eo_max = fiche["eo_value"]
+        conn.execute("INSERT OR IGNORE INTO character_profiles (character_id) VALUES (?)", (character_id,))
         conn.execute(
-            "UPDATE character_profiles SET eo_actuel = ?, eo_max = ? WHERE character_id = ?",
-            (fiche["eo_value"], fiche["eo_value"], character_id),
+            "UPDATE character_profiles SET eo_max = ?, "
+            "eo_actuel = MIN(COALESCE(eo_actuel, ?), ?) WHERE character_id = ?",
+            (eo_max, eo_max, eo_max, character_id),
         )
 
 

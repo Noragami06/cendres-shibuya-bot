@@ -2612,3 +2612,254 @@ def generate_daily_enemy_image(enemy_name: str, enemy_class: str,
 
     img.save(out_path)
     return out_path
+
+
+# ---------------------------------------------------------------------------
+# Coffres (/daily — affichage individuel par rareté, style illustration RPG)
+# ---------------------------------------------------------------------------
+import random as _rand
+from PIL import ImageFilter
+
+COFFRE_BG = (14, 12, 18, 255)
+COFFRE_HEADER_COLOR = (255, 200, 60, 255)
+COFFRE_GOLD = (232, 197, 121, 255)
+
+COFFRE_COLORS = {
+    "commun": (150, 150, 155),
+    "rare": (80, 150, 235),
+    "epic": (165, 75, 235),
+    "legendaire": (255, 160, 30),
+    "mythique": (235, 55, 95),
+}
+COFFRE_LABELS = {"commun": "Commun", "rare": "Rare", "epic": "Épique", "legendaire": "Légendaire", "mythique": "Mythique"}
+COFFRE_COMPLEXITY = {"commun": 1, "rare": 2, "epic": 3, "legendaire": 4, "mythique": 5}
+COFFRE_SS = 4  # facteur de supersampling (dessine en 4x puis reduit, anti-aliasing)
+
+def _coffre_tint(c, factor):
+    return tuple(max(0, min(255, int(v * factor))) for v in c[:3]) + (255,)
+
+def _coffre_lerp(c1, c2, t):
+    return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3)) + (255,)
+
+def _coffre_vgrad_rect(d, x0, y0, x1, y1, color_top, color_bottom, steps=40):
+    h = y1 - y0
+    for i in range(steps):
+        ty0 = y0 + h * i / steps
+        ty1 = y0 + h * (i + 1) / steps + 1
+        c = _coffre_lerp(color_top, color_bottom, i / max(1, steps - 1))
+        d.rectangle((x0, ty0, x1, ty1), fill=c)
+
+def _coffre_hgrad_rect(d, x0, y0, x1, y1, color_left, color_right, steps=30):
+    w = x1 - x0
+    for i in range(steps):
+        tx0 = x0 + w * i / steps
+        tx1 = x0 + w * (i + 1) / steps + 1
+        c = _coffre_lerp(color_left, color_right, i / max(1, steps - 1))
+        d.rectangle((tx0, y0, tx1, y1), fill=c)
+
+def _coffre_glow_layer(size, cx, cy, r, color, alpha):
+    layer = Image.new("RGBA", size, (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+    steps = 8
+    for i in range(steps, 0, -1):
+        rr = r * i / steps
+        a = int(alpha * (1 - i / steps) * 0.55)
+        ld.ellipse((cx - rr, cy - rr, cx + rr, cy + rr), fill=color[:3] + (a,))
+    return layer.filter(ImageFilter.GaussianBlur(radius=r * 0.18))
+
+def _coffre_drop_shadow(size, cx, cy, rx, ry, alpha=160):
+    layer = Image.new("RGBA", size, (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+    ld.ellipse((cx - rx, cy - ry, cx + rx, cy + ry), fill=(0, 0, 0, alpha))
+    return layer.filter(ImageFilter.GaussianBlur(radius=rx * 0.12))
+
+def _coffre_radial_gem(size, cx, cy, r, base_color):
+    layer = Image.new("RGBA", size, (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+    steps = 16
+    for i in range(steps, 0, -1):
+        rr = r * i / steps
+        t = 1 - i / steps
+        c = _coffre_lerp(_coffre_tint(base_color, 2.0), _coffre_tint(base_color, 0.5), t)
+        ld.ellipse((cx - rr, cy - rr, cx + rr, cy + rr), fill=c)
+    ld.ellipse((cx - r * 0.35, cy - r * 0.45, cx + r * 0.05, cy - r * 0.05), fill=(255, 255, 255, 210))
+    return layer
+
+def _coffre_noise_overlay(size, cx, cy, w, h, intensity=18):
+    layer = Image.new("RGBA", size, (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+    _rand.seed(int(cx * 7 + cy * 3))
+    for _ in range(int(w * h / 400)):
+        px = cx - w / 2 + _rand.uniform(0, w)
+        py = cy - h / 2 + _rand.uniform(0, h)
+        v = _rand.choice([-1, 1]) * _rand.randint(6, intensity)
+        c = (255, 255, 255, max(0, v)) if v > 0 else (0, 0, 0, -v)
+        ld.point((px, py), fill=c)
+    return layer.filter(ImageFilter.GaussianBlur(radius=0.6))
+
+
+def _draw_coffre_3d(base_img, cx, cy, size, color, complexity=1):
+    """Coffre illustration RPG : contours nets, degrades bois/metal, grain, ombre portee +
+    ombre de contact, gemme facettee. complexity 1 (Commun) a 5 (Mythique)."""
+    import math
+    w = size
+    h = size * 0.62
+    depth = size * 0.20
+    OUTLINE = (18, 12, 8, 255)
+    ow = max(2, int(size * 0.006))
+
+    wood_base = (60, 40, 25)
+    wood_shadow = _coffre_tint(wood_base + (255,), 0.4)
+    wood_dark = _coffre_tint(wood_base + (255,), 0.62)
+    wood_mid = _coffre_tint(wood_base + (255,), 0.88)
+    wood_light = _coffre_tint(wood_base + (255,), 1.18)
+    wood_highlight = _coffre_tint(wood_base + (255,), 1.5)
+
+    metal = _coffre_tint(color, 0.85)
+    metal_hi = _coffre_tint(color, 1.55)
+
+    x0, y0 = cx - w / 2, cy - h / 2
+    x1, y1 = cx + w / 2, cy + h / 2
+    lid_h = h * 0.4
+    body_y0 = y0 + lid_h
+
+    shadow = _coffre_drop_shadow(base_img.size, cx, y1 + h * 0.08, w * 0.42, h * 0.15, alpha=160)
+    base_img.alpha_composite(shadow)
+
+    if complexity >= 2:
+        glow_r = size * (0.5 + complexity * 0.08)
+        glow_alpha = 90 + complexity * 25
+        glow = _coffre_glow_layer(base_img.size, cx, cy - h * 0.1, glow_r, color, glow_alpha)
+        base_img.alpha_composite(glow)
+
+    d = ImageDraw.Draw(base_img)
+
+    side = Image.new("RGBA", base_img.size, (0, 0, 0, 0))
+    sd = ImageDraw.Draw(side)
+    side_pts = [(x1, body_y0), (x1 + depth, body_y0 - depth * 0.5), (x1 + depth, y1 - depth * 0.5), (x1, y1)]
+    sd.polygon(side_pts, fill=wood_shadow, outline=OUTLINE, width=ow)
+    base_img.alpha_composite(side)
+
+    top_pts = [(x0, y0), (x1, y0), (x1 + depth, y0 - depth * 0.5), (x0 + depth, y0 - depth * 0.5)]
+    top_face = Image.new("RGBA", base_img.size, (0, 0, 0, 0))
+    td = ImageDraw.Draw(top_face)
+    td.polygon(top_pts, fill=wood_light)
+    base_img.alpha_composite(top_face)
+    d = ImageDraw.Draw(base_img)
+    _coffre_hgrad_rect(d, x0, y0 - depth * 0.5, x1 + depth, y0, wood_highlight, wood_mid, steps=24)
+    d.polygon(top_pts, outline=OUTLINE, width=ow)
+
+    _coffre_vgrad_rect(d, x0, body_y0, x1, y1, wood_mid, wood_dark, steps=40)
+    grain_layer = Image.new("RGBA", base_img.size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(grain_layer)
+    _rand.seed(42)
+    for i in range(10):
+        gy = body_y0 + (y1 - body_y0) * (i + 0.5) / 10 + _rand.uniform(-3, 3)
+        pts = [(x0 + (x1 - x0) * t, gy + math.sin(t * 6 + i) * 3) for t in [j / 24 for j in range(25)]]
+        gd.line(pts, fill=(0, 0, 0, 40), width=2)
+    base_img.alpha_composite(grain_layer)
+    base_img.alpha_composite(_coffre_noise_overlay(base_img.size, cx, (body_y0 + y1) / 2, w, y1 - body_y0))
+
+    _coffre_vgrad_rect(d, x0, y0, x1, body_y0 + 8, wood_highlight, wood_mid, steps=28)
+    base_img.alpha_composite(_coffre_noise_overlay(base_img.size, cx, (y0 + body_y0) / 2, w, lid_h))
+    d = ImageDraw.Draw(base_img)
+    d.rounded_rectangle((x0, y0, x1, body_y0 + 8), radius=int(size * 0.02), outline=OUTLINE, width=ow)
+
+    contact = Image.new("RGBA", base_img.size, (0, 0, 0, 0))
+    cd = ImageDraw.Draw(contact)
+    cd.rectangle((x0, body_y0 - 3, x1, body_y0 + 14), fill=(0, 0, 0, 70))
+    contact = contact.filter(ImageFilter.GaussianBlur(radius=size * 0.01))
+    base_img.alpha_composite(contact)
+    d = ImageDraw.Draw(base_img)
+    d.rectangle((x0, body_y0, x1, y1), outline=OUTLINE, width=ow)
+
+    band_w = w * (0.09 + complexity * 0.01)
+    for bx in (x0 + w * 0.14, x1 - w * 0.14 - band_w):
+        _coffre_hgrad_rect(d, bx, y0, bx + band_w, y1, _coffre_tint(color, 0.4), metal_hi, steps=18)
+        d.rectangle((bx, y0, bx + band_w, y1), outline=OUTLINE, width=max(1, ow - 1))
+        d.line((bx + band_w * 0.5, y0, bx + band_w * 0.5, y1), fill=(255, 255, 255, 140), width=max(1, int(size * 0.004)))
+        nb_riv = 5
+        for k in range(nb_riv):
+            ry = y0 + (y1 - y0) * (k + 0.5) / nb_riv
+            rr = size * 0.013
+            d.ellipse((bx + band_w / 2 - rr, ry - rr, bx + band_w / 2 + rr, ry + rr), fill=metal_hi, outline=OUTLINE, width=1)
+            d.ellipse((bx + band_w / 2 - rr * 0.4, ry - rr * 0.6, bx + band_w / 2 + rr * 0.1, ry - rr * 0.1), fill=(255, 255, 255, 210))
+
+    _coffre_vgrad_rect(d, x0, body_y0 - 10, x1, body_y0 + 10, metal_hi, _coffre_tint(color, 0.4), steps=14)
+    d.rectangle((x0, body_y0 - 10, x1, body_y0 + 10), outline=OUTLINE, width=max(1, ow - 1))
+
+    lock_w = w * 0.17
+    lock_h = lock_w * 1.15
+    lx0, ly0 = cx - lock_w / 2, body_y0 - lock_h * 0.35
+    _coffre_vgrad_rect(d, lx0, ly0, lx0 + lock_w, ly0 + lock_h, metal_hi, _coffre_tint(color, 0.4), steps=12)
+    d.rounded_rectangle((lx0, ly0, lx0 + lock_w, ly0 + lock_h), radius=int(size * 0.012), outline=OUTLINE, width=ow)
+    d.ellipse((cx - lock_w * 0.18, ly0 + lock_h * 0.3, cx + lock_w * 0.18, ly0 + lock_h * 0.7), fill=(15, 12, 10, 255))
+    d.ellipse((cx - lock_w * 0.1, ly0 + lock_h * 0.35, cx - lock_w * 0.02, ly0 + lock_h * 0.45), fill=(255, 255, 255, 180))
+
+    if complexity == 1:
+        return
+
+    corner = w * 0.1
+    for (px, py, sx, sy) in [(x0, y0, 1, 1), (x1, y0, -1, 1), (x0, y1, 1, -1), (x1, y1, -1, -1)]:
+        pts = [(px, py), (px + sx * corner, py), (px + sx * corner * 0.3, py + sy * corner * 0.3), (px, py + sy * corner)]
+        d.polygon(pts, fill=metal, outline=OUTLINE, width=1)
+        d.line((px, py, px + sx * corner, py), fill=(255, 255, 255, 150), width=max(1, int(size * 0.003)))
+
+    if complexity >= 3:
+        gem_r = size * (0.055 + complexity * 0.014)
+        gx, gy = cx, y0 + lid_h * 0.45
+        gem = _coffre_radial_gem(base_img.size, gx, gy, gem_r, color)
+        base_img.alpha_composite(gem)
+        d = ImageDraw.Draw(base_img)
+        for a in range(0, 360, 45):
+            d.line((gx, gy, gx + gem_r * math.cos(math.radians(a)), gy + gem_r * math.sin(math.radians(a))),
+                   fill=(255, 255, 255, 90), width=1)
+        d.ellipse((gx - gem_r, gy - gem_r, gx + gem_r, gy + gem_r), outline=OUTLINE, width=max(1, ow - 1))
+
+    if complexity >= 4:
+        for sx in (x0 + w * 0.28, x1 - w * 0.28):
+            gem2 = _coffre_radial_gem(base_img.size, sx, y0 + lid_h * 0.45, size * 0.03, COFFRE_GOLD)
+            base_img.alpha_composite(gem2)
+            d = ImageDraw.Draw(base_img)
+            d.ellipse((sx - size * 0.03, y0 + lid_h * 0.45 - size * 0.03, sx + size * 0.03, y0 + lid_h * 0.45 + size * 0.03), outline=OUTLINE, width=1)
+        d.rounded_rectangle((x0 + 4, y0 + 4, x1 - 4, body_y0), radius=int(size * 0.02), outline=COFFRE_GOLD, width=2)
+
+    if complexity >= 5:
+        wing_span = w * 0.34
+        wing_h = h * 0.55
+        wing = Image.new("RGBA", base_img.size, (0, 0, 0, 0))
+        wd = ImageDraw.Draw(wing)
+        w1 = [(x0, y0 + lid_h * 0.3), (x0 - wing_span, y0 - wing_h * 0.5), (x0 - wing_span * 0.55, y0 - wing_h * 0.1), (x0 - wing_span * 0.3, y0 + lid_h * 0.6)]
+        w2 = [(x1, y0 + lid_h * 0.3), (x1 + wing_span, y0 - wing_h * 0.5), (x1 + wing_span * 0.55, y0 - wing_h * 0.1), (x1 + wing_span * 0.3, y0 + lid_h * 0.6)]
+        wd.polygon(w1, fill=metal, outline=OUTLINE)
+        wd.polygon(w2, fill=metal, outline=OUTLINE)
+        base_img.alpha_composite(wing)
+        d = ImageDraw.Draw(base_img)
+        d.line([w1[0], w1[1], w1[2]], fill=metal_hi, width=max(1, int(size * 0.005)))
+        d.line([w2[0], w2[1], w2[2]], fill=metal_hi, width=max(1, int(size * 0.005)))
+        _rand.seed(int(cx + cy))
+        sparkle = Image.new("RGBA", base_img.size, (0, 0, 0, 0))
+        spd = ImageDraw.Draw(sparkle)
+        for _ in range(18):
+            px = cx + _rand.uniform(-size * 0.85, size * 0.85)
+            py = cy + _rand.uniform(-h * 1.0, h * 0.65)
+            pr = _rand.uniform(1.5, 4.2)
+            spd.line((px - pr, py, px + pr, py), fill=(255, 255, 255, 235), width=1)
+            spd.line((px, py - pr, px, py + pr), fill=(255, 255, 255, 235), width=1)
+        base_img.alpha_composite(sparkle)
+
+
+def generate_coffre_image(rarete: str, out_path: str, width=700, height=600):
+    """
+    rarete : "commun", "rare", "epic", "legendaire", ou "mythique"
+    """
+    ss = COFFRE_SS
+    big = Image.new("RGBA", (width * ss, height * ss), COFFRE_BG)
+    d = ImageDraw.Draw(big)
+    label = COFFRE_LABELS[rarete]
+    lw = text_w(d, label, font(28 * ss, True))
+    d.text((big.size[0] / 2 - lw / 2, 24 * ss), label, font=font(28 * ss, True), fill=COFFRE_COLORS[rarete])
+    _draw_coffre_3d(big, big.size[0] / 2, big.size[1] / 2 + 40 * ss, 340 * ss, COFFRE_COLORS[rarete], COFFRE_COMPLEXITY[rarete])
+    img = big.resize((width, height), Image.LANCZOS)
+    img.save(out_path)
+    return out_path
