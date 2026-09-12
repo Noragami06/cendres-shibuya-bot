@@ -309,6 +309,13 @@ CREATE TABLE IF NOT EXISTS character_backgrounds (
     uploaded_at TEXT
 );
 
+-- Cooldown de la commande /daily par personnage (dernier lancement en ISO). Le cooldown effectif
+-- (24h joueur / 12h staff / aucun pour l'owner) est appliqué côté cog, pas ici.
+CREATE TABLE IF NOT EXISTS character_daily_cooldown (
+    character_id INTEGER PRIMARY KEY,
+    last_daily_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS character_stats (
     character_id INTEGER PRIMARY KEY,
     force_pts INTEGER DEFAULT 0,
@@ -2378,6 +2385,34 @@ def set_stat_base_pts(character_id: int, stat_key: str, value: int):
         conn.execute("INSERT OR IGNORE INTO character_stats (character_id) VALUES (?)", (character_id,))
         conn.execute(
             f"UPDATE character_stats SET {col} = ? WHERE character_id = ?", (int(value), character_id)
+        )
+
+
+def add_stat_base_pts(character_id: int, stat_key: str, n: int):
+    """Ajout ADDITIF direct à la base d'une stat (ex: gains de /daily), sans passer par points_restants."""
+    col = _stat_col(stat_key)
+    with get_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO character_stats (character_id) VALUES (?)", (character_id,))
+        conn.execute(
+            f"UPDATE character_stats SET {col} = {col} + ? WHERE character_id = ?", (int(n), character_id)
+        )
+
+
+def get_daily_cooldown(character_id: int):
+    """Ligne (last_daily_at) du cooldown /daily d'un personnage, ou None si jamais joué."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT last_daily_at FROM character_daily_cooldown WHERE character_id = ?", (character_id,)
+        ).fetchone()
+
+
+def set_daily_cooldown(character_id: int, iso_ts: str):
+    """Enregistre/actualise l'horodatage du dernier /daily (INSERT si absent)."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO character_daily_cooldown (character_id, last_daily_at) VALUES (?, ?) "
+            "ON CONFLICT(character_id) DO UPDATE SET last_daily_at = excluded.last_daily_at",
+            (character_id, iso_ts),
         )
 
 
