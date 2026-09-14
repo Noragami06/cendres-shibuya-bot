@@ -241,7 +241,8 @@ CREATE TABLE IF NOT EXISTS character_inventory (
     character_id INTEGER,
     item_id INTEGER,
     quantity INTEGER DEFAULT 0,
-    gifted_quantity INTEGER DEFAULT 0   -- unités reçues GRATUITEMENT (give staff) : jamais remboursables
+    gifted_quantity INTEGER DEFAULT 0,  -- unités reçues GRATUITEMENT (give staff) : jamais remboursables
+    rarete_source TEXT                  -- rareté du coffre d'origine du DERNIER exemplaire obtenu (Tokens)
 );
 
 CREATE TABLE IF NOT EXISTS pending_trades (
@@ -736,11 +737,13 @@ DEFAULT_SHOP_CATEGORIES = ("Potion", "Arme maudite", "Relique")
 
 
 def _ensure_character_inventory_columns(conn):
-    """Ajoute gifted_quantity (unités reçues gratuitement via give staff) à une table
-    character_inventory déjà existante. Idempotent."""
+    """Ajoute gifted_quantity (give staff) et rarete_source (rareté du coffre d'origine des Tokens) à une
+    table character_inventory déjà existante. Idempotent."""
     cols = _column_names(conn, "character_inventory")
     if cols and "gifted_quantity" not in cols:
         conn.execute("ALTER TABLE character_inventory ADD COLUMN gifted_quantity INTEGER DEFAULT 0")
+    if cols and "rarete_source" not in cols:
+        conn.execute("ALTER TABLE character_inventory ADD COLUMN rarete_source TEXT")
 
 
 # Coffres (/daily) : 1 objet par rareté, catégorie « Coffre », prix NULL (jamais achetable — obtenu
@@ -783,16 +786,33 @@ _POTION_PRICE_RANGES = {
 # Potions canoniques garanties en base (pour que les récompenses de coffres puissent les trouver par
 # potion_type + classe). soin/force/force_sort -> catégorie « Potion » ; energie_occulte -> « Potion
 # Énergie Occulte ». Noms figés, mais la recherche se fait par (potion_type, classe), jamais par nom.
+# Toutes les potions canoniques vivent dans la MÊME catégorie « Potion » (le sous-type potion_type
+# distingue soin / force_sort / force / energie_occulte).
 _CANONICAL_POTIONS = {
     "Potion": [("soin", "Potion de Soin"), ("force_sort", "Potion de Force du Sort"),
-               ("force", "Potion de Force")],
-    "Potion Énergie Occulte": [("energie_occulte", "Potion d'Énergie Occulte")],
+               ("force", "Potion de Force"), ("energie_occulte", "Potion d'Énergie Occulte")],
 }
+# Tokens NON achetables (prix NULL), obtenus uniquement via /daily.
 _TOKEN_ITEM_NAMES = [
     "Token RCT", "Token Territoire", "Token Stats Force", "Token Stats Vitesse",
     "Token Stats Endurance", "Token Stats Arme Maudite", "Token Stats RCT",
     "Token Stats Territoire", "Token Stats Sort", "Token Stats EO",
 ]
+# Tokens Stats ACHETABLES : 8 types × 5 classes (prix auto = fourchette des potions). Nom = « Token Stats
+# {Label} Classe {c} » pour ne pas entrer en collision avec les tokens classless ci-dessus.
+_TOKEN_STATS_LABELS = ["Force", "Vitesse", "Endurance", "Arme Maudite", "RCT", "Territoire", "Sort", "EO"]
+
+
+def _migrate_merge_eo_potion_category(conn):
+    """Fusionne l'ancienne catégorie séparée « Potion Énergie Occulte » dans « Potion » : déplace ses
+    objets (potion_type conservé) puis supprime la catégorie vide. Idempotent (no-op si absente)."""
+    eo = conn.execute("SELECT id FROM shop_categories WHERE name = 'Potion Énergie Occulte'").fetchone()
+    if eo is None:
+        return
+    potion = conn.execute("SELECT id FROM shop_categories WHERE name = 'Potion'").fetchone()
+    potion_id = potion["id"] if potion else _get_or_create_category(conn, "Potion")
+    conn.execute("UPDATE item_definitions SET categorie_id = ? WHERE categorie_id = ?", (potion_id, eo["id"]))
+    conn.execute("DELETE FROM shop_categories WHERE id = ?", (eo["id"],))
 
 
 def _get_or_create_category(conn, name):
@@ -823,7 +843,10 @@ def _seed_canonical_potions(conn):
 
 
 def _seed_token_items(conn):
-    """Crée la catégorie « Token » et ses 10 objets (prix NULL, jamais achetables). Idempotent."""
+    """Crée la catégorie « Token » et ses objets. Idempotent.
+    - Tokens NON achetables (RCT/Territoire + 8 stats classless) : prix NULL (obtenus via /daily).
+    - 40 Token Stats CLASSÉS (8 types × 5 classes) : ACHETABLES, prix auto = fourchette des potions."""
+    import random as _r
     cat_id = _get_or_create_category(conn, "Token")
     for nom in _TOKEN_ITEM_NAMES:
         ex = conn.execute("SELECT id FROM item_definitions WHERE name = ? COLLATE NOCASE", (nom,)).fetchone()
@@ -833,6 +856,38 @@ def _seed_token_items(conn):
                 "VALUES (?, ?, NULL, NULL, ?)",
                 (nom, "Token obtenu en combat (/daily).", cat_id),
             )
+    # 40 Token Stats classés, achetables (prix auto via les fourchettes des potions).
+    for label in _TOKEN_STATS_LABELS:
+        for classe in ("4", "3", "2", "1", "S"):
+            nom = f"Token Stats {label} Classe {classe}"
+            ex = conn.execute("SELECT id FROM item_definitions WHERE name = ? COLLATE NOCASE",
+                              (nom,)).fetchone()
+            if ex is None:
+                lo, hi = _POTION_PRICE_RANGES[classe]
+                conn.execute(
+                    "INSERT INTO item_definitions (name, description, classe, valeur_base, categorie_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (nom, "Token de stat (achetable).", classe, _r.randint(lo, hi), cat_id),
+                )
+
+
+def get_inventory_row(character_id: int, item_id: int):
+    """Ligne d'inventaire (quantity, gifted_quantity, rarete_source) d'un objet pour un personnage, ou None."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT quantity, gifted_quantity, rarete_source FROM character_inventory "
+            "WHERE character_id = ? AND item_id = ?",
+            (character_id, item_id),
+        ).fetchone()
+
+
+def set_inventory_rarete_source(character_id: int, item_id: int, rarete: str):
+    """Mémorise la rareté du coffre d'origine du DERNIER exemplaire obtenu (Tokens), sur la ligne d'inventaire."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE character_inventory SET rarete_source = ? WHERE character_id = ? AND item_id = ?",
+            (rarete, character_id, item_id),
+        )
 
 
 def get_potion_item(potion_type: str, classe: str):
@@ -1298,6 +1353,7 @@ def init_db():
         _seed_default_shop_categories(conn)
         _seed_coffre_items(conn)
         _seed_canonical_potions(conn)
+        _migrate_merge_eo_potion_category(conn)  # après le seed potions : fusionne l'ancienne cat. séparée
         _seed_token_items(conn)
 
 

@@ -71,6 +71,8 @@ def get_class_price_ranges_for_category(cat_name: str):
     norm = _normalize_cat_name(cat_name)
     if norm.startswith("potion"):  # « potion » ET « potion energie occulte »
         return SHOP_CLASS_PRICE_RANGES["potion"]
+    if norm == "token":  # Token Stats classés : même fourchette que les potions (RCT/Territoire = NULL)
+        return SHOP_CLASS_PRICE_RANGES["potion"]
     return SHOP_CLASS_PRICE_RANGES.get(norm)
 
 

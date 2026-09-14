@@ -231,6 +231,22 @@ DAILY_COFFRE_REWARDS = {
 }
 
 
+def _token_exchange_range(rarete_coffre_source, token_type):
+    """§2 : fourchette d'échange (argent OU stats) d'un Token RCT/Territoire au plafond de stade, selon
+    qu'il provient de la tranche la PLUS RARE du coffre d'origine (10000-15000) ou d'une tranche moyenne
+    (5000-10000). Repli prudent (5000-10000) si la rareté/le token n'est pas retrouvé dans la table."""
+    table = DAILY_COFFRE_REWARDS.get(rarete_coffre_source)
+    if not table:
+        return (5000, 10000)
+    min_pct = min(entry["pct"] for entry in table)
+    pct_du_token = next((entry["pct"] for entry in table if entry["type"] == f"token_{token_type}"), None)
+    if pct_du_token is None:
+        return (5000, 10000)
+    if pct_du_token == min_pct:
+        return (10000, 15000)  # tranche la plus rare du tableau
+    return (5000, 10000)       # tranche « moyenne »
+
+
 def weighted_choice(entries):
     """Tirage pondéré sur une liste d'entrées portant un champ 'pct'. Retourne l'entrée choisie."""
     total = sum(e["pct"] for e in entries)
@@ -320,6 +336,8 @@ async def roll_coffre_reward(character_id, guild, rarete) -> dict:
         qty = entry.get("qty", 1) * mult
         if item is not None:
             db.inv_add_item(character_id, item["id"], qty)
+            # §2 : mémorise la rareté du coffre d'origine (dernier obtenu) pour le calcul d'échange.
+            db.set_inventory_rarete_source(character_id, item["id"], rarete)
             return {"texte": item["name"], "n": qty}
         return {"texte": f"{nom or t} (introuvable)", "n": qty}
 
@@ -560,25 +578,65 @@ class Daily(commands.Cog):
     async def _before_vip_loop(self):
         await self.bot.wait_until_ready()
 
-    # §6 : utilisation d'un Token RCT / Territoire (progression de stade à chance dégressive). Retourne un
-    # dict d'issue. La CONSOMMATION du token et l'affichage/échange au stade max sont laissés à l'appelant
-    # (UI d'inventaire — à brancher : les 8 Tokens Stats n'ont pas encore d'action, cf. §7).
-    async def use_token_rct_or_territoire(self, guild, character_id, token_type):
+    # §2/§6 : utilisation INTERACTIVE d'un Token RCT / Territoire. Gère la progression de stade à chance
+    # dégressive (le % n'est JAMAIS révélé) ET l'écran d'échange à 3 boutons au plafond de stade.
+    # NB : le déclencheur (bouton « Utiliser » depuis l'inventaire) reste à brancher côté cogs/inventaire.py.
+    async def use_token_rct_or_territoire(self, channel, user, guild, character_id, token_type):
         from cogs.profil import get_current_rct_stage
         from cogs.parchemin import get_current_territoire_gamble_stage
+        token_name = "Token RCT" if token_type == "rct" else "Token Territoire"
+        item = db.get_item_by_name(token_name)
+        if item is None:
+            await channel.send(f"❌ Objet « {token_name} » introuvable en base.")
+            return
+        row = db.get_inventory_row(character_id, item["id"])
+        if not row or row["quantity"] <= 0:
+            await channel.send(f"❌ Tu ne possèdes aucun {token_name}.")
+            return
+        rarete_source = row["rarete_source"] or "epic"  # défaut prudent si non tracé
+
         if token_type == "rct":
             stage = await get_current_rct_stage(guild, character_id)
             at_max = stage in ("bonne", "avancee")
+            libelle = "RCT"
         else:
             stage = await get_current_territoire_gamble_stage(guild, character_id)
             at_max = stage == "stage2"
-        if at_max:
-            # Ne consomme pas le token : l'appelant proposera l'échange (argent/stats/garder, montants TODO).
-            return {"status": "max", "token_type": token_type}
+            libelle = "Territoire"
 
+        # --- Plafond atteint : écran d'échange à 3 boutons (argent / stats / garder). ---
+        if at_max:
+            lo, hi = _token_exchange_range(rarete_source, token_type)
+            view = DailyChoiceView(user.id, [
+                ("argent", "Échanger contre l'argent", "💰", discord.ButtonStyle.success),
+                ("stats", "Échanger contre des stats", "📊", discord.ButtonStyle.primary),
+                ("garder", "Garder", "📦", discord.ButtonStyle.secondary),
+            ])
+            await channel.send(embed=discord.Embed(
+                title="🏆 Maîtrise maximale atteinte",
+                description=(f"Tu as déjà la maîtrise maximale accessible par Token pour ton **{libelle}**.\n"
+                             "Que veux-tu faire de ce Token ?"),
+                color=PHOENIX_COLOR), view=view)
+            await view.wait()
+            if view.result == "argent":
+                montant = random.randint(lo, hi)
+                credit_compte_courant(character_id, montant, "Échange de Token", category="revenu")
+                db.inv_remove_item(character_id, item["id"], 1)
+                await channel.send(f"💰 Token échangé contre **{montant:,} ¥**.".replace(",", " "))
+            elif view.result == "stats":
+                montant = random.randint(lo, hi)
+                db.add_points_restants(character_id, montant)
+                db.inv_remove_item(character_id, item["id"], 1)
+                await channel.send(f"📊 Token échangé contre **{montant:,} points à répartir**.".replace(",", " "))
+            else:  # garder / timeout : aucun effet, le Token reste en inventaire.
+                await channel.send("📦 Token conservé dans ton inventaire.")
+            return
+
+        # --- Sinon : tentative de progression de stade (chance dégressive, jamais révélée). ---
         usage = db.get_token_usage(character_id, token_type)
         chance = TOKEN_CHANCE_TABLE[usage] if usage < 5 else TOKEN_CHANCE_TABLE[-1] + 2 * (usage - 4)
         reussi = random.randint(1, 100) <= chance
+        db.inv_remove_item(character_id, item["id"], 1)  # la tentative consomme le Token
         if reussi:
             char = db.get_validated_character_by_id(character_id)
             parch = self.bot.get_cog("Parchemin")
@@ -589,9 +647,21 @@ class Daily(commands.Cog):
                 else:
                     role_id = await parch._apply_territoire_success(guild, char)
             db.set_token_usage(character_id, token_type, 0)  # reset au succès
-            return {"status": "success", "token_type": token_type, "role_id": role_id}
-        db.set_token_usage(character_id, token_type, usage + 1)  # +1 au wagering (jamais le % révélé)
-        return {"status": "fail", "token_type": token_type}
+            nom_stade = None
+            if role_id is not None and guild is not None:
+                r = guild.get_role(role_id)
+                nom_stade = r.name if r else None
+            suffix = f"\n🎖️ Nouveau stade : **{nom_stade}**" if nom_stade else ""
+            await channel.send(embed=discord.Embed(
+                title=f"✅ Token {libelle} — Réussite !",
+                description=f"Ta maîtrise **{libelle}** progresse d'un stade !{suffix}",
+                color=discord.Color.green()))
+        else:
+            db.set_token_usage(character_id, token_type, usage + 1)  # +1 au wagering (jamais le % révélé)
+            await channel.send(embed=discord.Embed(
+                title=f"❌ Token {libelle} — Échec",
+                description="La progression a échoué cette fois. Retente avec un autre Token.",
+                color=discord.Color.dark_red()))
 
     # ---------- verrou / attente (mêmes patterns que shop/inventaire) ----------
     def _acquire(self, user_id) -> bool:
@@ -1113,26 +1183,33 @@ class Daily(commands.Cog):
         player_dealt = 0
         player_took = 0
 
-        # §2 / §7.2 : les DEUX attaquent -> clash sur (force_actuelle + PV), seul le plus haut inflige.
+        # §2 / §7.2 : les DEUX attaquent -> clash sur la FORCE ACTUELLE SEULE (les PV n'entrent plus dans
+        # la comparaison). f_j / f_p incluent déjà le bonus de Renforcement Maudit du tour. Égalité
+        # parfaite -> le choc s'annule, aucun dégât.
         if aj["attacking"] and ap["attacking"]:
-            total_j, total_p = f_j + pvj0, f_p + pvp0
-            joueur_gagne = total_j > total_p or (total_j == total_p and joueur_priorite)
-            if joueur_gagne:
+            entete = ("⚔️ **Les deux camps attaquent !**\n\n"
+                      f"**{nj}** : **{f_j:,} de Force**\n"
+                      f"**{npnj}** : **{f_p:,} de Force**\n\n")
+            if f_j == f_p:
+                text = entete + (
+                    f"⚔️ **Clash égal !** {nj} et {npnj} ont la même puissance ({f_j:,} chacun) — "
+                    "le choc s'annule, aucun dégât cette fois.")
+                return text, "blue"
+            if f_j > f_p:
                 st["pv_p"] -= aj["damage"]
                 player_dealt = aj["damage"]
                 gains["force"] += 1
                 gagnant, perdant, deg = nj, npnj, aj["damage"]
+                couleur = "green"
             else:
                 st["pv_j"] -= ap["damage"]
                 player_took = ap["damage"]
                 gagnant, perdant, deg = npnj, nj, ap["damage"]
-            text = (
-                "⚔️ **Les deux camps attaquent !**\n\n"
-                f"**{nj}** : {f_j:,} Force + {pvj0:,} PV = **{total_j:,} points de puissance**\n"
-                f"**{npnj}** : {f_p:,} Force + {pvp0:,} PV = **{total_p:,} points de puissance**\n\n"
+                couleur = "red"
+            text = entete + (
                 f"🏆 **{gagnant}** remporte le clash et inflige **{deg:,}** dégâts à {perdant} !\n"
                 f"{perdant} ne riposte pas ce tour-ci.")
-            return text, ("green" if joueur_gagne else "red")
+            return text, couleur
 
         # Sinon : au plus un camp attaque -> résolution indépendante avec blocage éventuel.
         parts = []
