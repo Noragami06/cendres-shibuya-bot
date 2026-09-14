@@ -14,8 +14,8 @@ from discord import app_commands
 from discord.ext import commands
 
 from cogs.utils import database as db
-from cogs.utils.image_gen import generate_daily_enemy_image
-from cogs.banque import get_characters, get_character, PHOENIX_COLOR
+from cogs.utils.image_gen import generate_daily_enemy_image, generate_coffre_image
+from cogs.banque import get_characters, get_character, credit_compte_courant, PHOENIX_COLOR
 
 # =====================================================================
 # 0. VALEURS DE RÉFÉRENCE
@@ -38,6 +38,22 @@ DAILY_COFFRE_ACCESS = {
 DAILY_COFFRE_KEYS = ["commun", "rare", "epic", "legendaire", "mythique"]
 DAILY_COFFRE_LABELS = {"commun": "Commun", "rare": "Rare", "epic": "Épique",
                        "legendaire": "Légendaire", "mythique": "Mythique"}
+# Noms EXACTS des objets coffre en base (item_definitions), un par rareté.
+COFFRE_ITEM_NAMES = {"commun": "Coffre Commun", "rare": "Coffre Rare", "epic": "Coffre Épique",
+                     "legendaire": "Coffre Légendaire", "mythique": "Coffre Mythique"}
+# Placeholder d'argent par rareté (STUB — voir roll_coffre_reward).
+COFFRE_REWARD_PLACEHOLDER = {"commun": 1000, "rare": 5000, "epic": 20000,
+                             "legendaire": 75000, "mythique": 300000}
+
+
+async def roll_coffre_reward(character_id, rarete) -> dict:
+    """STUB TEMPORAIRE : la vraie table de récompenses par rareté n'est pas encore définie.
+    Retourne pour l'instant un placeholder simple (un peu d'argent fixe), en attendant la vraie
+    table de loot (objets, argent, XP, parchemins, reliques... selon la rareté)."""
+    montant_placeholder = COFFRE_REWARD_PLACEHOLDER[rarete]
+    # TODO : remplacer ce stub par le vrai système de loot par rareté une fois la table définie.
+    credit_compte_courant(character_id, montant_placeholder, "Ouverture de coffre", category="revenu")
+    return {"type": "argent", "montant": montant_placeholder}
 
 DAILY_POTION_TABLE = {
     "4": {"nombre": 3, "pct_restaure": 60},
@@ -821,8 +837,7 @@ class Daily(commands.Cog):
                 title="🏆 VICTOIRE",
                 description=(f"Tu as vaincu ton adversaire de Classe {classe} !\n\n"
                              f"**Points gagnés :**\n{recap}\n\n"
-                             f"🎁 Coffre à débloquer (accès Classe {classe}) : {coffres} "
-                             "*(distribution différée — système de coffres à venir)*\n\n"
+                             f"🎁 Un coffre t'attend (raretés possibles en Classe {classe} : {coffres}).\n\n"
                              "⚠️ Combat InRP : tes PV et ton énergie occulte réels ont été mis à jour."),
                 color=discord.Color.green())
         else:
@@ -834,6 +849,60 @@ class Daily(commands.Cog):
                              "⚠️ Combat InRP : tes PV et ton énergie occulte réels ont été mis à jour."),
                 color=discord.Color.dark_red())
         await channel.send(embed=embed)
+
+        # §2 : à la victoire, tirage de la rareté du coffre + choix Stocker / Ouvrir.
+        if issue == "victoire":
+            rarete = weighted_pick(DAILY_COFFRE_ACCESS[classe])
+            await self._offer_coffre(channel, user, character_id, rarete)
+
+    # ---------- §2 : coffre obtenu à la victoire ----------
+    async def _offer_coffre(self, channel, user, character_id, rarete):
+        import os
+        import uuid
+        label = DAILY_COFFRE_LABELS[rarete]
+        # Message TEXTE classique (pas embed).
+        await channel.send(f"**{user.mention}, tu as obtenu un coffre {label} !**")
+        # Image du coffre sous le message.
+        os.makedirs("temp", exist_ok=True)
+        path = os.path.join("temp", f"coffre_{rarete}_{uuid.uuid4().hex}.png")
+        generate_coffre_image(rarete, path)
+        await channel.send(file=discord.File(path, filename="coffre.png"))
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        # 2 boutons sous l'image.
+        view = DailyChoiceView(user.id, [
+            ("stocker", "Stocker", "📦", discord.ButtonStyle.secondary),
+            ("ouvrir", "Ouvrir", "🔓", discord.ButtonStyle.success),
+        ])
+        await channel.send("Que fais-tu de ce coffre ?", view=view)
+        await view.wait()
+        # Timeout -> on stocke par défaut (ne jamais perdre le coffre gagné).
+        if view.result == "ouvrir":
+            reward = await roll_coffre_reward(character_id, rarete)
+            await channel.send(embed=daily_coffre_summary_embed(1, rarete, [reward]))
+        else:
+            item = db.get_coffre_item_by_rarete(rarete)
+            if item is not None:
+                db.inv_add_item(character_id, item["id"], 1)
+            await channel.send("✅ Le coffre a été ajouté à ton inventaire.")
+
+
+def daily_coffre_summary_embed(nombre, rarete, rewards):
+    """Embed récapitulatif agrégé d'une ou plusieurs ouvertures de coffres de MÊME rareté.
+    rewards : liste de dicts renvoyés par roll_coffre_reward. Agrège l'argent (seul type du stub)."""
+    label = DAILY_COFFRE_LABELS[rarete]
+    total_argent = sum(r["montant"] for r in rewards if r.get("type") == "argent")
+    unit = rewards[0]["montant"] if rewards else 0
+    lignes = []
+    if total_argent > 0:
+        lignes.append(f"💰 {total_argent:,} ¥ obtenus ({nombre}x {unit:,} ¥)".replace(",", " "))
+    # TODO : agréger ici les autres types de loot (objets, XP, parchemins…) quand la vraie table existera.
+    corps = "\n".join(lignes) if lignes else "Aucune récompense."
+    return discord.Embed(
+        title=f"🎁 Résumé de l'ouverture ({nombre}x Coffre {label})",
+        description=corps, color=PHOENIX_COLOR)
 
 
 async def setup(bot):

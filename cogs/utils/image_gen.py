@@ -547,7 +547,25 @@ CLASS_COLORS_INV = {
     "3": (60, 130, 240),
     "4": (40, 200, 150),
     "sans": (130, 130, 140),
+    # Raretés de coffres (même mécanisme d'étiquette colorée que les classes).
+    "commun": (170, 170, 175),
+    "rare": (80, 150, 235),
+    "epic": (165, 75, 235),
+    "legendaire": (255, 160, 30),
+    "mythique": (235, 55, 95),
 }
+
+# Libellés d'étiquette pour les raretés de coffres (sinon on retombe sur « Classe {x} »).
+RARETE_LABELS_INV = {"commun": "Commun", "rare": "Rare", "epic": "Épique",
+                     "legendaire": "Légendaire", "mythique": "Mythique"}
+
+
+def _inv_classe_label(cls: str) -> str:
+    """Étiquette affichée pour une classe/rareté : rareté de coffre -> libellé dédié, sinon « Classe X »
+    (ou « Sans classe »)."""
+    if cls in RARETE_LABELS_INV:
+        return RARETE_LABELS_INV[cls]
+    return f"Classe {cls}" if cls != "sans" else "Sans classe"
 
 
 def generate_inventaire_image(character_name: str, items: list, total_value: str, out_path: str):
@@ -587,7 +605,7 @@ def generate_inventaire_image(character_name: str, items: list, total_value: str
         d.rounded_rectangle((x, yy, x + col_w, yy + 8), radius=4, fill=color)
         d.text((x + 24, yy + 22), name, font=font(15, True), fill=TEXT)
         d.text((x + 24, yy + 46), desc, font=font(11), fill=SUB)
-        classe_label = f"Classe {cls}" if cls != "sans" else "Sans classe"
+        classe_label = _inv_classe_label(cls)
         d.text((x + 24, yy + 70), classe_label, font=font(11, True), fill=color)
         d.text((x + col_w - 140, yy + 22), f"x{qty}", font=font(13, True), fill=TEXT)
         vw = text_w(d, val, font(13, True))

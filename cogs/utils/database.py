@@ -729,6 +729,93 @@ def _ensure_character_inventory_columns(conn):
         conn.execute("ALTER TABLE character_inventory ADD COLUMN gifted_quantity INTEGER DEFAULT 0")
 
 
+# Coffres (/daily) : 1 objet par rareté, catégorie « Coffre », prix NULL (jamais achetable — obtenu
+# uniquement en combat). La rareté est stockée dans la colonne `classe` (comme la classe des armes),
+# pour réutiliser le mécanisme d'étiquette colorée à l'affichage.
+_DEFAULT_COFFRE_ITEMS = [
+    ("Coffre Commun", "commun"),
+    ("Coffre Rare", "rare"),
+    ("Coffre Épique", "epic"),
+    ("Coffre Légendaire", "legendaire"),
+    ("Coffre Mythique", "mythique"),
+]
+
+
+def _seed_coffre_items(conn):
+    """Crée la catégorie « Coffre » et ses 5 objets (un par rareté) s'ils n'existent pas déjà. Idempotent
+    (vérification insensible à la casse par nom). Prix laissé NULL (non achetable)."""
+    row = conn.execute("SELECT id FROM shop_categories WHERE name = ? COLLATE NOCASE", ("Coffre",)).fetchone()
+    if row is None:
+        cur = conn.execute("INSERT INTO shop_categories (name) VALUES (?)", ("Coffre",))
+        cat_id = cur.lastrowid
+    else:
+        cat_id = row["id"]
+    for name, rarete in _DEFAULT_COFFRE_ITEMS:
+        ex = conn.execute("SELECT id FROM item_definitions WHERE name = ? COLLATE NOCASE", (name,)).fetchone()
+        if ex is None:
+            conn.execute(
+                "INSERT INTO item_definitions (name, description, classe, valeur_base, categorie_id) "
+                "VALUES (?, ?, ?, NULL, ?)",
+                (name, "Coffre obtenu en combat (/daily).", rarete, cat_id),
+            )
+
+
+def get_coffre_item_by_rarete(rarete: str):
+    """Objet coffre correspondant à une rareté (id, name), via classe=rarete dans la catégorie Coffre."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT d.id, d.name FROM item_definitions d JOIN shop_categories s ON d.categorie_id = s.id "
+            "WHERE LOWER(s.name) = 'coffre' AND d.classe = ? LIMIT 1",
+            (rarete,),
+        ).fetchone()
+
+
+def get_owned_coffres(character_id: int):
+    """Coffres POSSÉDÉS (catégorie « Coffre », quantité > 0) : item_id, name, classe (=rareté), quantité."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT ci.item_id, ci.quantity, item.name, item.classe "
+            "FROM character_inventory ci "
+            "JOIN item_definitions item ON item.id = ci.item_id "
+            "JOIN shop_categories s ON item.categorie_id = s.id "
+            "WHERE ci.character_id = ? AND LOWER(s.name) = 'coffre' AND ci.quantity > 0 "
+            "ORDER BY item.id",
+            (character_id,),
+        ).fetchall()
+
+
+def inv_add_item(character_id: int, item_id: int, qty: int):
+    """Ajoute qty exemplaires d'un objet à l'inventaire d'un personnage (crée la ligne au besoin). Helper
+    de niveau base réutilisable (ex: stocker un coffre depuis /daily)."""
+    with get_connection() as conn:
+        r = conn.execute(
+            "SELECT id FROM character_inventory WHERE character_id = ? AND item_id = ?",
+            (character_id, item_id),
+        ).fetchone()
+        if r:
+            conn.execute("UPDATE character_inventory SET quantity = quantity + ? WHERE id = ?", (qty, r["id"]))
+        else:
+            conn.execute(
+                "INSERT INTO character_inventory (character_id, item_id, quantity) VALUES (?, ?, ?)",
+                (character_id, item_id, qty),
+            )
+
+
+def inv_remove_item(character_id: int, item_id: int, qty: int):
+    """Retire qty exemplaires (supprime la ligne si la quantité tombe à 0 ou moins)."""
+    with get_connection() as conn:
+        r = conn.execute(
+            "SELECT id, quantity FROM character_inventory WHERE character_id = ? AND item_id = ?",
+            (character_id, item_id),
+        ).fetchone()
+        if not r:
+            return
+        if r["quantity"] - qty > 0:
+            conn.execute("UPDATE character_inventory SET quantity = quantity - ? WHERE id = ?", (qty, r["id"]))
+        else:
+            conn.execute("DELETE FROM character_inventory WHERE id = ?", (r["id"],))
+
+
 def _seed_default_shop_categories(conn):
     """Crée les catégories de shop par défaut (Potion / Arme maudite / Relique) si elles n'existent pas
     encore, en vérifiant l'absence de façon INSENSIBLE À LA CASSE pour ne jamais créer de doublon d'une
@@ -1029,6 +1116,7 @@ def init_db():
         _migrate_item_categorie_id(conn)
         _ensure_character_inventory_columns(conn)
         _seed_default_shop_categories(conn)
+        _seed_coffre_items(conn)
 
 
 # =====================================================================

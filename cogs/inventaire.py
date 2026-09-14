@@ -291,7 +291,7 @@ class TradeTypeView(discord.ui.View):
 # VUE PRINCIPALE (persistante -> listener on_interaction)
 # =====================================================================
 class MainInventoryView(discord.ui.View):
-    def __init__(self, character_id, user_id, is_staff, categories):
+    def __init__(self, character_id, user_id, is_staff, categories, has_coffres=False):
         super().__init__(timeout=None)
         if categories:
             self.add_item(discord.ui.Select(
@@ -311,6 +311,11 @@ class MainInventoryView(discord.ui.View):
         self.add_item(discord.ui.Button(
             label="Utiliser une potion", emoji="🧪", style=discord.ButtonStyle.secondary,
             custom_id=f"inv_potion:{character_id}:{user_id}", row=1))
+        # Bouton « Ouvrir » (coffres) : visible seulement si le joueur possède au moins 1 coffre.
+        if has_coffres:
+            self.add_item(discord.ui.Button(
+                label="Ouvrir", emoji="🔓", style=discord.ButtonStyle.success,
+                custom_id=f"inv_open_coffre:{character_id}:{user_id}", row=2))
         if is_staff:
             # La création/ajout d'objets se fait maintenant exclusivement via la commande /shop (à venir).
             self.add_item(discord.ui.Button(
@@ -474,9 +479,11 @@ class Inventaire(commands.Cog):
         else:
             desc = "Ton inventaire est vide pour l'instant."
         embed = discord.Embed(title=f"🎒 Inventaire de {name}", description=desc, color=PHOENIX_COLOR)
+        has_coffres = bool(db.get_owned_coffres(character_id))
         await channel.send(
             embed=embed,
-            view=MainInventoryView(character_id, viewer_member.id, _is_staff(viewer_member), categories),
+            view=MainInventoryView(character_id, viewer_member.id, _is_staff(viewer_member), categories,
+                                   has_coffres=has_coffres),
         )
 
     # =================================================================
@@ -518,6 +525,8 @@ class Inventaire(commands.Cog):
             await self.handle_sell(interaction, cid)
         elif cid.startswith("inv_potion:"):
             await self.handle_use_potion(interaction, cid)
+        elif cid.startswith("inv_open_coffre:"):
+            await self.handle_open_coffre(interaction, cid)
         elif cid.startswith("inv_remove:"):
             await self.handle_remove(interaction, cid)
 
@@ -729,6 +738,73 @@ class Inventaire(commands.Cog):
         label = "force du sort" if potion_type == "force_sort" else "force"
         await channel.send(
             f"✅ Effet activé : +{bonus} ({label}), pendant {duree} messages.")
+
+    # ---------- OUVRIR DES COFFRES ----------
+    async def handle_open_coffre(self, interaction, cid):
+        # Import local : évite tout souci d'ordre de chargement / cycle entre cogs.
+        from cogs.daily import roll_coffre_reward, daily_coffre_summary_embed, DAILY_COFFRE_LABELS
+        _, character_id, user_id = cid.split(":")
+        character_id, user_id = int(character_id), int(user_id)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Cet inventaire n'est pas le tien.", ephemeral=True)
+            return
+        coffres = db.get_owned_coffres(character_id)
+        if not coffres:
+            await interaction.response.send_message("Tu ne possèdes aucun coffre.", ephemeral=True)
+            return
+        if not self._acquire(user_id):
+            await interaction.response.send_message(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True)
+            return
+        try:
+            await interaction.response.send_message("🔓 Ouverture de coffre…", ephemeral=True)
+            channel = interaction.channel
+
+            # 1. Choix de la rareté (auto si une seule, sinon liste numérotée).
+            if len(coffres) == 1:
+                coffre = coffres[0]
+            else:
+                lignes = "\n".join(
+                    f"**{i}.** {DAILY_COFFRE_LABELS.get(c['classe'], c['classe'])} — {c['quantity']}x"
+                    for i, c in enumerate(coffres, 1))
+                await channel.send(embed=discord.Embed(
+                    title="🔓 Quel coffre ouvrir ?",
+                    description=lignes + "\n\nRéponds avec le **numéro** correspondant.",
+                    color=PHOENIX_COLOR))
+                coffre = None
+                while coffre is None:
+                    m = await self.wait_message(channel, interaction.user)
+                    if m is None:
+                        await channel.send("⏳ Ouverture annulée.")
+                        return
+                    c = m.content.strip()
+                    if c.isdigit() and 1 <= int(c) <= len(coffres):
+                        coffre = coffres[int(c) - 1]
+                    else:
+                        await channel.send(f"Réponds avec un numéro entre 1 et {len(coffres)}.")
+
+            rarete = coffre["classe"]
+            label = DAILY_COFFRE_LABELS.get(rarete, rarete)
+            owned = coffre["quantity"]
+
+            # 2. Combien en ouvrir ?
+            nb = await self.ask_quantity(
+                channel, interaction.user,
+                f"Combien de coffres {label} veux tu ouvrir ? (tu en as {owned})", maximum=owned)
+            if nb is None:
+                await channel.send("⏳ Ouverture annulée.")
+                return
+
+            # 3-4. Ouvre chaque coffre (récompense cumulée), puis retire du stock.
+            rewards = []
+            for _ in range(nb):
+                rewards.append(await roll_coffre_reward(character_id, rarete))
+            db.inv_remove_item(character_id, coffre["item_id"], nb)
+
+            # 5. Récapitulatif agrégé.
+            await channel.send(embed=daily_coffre_summary_embed(nb, rarete, rewards))
+        finally:
+            self._release(user_id)
 
     # ---------- ÉCHANGE ----------
     async def handle_trade(self, interaction, cid):
