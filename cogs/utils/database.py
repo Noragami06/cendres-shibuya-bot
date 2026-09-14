@@ -316,6 +316,20 @@ CREATE TABLE IF NOT EXISTS character_daily_cooldown (
     last_daily_at TEXT
 );
 
+-- Compteur d'usages de Token RCT / Territoire (chance dégressive de progression de stade, /daily).
+CREATE TABLE IF NOT EXISTS character_token_usage (
+    character_id INTEGER,
+    token_type TEXT,              -- 'rct' ou 'territoire'
+    usage_count INTEGER DEFAULT 0,
+    PRIMARY KEY (character_id, token_type)
+);
+
+-- Statut VIP temporaire (obtenu via coffre) : expire à expires_at (ISO).
+CREATE TABLE IF NOT EXISTS character_vip_status (
+    character_id INTEGER PRIMARY KEY,
+    expires_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS character_stats (
     character_id INTEGER PRIMARY KEY,
     force_pts INTEGER DEFAULT 0,
@@ -760,6 +774,172 @@ def _seed_coffre_items(conn):
             )
 
 
+# Fourchettes de prix des potions (copie de SHOP_CLASS_PRICE_RANGES["potion"], pour l'auto-tarif au seed
+# des potions canoniques sans importer cogs.shop depuis la couche base).
+_POTION_PRICE_RANGES = {
+    "4": (100000, 250000), "3": (1000000, 2500000), "2": (10000000, 24000000),
+    "1": (100000000, 240000000), "S": (480000000, 1120000000),
+}
+# Potions canoniques garanties en base (pour que les récompenses de coffres puissent les trouver par
+# potion_type + classe). soin/force/force_sort -> catégorie « Potion » ; energie_occulte -> « Potion
+# Énergie Occulte ». Noms figés, mais la recherche se fait par (potion_type, classe), jamais par nom.
+_CANONICAL_POTIONS = {
+    "Potion": [("soin", "Potion de Soin"), ("force_sort", "Potion de Force du Sort"),
+               ("force", "Potion de Force")],
+    "Potion Énergie Occulte": [("energie_occulte", "Potion d'Énergie Occulte")],
+}
+_TOKEN_ITEM_NAMES = [
+    "Token RCT", "Token Territoire", "Token Stats Force", "Token Stats Vitesse",
+    "Token Stats Endurance", "Token Stats Arme Maudite", "Token Stats RCT",
+    "Token Stats Territoire", "Token Stats Sort", "Token Stats EO",
+]
+
+
+def _get_or_create_category(conn, name):
+    row = conn.execute("SELECT id FROM shop_categories WHERE name = ? COLLATE NOCASE", (name,)).fetchone()
+    if row is not None:
+        return row["id"]
+    return conn.execute("INSERT INTO shop_categories (name) VALUES (?)", (name,)).lastrowid
+
+
+def _seed_canonical_potions(conn):
+    """Crée les potions canoniques (soin/force_sort/force ×5 classes + energie_occulte ×5) si absentes,
+    dans leur catégorie, avec prix auto (fourchette de la classe). Idempotent (par nom)."""
+    import random as _r
+    for cat_name, familles in _CANONICAL_POTIONS.items():
+        cat_id = _get_or_create_category(conn, cat_name)
+        for ptype, base_nom in familles:
+            for classe in ("4", "3", "2", "1", "S"):
+                nom = f"{base_nom} Classe {classe}"
+                ex = conn.execute("SELECT id FROM item_definitions WHERE name = ? COLLATE NOCASE",
+                                  (nom,)).fetchone()
+                if ex is None:
+                    lo, hi = _POTION_PRICE_RANGES[classe]
+                    conn.execute(
+                        "INSERT INTO item_definitions (name, description, classe, valeur_base, "
+                        "categorie_id, potion_type) VALUES (?, ?, ?, ?, ?, ?)",
+                        (nom, "Potion.", classe, _r.randint(lo, hi), cat_id, ptype),
+                    )
+
+
+def _seed_token_items(conn):
+    """Crée la catégorie « Token » et ses 10 objets (prix NULL, jamais achetables). Idempotent."""
+    cat_id = _get_or_create_category(conn, "Token")
+    for nom in _TOKEN_ITEM_NAMES:
+        ex = conn.execute("SELECT id FROM item_definitions WHERE name = ? COLLATE NOCASE", (nom,)).fetchone()
+        if ex is None:
+            conn.execute(
+                "INSERT INTO item_definitions (name, description, classe, valeur_base, categorie_id) "
+                "VALUES (?, ?, NULL, NULL, ?)",
+                (nom, "Token obtenu en combat (/daily).", cat_id),
+            )
+
+
+def get_potion_item(potion_type: str, classe: str):
+    """Objet potion (id, name) correspondant à un type + une classe (toutes catégories confondues)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT id, name FROM item_definitions WHERE potion_type = ? AND classe = ? LIMIT 1",
+            (potion_type, classe),
+        ).fetchone()
+
+
+def get_random_item_in_category_classe(category_name: str, classe: str):
+    """Un item ALÉATOIRE d'une catégorie (par nom) et d'une classe donnée, ou None."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT d.id, d.name FROM item_definitions d JOIN shop_categories s ON d.categorie_id = s.id "
+            "WHERE LOWER(s.name) = LOWER(?) AND d.classe = ? ORDER BY RANDOM() LIMIT 1",
+            (category_name, classe),
+        ).fetchone()
+
+
+def get_item_by_name(name: str):
+    """Item par nom exact (insensible à la casse), ou None."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT id, name FROM item_definitions WHERE name = ? COLLATE NOCASE", (name,)
+        ).fetchone()
+
+
+def add_points_restants(character_id: int, n: int):
+    """Ajoute n points libres à répartir (character_stats.points_restants)."""
+    with get_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO character_stats (character_id) VALUES (?)", (character_id,))
+        conn.execute(
+            "UPDATE character_stats SET points_restants = points_restants + ? WHERE character_id = ?",
+            (int(n), character_id),
+        )
+
+
+# ---------- Tokens RCT / Territoire ----------
+def get_token_usage(character_id: int, token_type: str) -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT usage_count FROM character_token_usage WHERE character_id = ? AND token_type = ?",
+            (character_id, token_type),
+        ).fetchone()
+    return row["usage_count"] if row else 0
+
+
+def set_token_usage(character_id: int, token_type: str, value: int):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO character_token_usage (character_id, token_type, usage_count) VALUES (?, ?, ?) "
+            "ON CONFLICT(character_id, token_type) DO UPDATE SET usage_count = excluded.usage_count",
+            (character_id, token_type, int(value)),
+        )
+
+
+# ---------- Statut VIP ----------
+def set_vip_status(character_id: int, expires_at_iso: str):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO character_vip_status (character_id, expires_at) VALUES (?, ?) "
+            "ON CONFLICT(character_id) DO UPDATE SET expires_at = excluded.expires_at",
+            (character_id, expires_at_iso),
+        )
+
+
+def is_vip_active(character_id: int) -> bool:
+    """True si le personnage a un statut VIP non expiré."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT expires_at FROM character_vip_status WHERE character_id = ?", (character_id,)
+        ).fetchone()
+    if row is None or not row["expires_at"]:
+        return False
+    try:
+        from datetime import datetime as _dt
+        return _dt.fromisoformat(row["expires_at"]) > _dt.utcnow()
+    except ValueError:
+        return False
+
+
+def get_vip_status(character_id: int):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT expires_at FROM character_vip_status WHERE character_id = ?", (character_id,)
+        ).fetchone()
+
+
+def delete_vip_status(character_id: int):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM character_vip_status WHERE character_id = ?", (character_id,))
+
+
+def get_expired_vip(now_iso: str):
+    """Personnages dont le VIP a expiré (expires_at <= now), avec leur (character_id, user_id, guild_id,
+    slot_number) pour retirer le rôle réel/virtuel."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT v.character_id, vc.user_id, vc.guild_id, vc.slot_number "
+            "FROM character_vip_status v JOIN validated_characters vc ON vc.id = v.character_id "
+            "WHERE v.expires_at <= ?",
+            (now_iso,),
+        ).fetchall()
+
+
 def get_coffre_item_by_rarete(rarete: str):
     """Objet coffre correspondant à une rareté (id, name), via classe=rarete dans la catégorie Coffre."""
     with get_connection() as conn:
@@ -1117,6 +1297,8 @@ def init_db():
         _ensure_character_inventory_columns(conn)
         _seed_default_shop_categories(conn)
         _seed_coffre_items(conn)
+        _seed_canonical_potions(conn)
+        _seed_token_items(conn)
 
 
 # =====================================================================

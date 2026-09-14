@@ -798,7 +798,7 @@ class Inventaire(commands.Cog):
             # 3-4. Ouvre chaque coffre (récompense cumulée), puis retire du stock.
             rewards = []
             for _ in range(nb):
-                rewards.append(await roll_coffre_reward(character_id, rarete))
+                rewards.append(await roll_coffre_reward(character_id, channel.guild, rarete))
             db.inv_remove_item(character_id, coffre["item_id"], nb)
 
             # 5. Récapitulatif agrégé.

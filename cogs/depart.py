@@ -3011,6 +3011,10 @@ def delete_character_cascade(character_id):
         conn.execute("DELETE FROM character_inventory WHERE character_id = ?", (character_id,))
         # Effets de potions durables actifs (force / force_sort)
         conn.execute("DELETE FROM character_active_potions WHERE character_id = ?", (character_id,))
+        # /daily : cooldown, usages de tokens RCT/Territoire, statut VIP
+        conn.execute("DELETE FROM character_daily_cooldown WHERE character_id = ?", (character_id,))
+        conn.execute("DELETE FROM character_token_usage WHERE character_id = ?", (character_id,))
+        conn.execute("DELETE FROM character_vip_status WHERE character_id = ?", (character_id,))
         # Échanges (le personnage peut être proposeur OU cible)
         conn.execute(
             "DELETE FROM pending_trades WHERE proposer_character_id = ? OR target_character_id = ?",

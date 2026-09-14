@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from cogs.utils import database as db
 from cogs.utils.image_gen import generate_daily_enemy_image, generate_coffre_image
@@ -41,19 +41,6 @@ DAILY_COFFRE_LABELS = {"commun": "Commun", "rare": "Rare", "epic": "Épique",
 # Noms EXACTS des objets coffre en base (item_definitions), un par rareté.
 COFFRE_ITEM_NAMES = {"commun": "Coffre Commun", "rare": "Coffre Rare", "epic": "Coffre Épique",
                      "legendaire": "Coffre Légendaire", "mythique": "Coffre Mythique"}
-# Placeholder d'argent par rareté (STUB — voir roll_coffre_reward).
-COFFRE_REWARD_PLACEHOLDER = {"commun": 1000, "rare": 5000, "epic": 20000,
-                             "legendaire": 75000, "mythique": 300000}
-
-
-async def roll_coffre_reward(character_id, rarete) -> dict:
-    """STUB TEMPORAIRE : la vraie table de récompenses par rareté n'est pas encore définie.
-    Retourne pour l'instant un placeholder simple (un peu d'argent fixe), en attendant la vraie
-    table de loot (objets, argent, XP, parchemins, reliques... selon la rareté)."""
-    montant_placeholder = COFFRE_REWARD_PLACEHOLDER[rarete]
-    # TODO : remplacer ce stub par le vrai système de loot par rareté une fois la table définie.
-    credit_compte_courant(character_id, montant_placeholder, "Ouverture de coffre", category="revenu")
-    return {"type": "argent", "montant": montant_placeholder}
 
 DAILY_POTION_TABLE = {
     "4": {"nombre": 3, "pct_restaure": 60},
@@ -84,6 +71,312 @@ DAILY_COOLDOWN_HOURS_STAFF = 12
 DAILY_MAX_ADVERSAIRE_REROLL = 3
 
 DAILY_PV_FLOOR = 100  # le combat s'arrête dès qu'un camp atteint 100 PV ou moins
+
+# §1 : PV du PNJ calculé sur le « burst » du joueur (évite le one-shot), remplace pv_pct pour le PV seul.
+DAILY_DIFFICULTY_GROUP = {"4": "facile", "3": "moyen", "2": "moyen", "1": "difficile", "S": "difficile"}
+DAILY_PV_MULTIPLIER = {"facile": 4, "moyen": 7, "difficile": 12}
+
+# §8 : accès VIP 15 jours.
+VIP_ROLE_ID = 1549049286329761924
+DAILY_VIP_MULTIPLIER = 2
+DAILY_VIP_DURATION_DAYS = 15
+
+# §6 : tokens RCT / Territoire (chance dégressive de progression de stade).
+TOKEN_CHANCE_TABLE = [1, 5, 10, 15, 20]  # usages 1 à 5, puis +2%/usage au delà (continue de monter)
+
+# Correspondances type de récompense -> nom d'objet en base (parchemins & tokens).
+COFFRE_PARCHEMIN_NAMES = {
+    "parchemin_nature_eo": "Parchemin Nature d'EO",
+    "parchemin_rct": "Parchemin RCT",
+    "parchemin_territoire": "Parchemin Territoire",
+}
+COFFRE_TOKEN_NAMES = {
+    "token_rct": "Token RCT", "token_territoire": "Token Territoire",
+    "token_stats_force": "Token Stats Force", "token_stats_vitesse": "Token Stats Vitesse",
+    "token_stats_endurance": "Token Stats Endurance", "token_stats_arme": "Token Stats Arme Maudite",
+    "token_stats_rct": "Token Stats RCT", "token_stats_territoire": "Token Stats Territoire",
+    "token_stats_sort": "Token Stats Sort", "token_stats_eo": "Token Stats EO",
+}
+# stats_force/vitesse/endurance -> colonne de stat (add_stat_base_pts).
+COFFRE_STAT_DIRECT = {"stats_force": ("force", "Force"), "stats_vitesse": ("vitesse", "Vitesse"),
+                      "stats_endurance": ("endurance", "Endurance")}
+
+# §4 : table de récompenses par coffre. Chaque liste totalise 100% (vérifié). "pct" = poids du tirage.
+DAILY_COFFRE_REWARDS = {
+    "commun": [
+        {"type": "argent", "min": 500, "max": 1500, "pct": 45},
+        {"type": "xp", "min": 200, "max": 500, "pct": 25},
+        {"type": "stats_libre", "min": 10, "max": 20, "pct": 10},
+        {"type": "potion", "sous_type": "soin", "classe": "4", "qty": 1, "pct": 5},
+        {"type": "potion", "sous_type": "force_sort", "classe": "4", "qty": 1, "pct": 5},
+        {"type": "potion", "sous_type": "force", "classe": "4", "qty": 1, "pct": 5},
+        {"type": "potion", "sous_type": "energie_occulte", "classe": "4", "qty": 1, "pct": 5},
+    ],
+    "rare": [
+        {"type": "argent", "min": 2000, "max": 5000, "pct": 22},
+        {"type": "xp", "min": 800, "max": 1500, "pct": 18},
+        {"type": "stats_libre", "min": 30, "max": 50, "pct": 12},
+        {"type": "stats_force", "min": 20, "max": 40, "pct": 3},
+        {"type": "stats_vitesse", "min": 20, "max": 40, "pct": 3},
+        {"type": "stats_endurance", "min": 20, "max": 40, "pct": 3},
+        {"type": "potion", "sous_type": "soin", "classe": "4", "qty": 1, "pct": 4},
+        {"type": "potion", "sous_type": "soin", "classe": "3", "qty": 1, "pct": 4},
+        {"type": "potion", "sous_type": "force_sort", "classe": "4", "qty": 1, "pct": 4},
+        {"type": "potion", "sous_type": "force_sort", "classe": "3", "qty": 1, "pct": 4},
+        {"type": "potion", "sous_type": "force", "classe": "4", "qty": 1, "pct": 4},
+        {"type": "potion", "sous_type": "force", "classe": "3", "qty": 1, "pct": 4},
+        {"type": "potion", "sous_type": "energie_occulte", "classe": "4", "qty": 1, "pct": 4},
+        {"type": "potion", "sous_type": "energie_occulte", "classe": "3", "qty": 1, "pct": 4},
+        {"type": "arme_maudite", "classe": "4", "qty": 1, "pct": 2},
+        {"type": "relique", "classe": "4", "qty": 1, "pct": 2},
+        {"type": "parchemin_nature_eo", "qty": 1, "pct": 1},
+        {"type": "parchemin_rct", "qty": 1, "pct": 1},
+        {"type": "parchemin_territoire", "qty": 1, "pct": 1},
+    ],
+    "epic": [
+        {"type": "argent", "min": 8000, "max": 20000, "pct": 19},
+        {"type": "xp", "min": 3000, "max": 6000, "pct": 9},
+        {"type": "stats_libre", "min": 100, "max": 180, "pct": 8},
+        {"type": "stats_force", "min": 60, "max": 100, "pct": 3},
+        {"type": "stats_vitesse", "min": 60, "max": 100, "pct": 3},
+        {"type": "stats_endurance", "min": 60, "max": 100, "pct": 3},
+        {"type": "potion", "sous_type": "soin", "classe": "3", "qty": 1, "pct": 4},
+        {"type": "potion", "sous_type": "soin", "classe": "2", "qty": 1, "pct": 4},
+        {"type": "potion", "sous_type": "force_sort", "classe": "3", "qty": 1, "pct": 4},
+        {"type": "potion", "sous_type": "force_sort", "classe": "2", "qty": 1, "pct": 4},
+        {"type": "potion", "sous_type": "force", "classe": "3", "qty": 1, "pct": 4},
+        {"type": "potion", "sous_type": "force", "classe": "2", "qty": 1, "pct": 4},
+        {"type": "potion", "sous_type": "energie_occulte", "classe": "3", "qty": 1, "pct": 4},
+        {"type": "potion", "sous_type": "energie_occulte", "classe": "2", "qty": 1, "pct": 4},
+        {"type": "arme_maudite", "classe": "3", "qty": 1, "pct": 3},
+        {"type": "arme_maudite", "classe": "2", "qty": 1, "pct": 3},
+        {"type": "relique", "classe": "3", "qty": 1, "pct": 3},
+        {"type": "relique", "classe": "2", "qty": 1, "pct": 3},
+        {"type": "arme_maudite", "classe": "1", "qty": 1, "pct": 1},
+        {"type": "relique", "classe": "1", "qty": 1, "pct": 1},
+        {"type": "parchemin_nature_eo", "qty": 1, "pct": 2},
+        {"type": "parchemin_rct", "qty": 1, "pct": 2},
+        {"type": "parchemin_territoire", "qty": 1, "pct": 2},
+        {"type": "token_rct", "qty": 1, "pct": 1},
+        {"type": "token_territoire", "qty": 1, "pct": 1},
+        {"type": "vip_15j", "pct": 1},
+    ],
+    "legendaire": [
+        {"type": "argent", "min": 40000, "max": 100000, "pct": 17},
+        {"type": "xp", "min": 15000, "max": 30000, "pct": 6},
+        {"type": "stats_libre", "min": 400, "max": 600, "pct": 10},
+        {"type": "stats_force", "min": 200, "max": 300, "pct": 2},
+        {"type": "stats_vitesse", "min": 200, "max": 300, "pct": 2},
+        {"type": "stats_endurance", "min": 200, "max": 300, "pct": 2},
+        {"type": "potion", "sous_type": "soin", "classe": "2", "qty": 1, "pct": 2},
+        {"type": "potion", "sous_type": "soin", "classe": "1", "qty": 1, "pct": 2},
+        {"type": "potion", "sous_type": "soin", "classe": "S", "qty": 1, "pct": 2},
+        {"type": "potion", "sous_type": "force_sort", "classe": "2", "qty": 1, "pct": 2},
+        {"type": "potion", "sous_type": "force_sort", "classe": "1", "qty": 1, "pct": 2},
+        {"type": "potion", "sous_type": "force_sort", "classe": "S", "qty": 1, "pct": 2},
+        {"type": "potion", "sous_type": "force", "classe": "2", "qty": 1, "pct": 2},
+        {"type": "potion", "sous_type": "force", "classe": "1", "qty": 1, "pct": 2},
+        {"type": "potion", "sous_type": "force", "classe": "S", "qty": 1, "pct": 2},
+        {"type": "potion", "sous_type": "energie_occulte", "classe": "2", "qty": 1, "pct": 2},
+        {"type": "potion", "sous_type": "energie_occulte", "classe": "1", "qty": 1, "pct": 2},
+        {"type": "potion", "sous_type": "energie_occulte", "classe": "S", "qty": 1, "pct": 2},
+        {"type": "arme_maudite", "classe": "2", "qty": 1, "pct": 3},
+        {"type": "arme_maudite", "classe": "1", "qty": 1, "pct": 3},
+        {"type": "arme_maudite", "classe": "S", "qty": 1, "pct": 3},
+        {"type": "relique", "classe": "2", "qty": 1, "pct": 3},
+        {"type": "relique", "classe": "1", "qty": 1, "pct": 3},
+        {"type": "relique", "classe": "S", "qty": 1, "pct": 3},
+        {"type": "parchemin_nature_eo", "qty": 1, "pct": 3},
+        {"type": "parchemin_rct", "qty": 1, "pct": 3},
+        {"type": "parchemin_territoire", "qty": 1, "pct": 3},
+        {"type": "token_rct", "qty": 1, "pct": 1},
+        {"type": "token_territoire", "qty": 1, "pct": 1},
+        {"type": "token_stats_force", "qty": 1, "pct": 1},
+        {"type": "token_stats_vitesse", "qty": 1, "pct": 1},
+        {"type": "token_stats_endurance", "qty": 1, "pct": 1},
+        {"type": "token_stats_arme", "qty": 1, "pct": 1},
+        {"type": "token_stats_rct", "qty": 1, "pct": 1},
+        {"type": "token_stats_territoire", "qty": 1, "pct": 1},
+        {"type": "token_stats_sort", "qty": 1, "pct": 1},
+        {"type": "token_stats_eo", "qty": 1, "pct": 1},
+    ],
+    "mythique": [
+        {"type": "argent", "min": 200000, "max": 500000, "pct": 3},
+        {"type": "xp", "min": 80000, "max": 150000, "pct": 3},
+        {"type": "stats_libre", "min": 1200, "max": 2000, "pct": 12},
+        {"type": "stats_force", "min": 600, "max": 900, "pct": 4},
+        {"type": "stats_vitesse", "min": 600, "max": 900, "pct": 4},
+        {"type": "stats_endurance", "min": 600, "max": 900, "pct": 4},
+        {"type": "potion", "sous_type": "soin", "classe": "S", "qty": 1, "pct": 3},
+        {"type": "potion", "sous_type": "force_sort", "classe": "S", "qty": 1, "pct": 3},
+        {"type": "potion", "sous_type": "force", "classe": "S", "qty": 1, "pct": 3},
+        {"type": "potion", "sous_type": "energie_occulte", "classe": "S", "qty": 1, "pct": 3},
+        {"type": "arme_maudite", "classe": "S", "qty": 1, "pct": 8},
+        {"type": "relique", "classe": "S", "qty": 1, "pct": 8},
+        {"type": "parchemin_nature_eo", "qty": 1, "pct": 4},
+        {"type": "parchemin_rct", "qty": 1, "pct": 4},
+        {"type": "parchemin_territoire", "qty": 1, "pct": 4},
+        {"type": "token_rct", "qty": 1, "pct": 2},
+        {"type": "token_territoire", "qty": 1, "pct": 2},
+        {"type": "token_stats_force", "qty": 1, "pct": 3},
+        {"type": "token_stats_vitesse", "qty": 1, "pct": 3},
+        {"type": "token_stats_endurance", "qty": 1, "pct": 3},
+        {"type": "token_stats_arme", "qty": 1, "pct": 3},
+        {"type": "token_stats_rct", "qty": 1, "pct": 3},
+        {"type": "token_stats_territoire", "qty": 1, "pct": 3},
+        {"type": "token_stats_sort", "qty": 1, "pct": 3},
+        {"type": "token_stats_eo", "qty": 1, "pct": 3},
+        {"type": "vip_15j", "pct": 2},
+    ],
+}
+
+
+def weighted_choice(entries):
+    """Tirage pondéré sur une liste d'entrées portant un champ 'pct'. Retourne l'entrée choisie."""
+    total = sum(e["pct"] for e in entries)
+    r = random.uniform(0, total)
+    acc = 0
+    for e in entries:
+        acc += e["pct"]
+        if r <= acc:
+            return e
+    return entries[-1]
+
+
+def _coffre_entries_for(character_id, rarete):
+    """Table de tirage effective pour ce personnage : si VIP déjà actif, retire l'entrée 'vip_15j' et
+    reverse son % vers l'entrée la PLUS RARE restante (plus petit pct), pour CE tirage précis (§8)."""
+    entries = [dict(e) for e in DAILY_COFFRE_REWARDS[rarete]]
+    if not db.is_vip_active(character_id):
+        return entries
+    vip = next((e for e in entries if e["type"] == "vip_15j"), None)
+    if vip is None:
+        return entries
+    entries.remove(vip)
+    if entries:
+        cible = min(entries, key=lambda e: e["pct"])
+        cible["pct"] += vip["pct"]
+    return entries
+
+
+async def roll_coffre_reward(character_id, guild, rarete) -> dict:
+    """Tire une récompense pondérée dans DAILY_COFFRE_REWARDS[rarete] et l'applique. Retourne
+    {"texte": description lisible}. Applique le multiplicateur VIP ×2 aux gains NUMÉRIQUES (argent, xp,
+    stats, quantités) ; les tirages d'objet unique (arme/relique) restent à 1 exemplaire."""
+    entry = weighted_choice(_coffre_entries_for(character_id, rarete))
+    mult = DAILY_VIP_MULTIPLIER if db.is_vip_active(character_id) else 1
+    t = entry["type"]
+
+    # Convention de retour : {"texte": libellé de base, "n": quantité} (agrégé au récap, §9).
+    if t == "argent":
+        montant = random.randint(entry["min"], entry["max"]) * mult
+        credit_compte_courant(character_id, montant, "Ouverture de coffre", category="revenu")
+        return {"texte": f"{montant:,} ¥".replace(",", " "), "n": 1}
+
+    if t == "xp":
+        montant = random.randint(entry["min"], entry["max"]) * mult
+        await db.grant_character_xp(character_id, montant)
+        return {"texte": f"{montant:,} XP".replace(",", " "), "n": 1}
+
+    if t == "stats_libre":
+        montant = random.randint(entry["min"], entry["max"]) * mult
+        db.add_points_restants(character_id, montant)
+        return {"texte": f"{montant:,} points à répartir".replace(",", " "), "n": 1}
+
+    if t in COFFRE_STAT_DIRECT:
+        stat_key, label = COFFRE_STAT_DIRECT[t]
+        montant = random.randint(entry["min"], entry["max"]) * mult
+        db.add_stat_base_pts(character_id, stat_key, montant)
+        return {"texte": f"{montant:,} points directement en {label}".replace(",", " "), "n": 1}
+
+    if t == "potion":
+        item = db.get_potion_item(entry["sous_type"], entry["classe"])
+        qty = entry.get("qty", 1) * mult
+        if item is not None:
+            db.inv_add_item(character_id, item["id"], qty)
+            return {"texte": item["name"], "n": qty}
+        return {"texte": f"Potion {entry['sous_type']} classe {entry['classe']} (introuvable)", "n": qty}
+
+    if t in ("arme_maudite", "relique"):
+        cat = "Arme maudite" if t == "arme_maudite" else "Relique"
+        item = db.get_random_item_in_category_classe(cat, entry["classe"])
+        if item is not None:
+            db.inv_add_item(character_id, item["id"], 1)  # objet unique : jamais ×2
+            return {"texte": item["name"], "n": 1}
+        return {"texte": f"{cat} classe {entry['classe']} (introuvable)", "n": 1}
+
+    if t.startswith("parchemin_"):
+        nom = COFFRE_PARCHEMIN_NAMES.get(t)
+        item = db.get_item_by_name(nom) if nom else None
+        qty = entry.get("qty", 1) * mult
+        if item is not None:
+            db.inv_add_item(character_id, item["id"], qty)
+            return {"texte": item["name"], "n": qty}
+        return {"texte": f"{nom or t} (introuvable)", "n": qty}
+
+    if t.startswith("token_"):
+        nom = COFFRE_TOKEN_NAMES.get(t)
+        item = db.get_item_by_name(nom) if nom else None
+        qty = entry.get("qty", 1) * mult
+        if item is not None:
+            db.inv_add_item(character_id, item["id"], qty)
+            return {"texte": item["name"], "n": qty}
+        return {"texte": f"{nom or t} (introuvable)", "n": qty}
+
+    if t == "vip_15j":
+        await grant_vip(character_id, guild)
+        return {"texte": "Accès VIP 15 jours", "n": 1}
+
+    return {"texte": "Récompense inconnue", "n": 1}
+
+
+async def grant_vip(character_id, guild):
+    """§8 : attribue le rôle VIP (réel/virtuel selon slot) + enregistre l'expiration à +15 jours."""
+    with db.get_connection() as conn:
+        char = conn.execute(
+            "SELECT id, user_id, slot_number FROM validated_characters WHERE id = ?", (character_id,)
+        ).fetchone()
+    if char is not None:
+        await _add_role_real_or_virtual(guild, char, VIP_ROLE_ID, "Coffre — accès VIP 15 jours")
+    expires = (datetime.utcnow() + timedelta(days=DAILY_VIP_DURATION_DAYS)).isoformat()
+    db.set_vip_status(character_id, expires)
+
+
+async def _add_role_real_or_virtual(guild, char, role_id, reason):
+    """Attribue un rôle : réel (Discord) pour le slot 1, virtuel (base) pour les slots 2/3."""
+    if char["slot_number"] == 1 and guild is not None:
+        member = guild.get_member(char["user_id"])
+        if member is None:
+            try:
+                member = await guild.fetch_member(char["user_id"])
+            except (discord.NotFound, discord.HTTPException):
+                member = None
+        role = guild.get_role(role_id)
+        if member is not None and role is not None and role not in member.roles:
+            try:
+                await member.add_roles(role, reason=reason)
+            except (discord.Forbidden, discord.HTTPException):
+                print(f"[daily] Impossible d'attribuer le rôle {role_id} à {char['user_id']}.")
+    else:
+        db.add_virtual_role(char["id"], role_id)
+
+
+async def _remove_role_real_or_virtual(guild, char, role_id, reason):
+    if char["slot_number"] == 1 and guild is not None:
+        member = guild.get_member(char["user_id"])
+        if member is None:
+            try:
+                member = await guild.fetch_member(char["user_id"])
+            except (discord.NotFound, discord.HTTPException):
+                member = None
+        role = guild.get_role(role_id)
+        if member is not None and role is not None and role in member.roles:
+            try:
+                await member.remove_roles(role, reason=reason)
+            except (discord.Forbidden, discord.HTTPException):
+                print(f"[daily] Impossible de retirer le rôle {role_id} de {char['user_id']}.")
+    else:
+        db.remove_virtual_role(char["id"], role_id)
 
 # IA du PNJ : pondération des actions par classe (jamais 100% d'un seul choix). Plus la classe est haute,
 # plus l'IA privilégie l'attaque et le renforcement.
@@ -132,9 +425,10 @@ def block_chance(compteur: int) -> int:
     return max(0, chance)
 
 
-def generate_pnj(player_stats: dict, classe: str) -> dict:
+def generate_pnj(player_stats: dict, classe: str, pv_override=None) -> dict:
     """player_stats : {pv, eo, force, vitesse, arme, rct, territoire}. Applique DAILY_STATS_TABLE[classe].
-    Variance (classe 2) : chaque valeur *= uniform(0.90, 1.10) indépendamment. Sinon déterministe."""
+    Variance (classe 2) : chaque valeur *= uniform(0.90, 1.10) indépendamment. Sinon déterministe.
+    §1 : si pv_override est fourni, il REMPLACE le PV calculé par pv_pct (les autres stats sont inchangées)."""
     tbl = DAILY_STATS_TABLE[classe]
     variance = tbl["variance"]
 
@@ -143,10 +437,11 @@ def generate_pnj(player_stats: dict, classe: str) -> dict:
             return round(value * pct)
         return round(value * pct * random.uniform(1 - variance, 1 + variance))
 
+    pv_max = int(pv_override) if pv_override is not None else scale(player_stats["pv"], tbl["pv_pct"])
     return {
         "name": generate_pnj_name(),
         "classe": classe,
-        "pv_max": max(1, scale(player_stats["pv"], tbl["pv_pct"])),
+        "pv_max": max(1, pv_max),
         "eo_max": max(0, scale(player_stats["eo"], tbl["eo_pct"])),
         "force": max(0, scale(player_stats["force"], tbl["stat_pct"])),
         "vitesse": max(0, scale(player_stats["vitesse"], tbl["stat_pct"])),
@@ -242,6 +537,61 @@ class Daily(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self._active_users = set()  # isolation de flux par joueur (mémoire, vidée au redémarrage)
+
+    async def cog_load(self):
+        if not self.vip_expiry_loop.is_running():
+            self.vip_expiry_loop.start()
+
+    async def cog_unload(self):
+        self.vip_expiry_loop.cancel()
+
+    # §8 : tâche planifiée d'expiration du VIP (réutilise le scheduler tasks.loop, comme les autres tâches).
+    @tasks.loop(hours=6)
+    async def vip_expiry_loop(self):
+        now = datetime.utcnow().isoformat()
+        for row in db.get_expired_vip(now):
+            guild = self.bot.get_guild(row["guild_id"]) if row["guild_id"] else None
+            char = {"id": row["character_id"], "user_id": row["user_id"],
+                    "slot_number": row["slot_number"]}
+            await _remove_role_real_or_virtual(guild, char, VIP_ROLE_ID, "Fin d'accès VIP (15 jours)")
+            db.delete_vip_status(row["character_id"])
+
+    @vip_expiry_loop.before_loop
+    async def _before_vip_loop(self):
+        await self.bot.wait_until_ready()
+
+    # §6 : utilisation d'un Token RCT / Territoire (progression de stade à chance dégressive). Retourne un
+    # dict d'issue. La CONSOMMATION du token et l'affichage/échange au stade max sont laissés à l'appelant
+    # (UI d'inventaire — à brancher : les 8 Tokens Stats n'ont pas encore d'action, cf. §7).
+    async def use_token_rct_or_territoire(self, guild, character_id, token_type):
+        from cogs.profil import get_current_rct_stage
+        from cogs.parchemin import get_current_territoire_gamble_stage
+        if token_type == "rct":
+            stage = await get_current_rct_stage(guild, character_id)
+            at_max = stage in ("bonne", "avancee")
+        else:
+            stage = await get_current_territoire_gamble_stage(guild, character_id)
+            at_max = stage == "stage2"
+        if at_max:
+            # Ne consomme pas le token : l'appelant proposera l'échange (argent/stats/garder, montants TODO).
+            return {"status": "max", "token_type": token_type}
+
+        usage = db.get_token_usage(character_id, token_type)
+        chance = TOKEN_CHANCE_TABLE[usage] if usage < 5 else TOKEN_CHANCE_TABLE[-1] + 2 * (usage - 4)
+        reussi = random.randint(1, 100) <= chance
+        if reussi:
+            char = db.get_validated_character_by_id(character_id)
+            parch = self.bot.get_cog("Parchemin")
+            role_id = None
+            if parch is not None and char is not None:
+                if token_type == "rct":
+                    role_id = await parch._apply_rct_success(guild, char)
+                else:
+                    role_id = await parch._apply_territoire_success(guild, char)
+            db.set_token_usage(character_id, token_type, 0)  # reset au succès
+            return {"status": "success", "token_type": token_type, "role_id": role_id}
+        db.set_token_usage(character_id, token_type, usage + 1)  # +1 au wagering (jamais le % révélé)
+        return {"status": "fail", "token_type": token_type}
 
     # ---------- verrou / attente (mêmes patterns que shop/inventaire) ----------
     def _acquire(self, user_id) -> bool:
@@ -415,8 +765,9 @@ class Daily(commands.Cog):
                              f"🎁 Coffres accessibles : {coffres}"),
                 color=PHOENIX_COLOR))
 
-            # §3-4 : génération PNJ + pillow + 3 boutons, avec reroll (max 3).
-            pnj = generate_pnj(player_stats, classe)
+            # §1+§3-4 : PV du PNJ basé sur le burst du joueur (anti one-shot), reste des stats en %.
+            pv_override = self._burst_pv_override(character_id, player_stats, classe)
+            pnj = generate_pnj(player_stats, classe, pv_override=pv_override)
             rerolls = 0
             while True:
                 await self._send_pnj_pillow(channel, pnj)
@@ -441,7 +792,17 @@ class Daily(commands.Cog):
                     await channel.send("❌ Tu as déjà changé d'adversaire 3 fois : plus de changement possible.")
                     continue
                 rerolls += 1
-                pnj = generate_pnj(player_stats, classe)
+                pnj = generate_pnj(player_stats, classe, pv_override=pv_override)
+
+    def _burst_pv_override(self, character_id, player_stats, classe):
+        """§1 : PV du PNJ = burst_power_joueur × multiplicateur de difficulté. burst = max(dégât physique,
+        meilleur dégât de sort secondaire débloqué, meilleur dégât d'arme maudite)."""
+        phys = player_stats["force"] * DAILY_DAMAGE_RATIO
+        best_spell = max((s["damage"] for s in self._unlocked_spells(character_id, player_stats["eo"])),
+                         default=0)
+        best_arme = max((a["degats_actuel"] or 0 for a in db.get_character_armes(character_id)), default=0)
+        burst = max(phys, best_spell, best_arme)
+        return round(burst * DAILY_PV_MULTIPLIER[DAILY_DIFFICULTY_GROUP[classe]])
 
     async def _send_pnj_pillow(self, channel, pnj):
         import os
@@ -539,6 +900,7 @@ class Daily(commands.Cog):
         Le renforcement maudit boucle sans consommer le tour."""
         bonus_force = 0
         potions = db.get_owned_potions(character_id)
+        armes = db.get_character_armes(character_id)  # §2 : armes maudites créées par le joueur
         while True:
             options = [
                 ("attaquer", "Attaquer", "⚔️", discord.ButtonStyle.danger),
@@ -546,6 +908,8 @@ class Daily(commands.Cog):
                 ("renfort", "Renforcement maudit", "🔮", discord.ButtonStyle.primary),
                 ("sort", "Utiliser un sort", "✨", discord.ButtonStyle.primary),
             ]
+            if armes:
+                options.append(("arme", "Utiliser une arme maudite", "🗡️", discord.ButtonStyle.primary))
             if potions:
                 options.append(("potion", "Utiliser une potion", "🧪", discord.ButtonStyle.success))
             view = DailyChoiceView(user.id, options)
@@ -602,6 +966,15 @@ class Daily(commands.Cog):
                 return {"kind": "sort", "attacking": True, "damage": spell["damage"], "dtype": "spell",
                         "blocking": False, "spell_name": spell["name"], "force_actuelle": f_act}
 
+            if act == "arme":
+                arme = await self._pick_arme(channel, user, character_id, st)
+                if arme is None:
+                    continue  # aucune arme utilisable / annulé : redemande une action
+                st["eo_j"] -= arme["cost"]
+                # §2 : l'arme est alimentée par l'EO -> traitée EXACTEMENT comme un sort pour le blocage.
+                return {"kind": "arme", "attacking": True, "damage": arme["damage"], "dtype": "spell",
+                        "blocking": False, "spell_name": arme["name"], "force_actuelle": f_act}
+
             if act == "attaquer":
                 return {"kind": "attaquer", "attacking": True, "damage": physical_damage(f_act),
                         "dtype": "phys", "blocking": False, "force_actuelle": f_act}
@@ -639,6 +1012,53 @@ class Daily(commands.Cog):
                     continue
                 return chosen
             await channel.send(f"Réponds par un numéro entre 1 et {len(spells)}.")
+
+    def _armes_usable(self, character_id, eo_reserve):
+        """§2 : armes maudites du joueur, avec coût EO concret et dégâts. Coût = cout_eo_fixe si converti,
+        sinon cout_pct% de la RÉSERVE ACTUELLE (même logique que /technique). cout_pct dérivé de la classe
+        via l'override staff ou SPELL_CLASS_VALUES."""
+        from cogs.utils.coherence_check import SPELL_CLASS_VALUES
+        out = []
+        for a in db.get_character_armes(character_id):
+            if a["cout_eo_fixe"] is not None:
+                cost = a["cout_eo_fixe"]
+            else:
+                override = a["cout_eo_pct_override"] if "cout_eo_pct_override" in a.keys() else None
+                pct = override if override is not None else SPELL_CLASS_VALUES.get(a["classe"], {}).get("cout_pct", 0)
+                cost = round(pct / 100 * eo_reserve)
+            out.append({"name": a["name"] or "Arme maudite", "cost": int(cost),
+                        "damage": int(a["degats_actuel"] or 0)})
+        return out
+
+    async def _pick_arme(self, channel, user, character_id, st):
+        """§2 : liste TEXTE (pas embed) des armes maudites + suggestion du meilleur ratio. Retourne l'arme
+        choisie (EO vérifié) ou None."""
+        armes = self._armes_usable(character_id, st["eo_j"])
+        if not armes:
+            await channel.send("Tu n'as aucune arme maudite utilisable.")
+            return None
+        lignes = ["🗡️ Armes maudites disponibles :"]
+        for i, a in enumerate(armes, 1):
+            lignes.append(f"{i}. **{a['name']}** — coût {a['cost']:,} EO · {a['damage']:,} dégâts")
+        best = best_spell_ratio(armes)  # même heuristique dégâts/coût que les sorts
+        lignes.append(f"\n💡 Meilleur ratio dégâts/coût : **{best['name']}**.")
+        lignes.append("Réponds par le **numéro** de l'arme (ou « annuler »).")
+        await channel.send("\n".join(lignes))
+        while True:
+            m = await self.wait_message(channel, user)
+            if m is None:
+                return None
+            c = m.content.strip()
+            if c.lower() in ("cancel", "annuler"):
+                return None
+            if c.isdigit() and 1 <= int(c) <= len(armes):
+                chosen = armes[int(c) - 1]
+                if chosen["cost"] > st["eo_j"]:
+                    await channel.send(
+                        f"Énergie occulte insuffisante ({st['eo_j']:,} < {chosen['cost']:,}). Choisis une autre arme.")
+                    continue
+                return chosen
+            await channel.send(f"Réponds par un numéro entre 1 et {len(armes)}.")
 
     def _consume_one_potion(self, character_id, item_id):
         with db.get_connection() as conn:
@@ -726,7 +1146,10 @@ class Daily(commands.Cog):
                 gains["force"] += 1
                 if aj["dtype"] == "spell":
                     sn = aj.get("spell_name") or "un sort"
-                    parts.append(f"✨ **{nj}** lance **{sn}** et inflige **{dealt:,}** dégâts à {npnj} !")
+                    if aj.get("kind") == "arme":
+                        parts.append(f"🗡️ **{nj}** frappe avec **{sn}** et inflige **{dealt:,}** dégâts à {npnj} !")
+                    else:
+                        parts.append(f"✨ **{nj}** lance **{sn}** et inflige **{dealt:,}** dégâts à {npnj} !")
                 else:
                     parts.append(f"🗡️ **{nj}** attaque et inflige **{dealt:,}** dégâts à {npnj} !")
             else:
@@ -880,7 +1303,7 @@ class Daily(commands.Cog):
         await view.wait()
         # Timeout -> on stocke par défaut (ne jamais perdre le coffre gagné).
         if view.result == "ouvrir":
-            reward = await roll_coffre_reward(character_id, rarete)
+            reward = await roll_coffre_reward(character_id, channel.guild, rarete)
             await channel.send(embed=daily_coffre_summary_embed(1, rarete, [reward]))
         else:
             item = db.get_coffre_item_by_rarete(rarete)
@@ -890,15 +1313,18 @@ class Daily(commands.Cog):
 
 
 def daily_coffre_summary_embed(nombre, rarete, rewards):
-    """Embed récapitulatif agrégé d'une ou plusieurs ouvertures de coffres de MÊME rareté.
-    rewards : liste de dicts renvoyés par roll_coffre_reward. Agrège l'argent (seul type du stub)."""
+    """§9 : embed récapitulatif AGRÉGÉ de N ouvertures de coffres de même rareté. Regroupe les lignes
+    identiques en sommant les quantités (ex: « 3x Potion de Soin Classe 4 »)."""
     label = DAILY_COFFRE_LABELS[rarete]
-    total_argent = sum(r["montant"] for r in rewards if r.get("type") == "argent")
-    unit = rewards[0]["montant"] if rewards else 0
-    lignes = []
-    if total_argent > 0:
-        lignes.append(f"💰 {total_argent:,} ¥ obtenus ({nombre}x {unit:,} ¥)".replace(",", " "))
-    # TODO : agréger ici les autres types de loot (objets, XP, parchemins…) quand la vraie table existera.
+    agg = {}
+    ordre = []
+    for r in rewards:
+        texte = r["texte"]
+        if texte not in agg:
+            agg[texte] = 0
+            ordre.append(texte)
+        agg[texte] += r.get("n", 1)
+    lignes = [f"• {agg[t]}x {t}" if agg[t] > 1 else f"• {t}" for t in ordre]
     corps = "\n".join(lignes) if lignes else "Aucune récompense."
     return discord.Embed(
         title=f"🎁 Résumé de l'ouverture ({nombre}x Coffre {label})",

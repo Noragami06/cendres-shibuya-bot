@@ -66,8 +66,12 @@ def _normalize_cat_name(name: str) -> str:
 
 
 def get_class_price_ranges_for_category(cat_name: str):
-    """Fourchettes de prix par classe pour cette catégorie, ou None si elle n'est pas auto-tarifée."""
-    return SHOP_CLASS_PRICE_RANGES.get(_normalize_cat_name(cat_name))
+    """Fourchettes de prix par classe pour cette catégorie, ou None si elle n'est pas auto-tarifée.
+    « Potion Énergie Occulte » réutilise les fourchettes de « potion »."""
+    norm = _normalize_cat_name(cat_name)
+    if norm.startswith("potion"):  # « potion » ET « potion energie occulte »
+        return SHOP_CLASS_PRICE_RANGES["potion"]
+    return SHOP_CLASS_PRICE_RANGES.get(norm)
 
 
 def _tmp_shop(prefix: str) -> str:
