@@ -52,7 +52,11 @@ DAILY_POTION_TABLE = {
 
 DAILY_REWARD_POINTS = {"4": 5, "3": 10, "2": 16, "1": 32, "S": 65}
 
-DAILY_DAMAGE_RATIO = 0.03  # dégâts = force_actuelle * 0.03, aucun tirage aléatoire
+DAILY_DAMAGE_RATIO = 0.05  # dégâts = force_actuelle * 0.05 (1000 Force = 50 dégâts), aucun aléatoire
+
+# §2 : critique « Black Flash » (JOUEUR uniquement, action Attaquer). Chance de départ 10%, dégâts ×3.
+DAILY_CRIT_BASE = 10
+DAILY_CRIT_MULTIPLIER = 3
 
 DAILY_BLOCK_CHANCES = [100, 100, 90, 80, 70, 65, 60, 55, 50]  # blocages 1 à 9
 DAILY_BLOCK_DECREMENT_AFTER_9 = 2  # -2% par blocage au delà du 9e, SANS PLANCHER (peut atteindre 0%)
@@ -909,6 +913,7 @@ class Daily(commands.Cog):
             "force_base_p": pnj["force"],
             "bloc_j": 0, "bloc_p": 0,          # compteurs de blocage (chance dégressive)
             "potions_p": pnj["potions"], "potion_pct_p": pnj["potion_pct"],
+            "crit_chance_j": DAILY_CRIT_BASE,  # §2 : chance de Black Flash, persiste tout le combat
         }
         gains = {"force": 0, "endurance": 0, "energie_occulte": 0, "sorts": 0}
         sort_xp = {}  # principal_id -> xp total à accorder
@@ -1183,6 +1188,24 @@ class Daily(commands.Cog):
         player_dealt = 0
         player_took = 0
 
+        # §2 : critique « Black Flash » — JOUEUR uniquement, action Attaquer (physique) uniquement (jamais
+        # PNJ, ni Bloquer/Sort/Arme/Renforcement/Potion). Le % n'est JAMAIS révélé au joueur.
+        crit_text = ""
+        if aj.get("kind") == "attaquer":
+            aj = dict(aj)  # copie locale : ne jamais muter le dict d'action de l'appelant
+            if random.randint(1, 100) <= st.get("crit_chance_j", DAILY_CRIT_BASE):
+                aj["damage"] = aj["damage"] * DAILY_CRIT_MULTIPLIER
+                st["crit_chance_j"] = DAILY_CRIT_BASE  # réussite -> retombe à 10%
+                crit_text = "\n💥 **BLACK FLASH !** Le coup critique multiplie les dégâts par 3 !"
+            else:
+                cc = st.get("crit_chance_j", DAILY_CRIT_BASE)
+                if cc == 10:
+                    st["crit_chance_j"] = 15
+                elif cc == 15:
+                    st["crit_chance_j"] = 20
+                else:
+                    st["crit_chance_j"] = cc + 1  # +1%/échec au delà de 20%
+
         # §2 / §7.2 : les DEUX attaquent -> clash sur la FORCE ACTUELLE SEULE (les PV n'entrent plus dans
         # la comparaison). f_j / f_p incluent déjà le bonus de Renforcement Maudit du tour. Égalité
         # parfaite -> le choc s'annule, aucun dégât.
@@ -1194,7 +1217,7 @@ class Daily(commands.Cog):
                 text = entete + (
                     f"⚔️ **Clash égal !** {nj} et {npnj} ont la même puissance ({f_j:,} chacun) — "
                     "le choc s'annule, aucun dégât cette fois.")
-                return text, "blue"
+                return text + crit_text, "blue"
             if f_j > f_p:
                 st["pv_p"] -= aj["damage"]
                 player_dealt = aj["damage"]
@@ -1209,7 +1232,7 @@ class Daily(commands.Cog):
             text = entete + (
                 f"🏆 **{gagnant}** remporte le clash et inflige **{deg:,}** dégâts à {perdant} !\n"
                 f"{perdant} ne riposte pas ce tour-ci.")
-            return text, couleur
+            return text + crit_text, couleur
 
         # Sinon : au plus un camp attaque -> résolution indépendante avec blocage éventuel.
         parts = []
@@ -1244,7 +1267,7 @@ class Daily(commands.Cog):
         if not aj["attacking"] and not ap["attacking"] and aj["kind"] != "potion":
             parts.append(f"🌀 **{nj}** se met en garde tandis que **{npnj}** temporise.")
 
-        text = "\n".join(parts) if parts else f"{nj} et {npnj} s'observent."
+        text = ("\n".join(parts) if parts else f"{nj} et {npnj} s'observent.") + crit_text
         if player_dealt > 0:
             color = "green"
         elif player_took > 0:
