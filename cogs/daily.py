@@ -50,7 +50,28 @@ DAILY_POTION_TABLE = {
     "S": {"nombre": 0, "pct_restaure": 0},
 }
 
-DAILY_REWARD_POINTS = {"4": 5, "3": 10, "2": 16, "1": 32, "S": 65}
+# §8 : points de stats par action réussie, selon classe ET issue du combat.
+DAILY_REWARD_POINTS = {
+    "4": {"victoire": 50, "defaite": 25},
+    "3": {"victoire": 113, "defaite": 56},
+    "2": {"victoire": 175, "defaite": 88},
+    "1": {"victoire": 238, "defaite": 119},
+    "S": {"victoire": 300, "defaite": 150},
+}
+# §7 : XP de personnage gagnée en fin de combat, selon classe ET issue.
+DAILY_XP_REWARD = {
+    "4": {"victoire": 200, "defaite": 100},
+    "3": {"victoire": 400, "defaite": 200},
+    "2": {"victoire": 700, "defaite": 350},
+    "1": {"victoire": 1100, "defaite": 550},
+    "S": {"victoire": 1700, "defaite": 850},
+}
+# §2 : effet des potions d'Énergie Occulte (absent de POTION_EFFECTS_TABLE). 4/3/2 = points fixes ;
+# 1 = 75% de la réserve max ; S = 100% de la réserve max.
+DAILY_EO_POTION_EFFECT = {
+    "4": {"eo": 500}, "3": {"eo": 1000}, "2": {"eo": 2000},
+    "1": {"eo_pct": 75}, "S": {"eo_pct": 100},
+}
 
 DAILY_DAMAGE_RATIO = 0.05  # dégâts = force_actuelle * 0.05 (1000 Force = 50 dégâts), aucun aléatoire
 
@@ -563,9 +584,22 @@ class Daily(commands.Cog):
     async def cog_load(self):
         if not self.vip_expiry_loop.is_running():
             self.vip_expiry_loop.start()
+        if not self.eo_regen_loop.is_running():
+            self.eo_regen_loop.start()
 
     async def cog_unload(self):
         self.vip_expiry_loop.cancel()
+        self.eo_regen_loop.cancel()
+
+    # §6 : régénération d'EO dans le temps (paliers de 10 min, complète en 1h), pour TOUS les personnages,
+    # en et hors combat. La régénération est aussi appliquée à la volée à l'affichage de /profil.
+    @tasks.loop(minutes=10)
+    async def eo_regen_loop(self):
+        db.regen_eo_all()
+
+    @eo_regen_loop.before_loop
+    async def _before_regen_loop(self):
+        await self.bot.wait_until_ready()
 
     # §8 : tâche planifiée d'expiration du VIP (réutilise le scheduler tasks.loop, comme les autres tâches).
     @tasks.loop(hours=6)
@@ -834,7 +868,8 @@ class Daily(commands.Cog):
                                 if DAILY_COFFRE_ACCESS.get(classe, {}).get(k))
             await channel.send(embed=discord.Embed(
                 title=f"📋 Classe {classe} sélectionnée",
-                description=(f"🎁 Récompense par action réussie : **+{DAILY_REWARD_POINTS[classe]} points**\n"
+                description=(f"🎁 Points par action réussie : **+{DAILY_REWARD_POINTS[classe]['victoire']}** "
+                             f"(victoire) / **+{DAILY_REWARD_POINTS[classe]['defaite']}** (défaite)\n"
                              f"⚔️ Adversaire : **{adv}**\n"
                              f"🎁 Coffres accessibles : {coffres}"),
                 color=PHOENIX_COLOR))
@@ -914,6 +949,7 @@ class Daily(commands.Cog):
             "bloc_j": 0, "bloc_p": 0,          # compteurs de blocage (chance dégressive)
             "potions_p": pnj["potions"], "potion_pct_p": pnj["potion_pct"],
             "crit_chance_j": DAILY_CRIT_BASE,  # §2 : chance de Black Flash, persiste tout le combat
+            "sort_bonus_j": 0,                 # bonus de dégâts de sort/arme (potion « force du sort »)
         }
         gains = {"force": 0, "endurance": 0, "energie_occulte": 0, "sorts": 0}
         sort_xp = {}  # principal_id -> xp total à accorder
@@ -1019,16 +1055,10 @@ class Daily(commands.Cog):
                 continue
 
             if act == "potion":
-                if not potions:
-                    await channel.send("Tu n'as aucune potion.")
-                    continue
-                pot = potions[0]
-                self._consume_one_potion(character_id, pot["item_id"])
-                restore = round(st["eo_max_j"] * DAILY_PLAYER_POTION_EO_PCT / 100)
-                st["eo_j"] = min(st["eo_max_j"], st["eo_j"] + restore)
-                await channel.send(
-                    f"🧪 Potion utilisée : +{restore} énergie occulte (EO : {st['eo_j']:,}/{st['eo_max_j']:,}).")
-                potions = db.get_owned_potions(character_id)
+                used = await self._use_combat_potion(channel, user, character_id, st)
+                if not used:
+                    potions = db.get_owned_potions(character_id)  # re-lecture temps réel
+                    continue  # aucune potion / annulé : redemande une action, ne consomme pas le tour
                 return {"kind": "potion", "attacking": False, "damage": 0, "dtype": None, "blocking": False}
 
             if act == "sort":
@@ -1037,8 +1067,9 @@ class Daily(commands.Cog):
                     continue  # pas de sort / annulé : redemande une action
                 st["eo_j"] -= spell["cost"]
                 gains["sorts"] += 1  # §9 : sort utilisé = +points Sorts
-                sort_xp[spell["principal_id"]] = sort_xp.get(spell["principal_id"], 0) + spell["damage"]
-                return {"kind": "sort", "attacking": True, "damage": spell["damage"], "dtype": "spell",
+                degats = spell["damage"] + st.get("sort_bonus_j", 0)  # bonus « force du sort » (potion)
+                sort_xp[spell["principal_id"]] = sort_xp.get(spell["principal_id"], 0) + degats
+                return {"kind": "sort", "attacking": True, "damage": degats, "dtype": "spell",
                         "blocking": False, "spell_name": spell["name"], "force_actuelle": f_act}
 
             if act == "arme":
@@ -1046,8 +1077,9 @@ class Daily(commands.Cog):
                 if arme is None:
                     continue  # aucune arme utilisable / annulé : redemande une action
                 st["eo_j"] -= arme["cost"]
+                degats = arme["damage"] + st.get("sort_bonus_j", 0)  # bonus « force du sort » (potion)
                 # §2 : l'arme est alimentée par l'EO -> traitée EXACTEMENT comme un sort pour le blocage.
-                return {"kind": "arme", "attacking": True, "damage": arme["damage"], "dtype": "spell",
+                return {"kind": "arme", "attacking": True, "damage": degats, "dtype": "spell",
                         "blocking": False, "spell_name": arme["name"], "force_actuelle": f_act}
 
             if act == "attaquer":
@@ -1057,6 +1089,72 @@ class Daily(commands.Cog):
             if act == "bloquer":
                 return {"kind": "bloquer", "attacking": False, "damage": 0, "dtype": None,
                         "blocking": True, "force_actuelle": f_act}
+
+    async def _use_combat_potion(self, channel, user, character_id, st):
+        """§2/§3/§4 : sélection RÉELLE parmi les potions possédées (lues EN DIRECT), application de l'effet
+        du VRAI sous-type (soin→PV, energie_occulte→EO, force→+Force du combat, force_sort→+dégâts de
+        sort/arme du combat), et consommation d'1 exemplaire (quantité re-vérifiée en temps réel).
+        Retourne True si une potion a bien été utilisée, False sinon (aucune / annulé)."""
+        from cogs.utils.coherence_check import POTION_EFFECTS_TABLE
+        potions = db.get_owned_potions(character_id)  # lecture temps réel
+        if not potions:
+            await channel.send("Tu n'as aucune potion.")
+            return False
+        # 1 seule sorte -> directe ; plusieurs -> choix numéroté (nom exact + quantité).
+        if len(potions) == 1:
+            pot = potions[0]
+        else:
+            lignes = ["🧪 Quelle potion utiliser ?"]
+            for i, p in enumerate(potions, 1):
+                lignes.append(f"{i}) {p['quantity']}x **{p['name']}**")
+            lignes.append("Réponds par le **numéro** (ou « annuler »).")
+            await channel.send("\n".join(lignes))
+            pot = None
+            while pot is None:
+                m = await self.wait_message(channel, user)
+                if m is None:
+                    return False
+                c = m.content.strip()
+                if c.lower() in ("cancel", "annuler"):
+                    return False
+                if c.isdigit() and 1 <= int(c) <= len(potions):
+                    pot = potions[int(c) - 1]
+                else:
+                    await channel.send(f"Réponds par un numéro entre 1 et {len(potions)}.")
+
+        # Revérifie la quantité EN TEMPS RÉEL juste avant de consommer (jamais une valeur en cache).
+        row = db.get_inventory_row(character_id, pot["item_id"])
+        if not row or row["quantity"] <= 0:
+            await channel.send("Cette potion n'est plus disponible.")
+            return False
+
+        ptype, classe = pot["potion_type"], pot["classe"]
+        msg = None
+        if ptype == "soin":
+            info = POTION_EFFECTS_TABLE.get("soin", {}).get(classe, {})
+            soin = round(st["pv_max_j"] * info["effet_pct"] / 100) if "effet_pct" in info else info.get("effet", 0)
+            st["pv_j"] = min(st["pv_max_j"], st["pv_j"] + soin)
+            msg = f"🧪 **{pot['name']}** : +{soin:,} PV (PV : {st['pv_j']:,}/{st['pv_max_j']:,}).".replace(",", " ")
+        elif ptype == "energie_occulte":
+            info = DAILY_EO_POTION_EFFECT.get(classe, {})
+            eo = round(st["eo_max_j"] * info["eo_pct"] / 100) if "eo_pct" in info else info.get("eo", 0)
+            st["eo_j"] = min(st["eo_max_j"], st["eo_j"] + eo)
+            msg = f"🧪 **{pot['name']}** : +{eo:,} EO (EO : {st['eo_j']:,}/{st['eo_max_j']:,}).".replace(",", " ")
+        elif ptype == "force":
+            bonus = POTION_EFFECTS_TABLE.get("force", {}).get(classe, {}).get("bonus", 0)
+            st["force_base_j"] += bonus  # +Force pour le reste du combat
+            msg = f"🧪 **{pot['name']}** : +{bonus:,} Force pour le reste du combat.".replace(",", " ")
+        elif ptype == "force_sort":
+            bonus = POTION_EFFECTS_TABLE.get("force_sort", {}).get(classe, {}).get("bonus", 0)
+            st["sort_bonus_j"] = st.get("sort_bonus_j", 0) + bonus  # +dégâts de sort/arme pour le combat
+            msg = f"🧪 **{pot['name']}** : +{bonus:,} dégâts de sort/arme pour le reste du combat.".replace(",", " ")
+        else:
+            await channel.send("Cette potion n'a pas d'effet reconnu.")
+            return False
+
+        db.inv_remove_item(character_id, pot["item_id"], 1)  # consommation réelle (supprime si 0)
+        await channel.send(msg)
+        return True
 
     async def _pick_spell(self, channel, user, character_id, st):
         """§6 : liste TEXTE (pas embed) des sorts débloqués + suggestion du meilleur ratio. Retourne le
@@ -1323,8 +1421,8 @@ class Daily(commands.Cog):
 
     # ---------- §9 : fin + récompenses ----------
     async def _finish_combat(self, channel, user, character_id, classe, st, gains, sort_xp, issue):
-        pts = DAILY_REWARD_POINTS[classe]
-        # Multiplie chaque compteur de réussite par le barème de points de la classe.
+        # §8 : points par action réussie selon la classe ET l'issue (victoire/défaite).
+        pts = DAILY_REWARD_POINTS[classe]["victoire" if issue == "victoire" else "defaite"]
         applied = {}
         for key, count in gains.items():
             if count > 0:
@@ -1334,6 +1432,9 @@ class Daily(commands.Cog):
         for principal_id, xp in sort_xp.items():
             if xp > 0:
                 await db.grant_sort_xp(principal_id, xp)
+        # §7 : XP de personnage gagnée dans tous les cas (victoire OU défaite).
+        xp_gagnee = DAILY_XP_REWARD[classe]["victoire" if issue == "victoire" else "defaite"]
+        await db.grant_character_xp(character_id, xp_gagnee)
 
         # PV/EO réels appliqués. §8 : le PV joueur affiché/enregistré est clampé à 100 minimum.
         pv_final_j = max(st["pv_j"], DAILY_PV_FLOOR)
@@ -1353,6 +1454,7 @@ class Daily(commands.Cog):
         stat_labels = {"force": "Force", "endurance": "Endurance", "energie_occulte": "Énergie occulte",
                        "sorts": "Sorts"}
         recap = "\n".join(f"• +{v} points {stat_labels[k]}" for k, v in applied.items()) or "Aucun point gagné."
+        recap += f"\n• +{xp_gagnee:,} XP".replace(",", " ")
         if issue == "victoire":
             coffres = ", ".join(DAILY_COFFRE_LABELS[k] for k in DAILY_COFFRE_KEYS
                                 if DAILY_COFFRE_ACCESS.get(classe, {}).get(k))

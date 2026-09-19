@@ -301,7 +301,8 @@ CREATE TABLE IF NOT EXISTS character_profiles (
     rct_quest_available INTEGER DEFAULT 0,
     victoires INTEGER DEFAULT 0,
     defaites INTEGER DEFAULT 0,
-    nuls INTEGER DEFAULT 0
+    nuls INTEGER DEFAULT 0,
+    last_eo_regen_at TEXT           -- §6 : dernier tick de régénération d'EO (ISO)
 );
 
 CREATE TABLE IF NOT EXISTS character_backgrounds (
@@ -830,15 +831,17 @@ def _seed_canonical_potions(conn):
         cat_id = _get_or_create_category(conn, cat_name)
         for ptype, base_nom in familles:
             for classe in ("4", "3", "2", "1", "S"):
-                nom = f"{base_nom} Classe {classe}"
-                ex = conn.execute("SELECT id FROM item_definitions WHERE name = ? COLLATE NOCASE",
-                                  (nom,)).fetchone()
+                # Existence testée par (potion_type, classe) — l'IDENTITÉ réelle d'une potion — et non par
+                # nom : évite de recréer un doublon d'une potion déjà présente sous un autre libellé.
+                ex = conn.execute(
+                    "SELECT id FROM item_definitions WHERE potion_type = ? AND classe = ?",
+                    (ptype, classe)).fetchone()
                 if ex is None:
                     lo, hi = _POTION_PRICE_RANGES[classe]
                     conn.execute(
                         "INSERT INTO item_definitions (name, description, classe, valeur_base, "
                         "categorie_id, potion_type) VALUES (?, ?, ?, ?, ?, ?)",
-                        (nom, "Potion.", classe, _r.randint(lo, hi), cat_id, ptype),
+                        (f"{base_nom} Classe {classe}", "Potion.", classe, _r.randint(lo, hi), cat_id, ptype),
                     )
 
 
@@ -869,6 +872,48 @@ def _seed_token_items(conn):
                     "VALUES (?, ?, ?, ?, ?)",
                     (nom, "Token de stat (achetable).", classe, _r.randint(lo, hi), cat_id),
                 )
+
+
+def _migrate_dedup_potions(conn):
+    """§5 : supprime les potions en double. L'IDENTITÉ d'une potion = (potion_type, classe) ; deux objets
+    partageant ce couple sont des doublons même si leur libellé diffère (« … Classe S » vs « … de classe
+    S »). Les potions sans potion_type retombent sur le dédoublonnage par nom identique. On garde le prix
+    le PLUS BAS (NULL = infini, jamais gardé si un prix existe), on fusionne les quantités possédées vers
+    le survivant, puis on supprime les doublons. Retourne (nom_conservé, prix_supprimé, prix_conservé)."""
+    rows = conn.execute(
+        "SELECT d.id, d.name, d.valeur_base, d.potion_type, d.classe FROM item_definitions d "
+        "JOIN shop_categories s ON d.categorie_id = s.id WHERE LOWER(s.name) = 'potion'"
+    ).fetchall()
+    groups = {}
+    for r in rows:
+        key = ("type", r["potion_type"], r["classe"]) if r["potion_type"] else ("nom", (r["name"] or "").strip().lower())
+        groups.setdefault(key, []).append(r)
+    report = []
+    for _key, items in groups.items():
+        if len(items) < 2:
+            continue
+        items_sorted = sorted(
+            items, key=lambda it: it["valeur_base"] if it["valeur_base"] is not None else float("inf"))
+        keep = items_sorted[0]
+        for rem in items_sorted[1:]:
+            holders = conn.execute(
+                "SELECT character_id, quantity FROM character_inventory WHERE item_id = ?", (rem["id"],)
+            ).fetchall()
+            for h in holders:
+                existing = conn.execute(
+                    "SELECT id FROM character_inventory WHERE character_id = ? AND item_id = ?",
+                    (h["character_id"], keep["id"])).fetchone()
+                if existing:
+                    conn.execute("UPDATE character_inventory SET quantity = quantity + ? WHERE id = ?",
+                                 (h["quantity"], existing["id"]))
+                    conn.execute("DELETE FROM character_inventory WHERE character_id = ? AND item_id = ?",
+                                 (h["character_id"], rem["id"]))
+                else:
+                    conn.execute("UPDATE character_inventory SET item_id = ? WHERE character_id = ? AND item_id = ?",
+                                 (keep["id"], h["character_id"], rem["id"]))
+            conn.execute("DELETE FROM item_definitions WHERE id = ?", (rem["id"],))
+            report.append((keep["name"], rem["valeur_base"], keep["valeur_base"]))
+    return report
 
 
 def get_inventory_row(character_id: int, item_id: int):
@@ -1155,6 +1200,7 @@ def _ensure_character_profiles_columns(conn):
         ("mastery_sort_level", "INTEGER DEFAULT 1"),
         ("mastery_rct_level", "INTEGER DEFAULT 1"),
         ("rct_quest_available", "INTEGER DEFAULT 0"),
+        ("last_eo_regen_at", "TEXT"),  # §6 : régénération d'EO dans le temps
     ):
         if name not in cols:
             conn.execute(f"ALTER TABLE character_profiles ADD COLUMN {name} {decl}")
@@ -1354,6 +1400,7 @@ def init_db():
         _seed_coffre_items(conn)
         _seed_canonical_potions(conn)
         _migrate_merge_eo_potion_category(conn)  # après le seed potions : fusionne l'ancienne cat. séparée
+        _migrate_dedup_potions(conn)             # §5 : supprime les doublons de nom dans « Potion »
         _seed_token_items(conn)
 
 
@@ -2121,10 +2168,10 @@ def create_profile_from_fiche(character_id: int, eo_value):
                    vitesse_level, vitesse_xp_actuel, vitesse_xp_max,
                    defense_level, defense_xp_actuel, defense_xp_max,
                    maitrise_eo_level,
-                   victoires, defaites, nuls
+                   victoires, defaites, nuls, last_eo_regen_at
                ) VALUES (?, 5000, 5000, ?, ?, 1, 0, 1000,
-                         1, 0, 1000, 1, 0, 1000, 1, 0, 1000, 1, 0, 0, 0)""",
-            (character_id, eo, eo),
+                         1, 0, 1000, 1, 0, 1000, 1, 0, 1000, 1, 0, 0, 0, ?)""",
+            (character_id, eo, eo, datetime.utcnow().isoformat()),  # §6 : amorce l'horloge de régénération
         )
 
 
@@ -3299,6 +3346,54 @@ def get_fiche_record(character_id: int):
             "SELECT character_id, eo_value FROM fiche_record WHERE character_id = ?",
             (character_id,),
         ).fetchone()
+
+
+EO_REGEN_PALIER_MINUTES = 10   # §6 : un palier toutes les 10 min
+EO_REGEN_NB_PALIERS = 6        # 6 paliers = régénération complète en 1h
+
+
+def apply_eo_regen(character_id: int):
+    """§6 : régénère l'EO d'un personnage selon le temps écoulé (paliers de 10 min, complet en 1h). Fait
+    au moins 1 palier si un intervalle complet s'est écoulé. Sans effet si EO déjà pleine. Met à jour
+    last_eo_regen_at. Sûr à appeler à tout moment (loop planifié OU affichage /profil)."""
+    now = datetime.utcnow()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT eo_actuel, eo_max, last_eo_regen_at FROM character_profiles WHERE character_id = ?",
+            (character_id,),
+        ).fetchone()
+        if row is None or row["eo_max"] <= 0 or row["eo_actuel"] >= row["eo_max"]:
+            return
+        last = None
+        if row["last_eo_regen_at"]:
+            try:
+                last = datetime.fromisoformat(row["last_eo_regen_at"])
+            except ValueError:
+                last = None
+        if last is None:
+            # Jamais initialisé : on amorce l'horloge, régénération au prochain palier.
+            conn.execute("UPDATE character_profiles SET last_eo_regen_at = ? WHERE character_id = ?",
+                         (now.isoformat(), character_id))
+            return
+        paliers = int((now - last).total_seconds() // (EO_REGEN_PALIER_MINUTES * 60))
+        if paliers < 1:
+            return
+        regen_par_palier = max(1, row["eo_max"] // EO_REGEN_NB_PALIERS)
+        nouveau = min(row["eo_max"], row["eo_actuel"] + regen_par_palier * paliers)
+        conn.execute(
+            "UPDATE character_profiles SET eo_actuel = ?, last_eo_regen_at = ? WHERE character_id = ?",
+            (nouveau, now.isoformat(), character_id),
+        )
+
+
+def regen_eo_all() -> int:
+    """Applique apply_eo_regen à tous les personnages dont l'EO n'est pas pleine. Retourne le nombre traité."""
+    with get_connection() as conn:
+        ids = [r["character_id"] for r in conn.execute(
+            "SELECT character_id FROM character_profiles WHERE eo_actuel < eo_max").fetchall()]
+    for cid in ids:
+        apply_eo_regen(cid)
+    return len(ids)
 
 
 def sync_eo_with_fiche(character_id: int):

@@ -907,9 +907,10 @@ class Profil(commands.Cog):
 
     # ---------- rendu de l'image de profil ----------
     async def _render_profile(self, character_id, guild=None) -> str:
-        # Source de vérité permanente : réaligne l'EO sur la fiche AVANT de lire character_profiles, à
-        # CHAQUE affichage (robuste aux redémarrages / personnages anciens). No-op sans réserve.
+        # Source de vérité permanente : réaligne le MAX d'EO sur la fiche, puis applique la régénération
+        # d'EO écoulée (§6) à la volée, AVANT de lire character_profiles. No-op sans réserve / EO pleine.
         db.sync_eo_with_fiche(character_id)
+        db.apply_eo_regen(character_id)
         p = db.get_or_create_profile(character_id)
         char = get_character(character_id)
         name = char["character_name"] if char else "?"

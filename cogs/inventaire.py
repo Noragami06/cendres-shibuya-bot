@@ -64,6 +64,13 @@ def get_item(item_id: int):
         return conn.execute("SELECT * FROM item_definitions WHERE id = ?", (item_id,)).fetchone()
 
 
+def _category_name(cat_id: int) -> str:
+    """Nom d'une catégorie shop par id (chaîne vide si introuvable)."""
+    with db.get_connection() as conn:
+        r = conn.execute("SELECT name FROM shop_categories WHERE id = ?", (cat_id,)).fetchone()
+    return r["name"] if r else ""
+
+
 def get_inventory_categories(character_id: int):
     """Catégories (id + nom) présentes dans l'inventaire du personnage. Le nom provient de
     shop_categories (référencé par item_definitions.categorie_id) : un renommage côté /shop se
@@ -292,6 +299,9 @@ class TradeTypeView(discord.ui.View):
 # =====================================================================
 class MainInventoryView(discord.ui.View):
     def __init__(self, character_id, user_id, is_staff, categories, has_coffres=False):
+        # has_coffres conservé pour compat d'appel ; les boutons spécifiques à une catégorie (Utiliser une
+        # potion, Ouvrir un coffre) NE sont PLUS sur cette vue racine (§9) : ils n'apparaissent QUE sur la
+        # page de la catégorie concernée (cf. InventoryPageView). Ici : uniquement les actions génériques.
         super().__init__(timeout=None)
         if categories:
             self.add_item(discord.ui.Select(
@@ -308,35 +318,38 @@ class MainInventoryView(discord.ui.View):
         self.add_item(discord.ui.Button(
             label="Vendre", emoji="💰", style=discord.ButtonStyle.success,
             custom_id=f"inv_sell:{character_id}:{user_id}", row=1))
-        self.add_item(discord.ui.Button(
-            label="Utiliser une potion", emoji="🧪", style=discord.ButtonStyle.secondary,
-            custom_id=f"inv_potion:{character_id}:{user_id}", row=1))
-        # Bouton « Ouvrir » (coffres) : visible seulement si le joueur possède au moins 1 coffre.
-        if has_coffres:
-            self.add_item(discord.ui.Button(
-                label="Ouvrir", emoji="🔓", style=discord.ButtonStyle.success,
-                custom_id=f"inv_open_coffre:{character_id}:{user_id}", row=2))
         if is_staff:
-            # La création/ajout d'objets se fait maintenant exclusivement via la commande /shop (à venir).
+            # La création/ajout d'objets se fait maintenant exclusivement via la commande /shop.
             self.add_item(discord.ui.Button(
                 label="Retirer un item", emoji="➖", style=discord.ButtonStyle.danger,
                 custom_id=f"inv_remove:{user_id}", row=2))
 
 
 class InventoryPageView(discord.ui.View):
-    """Boutons de pagination sous l'image d'inventaire (persistants). Les états activé/désactivé
-    dépendent de la page courante et du nombre total de pages."""
+    """Boutons SOUS l'image d'une catégorie précise. Pagination (si >1 page) + boutons d'action
+    SPÉCIFIQUES à la catégorie affichée (§9) : « Utiliser une potion » pour Potion, « Ouvrir » pour
+    Coffre — jamais présents ailleurs ni par défaut."""
 
-    def __init__(self, character_id, user_id, page, total_pages):
+    def __init__(self, character_id, user_id, page, total_pages, cat_name=None):
         super().__init__(timeout=None)
-        self.add_item(discord.ui.Button(
-            label="Page précédente", emoji="◀️", style=discord.ButtonStyle.secondary,
-            custom_id=f"inv_page_prev:{character_id}:{user_id}", disabled=(page <= 0),
-        ))
-        self.add_item(discord.ui.Button(
-            label="Page suivante", emoji="▶️", style=discord.ButtonStyle.secondary,
-            custom_id=f"inv_page_next:{character_id}:{user_id}", disabled=(page >= total_pages - 1),
-        ))
+        if total_pages > 1:
+            self.add_item(discord.ui.Button(
+                label="Page précédente", emoji="◀️", style=discord.ButtonStyle.secondary,
+                custom_id=f"inv_page_prev:{character_id}:{user_id}", disabled=(page <= 0),
+            ))
+            self.add_item(discord.ui.Button(
+                label="Page suivante", emoji="▶️", style=discord.ButtonStyle.secondary,
+                custom_id=f"inv_page_next:{character_id}:{user_id}", disabled=(page >= total_pages - 1),
+            ))
+        norm = (cat_name or "").strip().lower()
+        if norm == "potion":
+            self.add_item(discord.ui.Button(
+                label="Utiliser une potion", emoji="🧪", style=discord.ButtonStyle.secondary,
+                custom_id=f"inv_potion:{character_id}:{user_id}", row=1))
+        elif norm == "coffre":
+            self.add_item(discord.ui.Button(
+                label="Ouvrir", emoji="🔓", style=discord.ButtonStyle.success,
+                custom_id=f"inv_open_coffre:{character_id}:{user_id}", row=1))
 
 
 # =====================================================================
@@ -479,11 +492,11 @@ class Inventaire(commands.Cog):
         else:
             desc = "Ton inventaire est vide pour l'instant."
         embed = discord.Embed(title=f"🎒 Inventaire de {name}", description=desc, color=PHOENIX_COLOR)
-        has_coffres = bool(db.get_owned_coffres(character_id))
+        # §9 : les boutons spécifiques (potion/coffre) sont désormais rattachés à la page de leur
+        # catégorie, plus à cette vue racine. On ne passe donc plus de drapeau has_coffres.
         await channel.send(
             embed=embed,
-            view=MainInventoryView(character_id, viewer_member.id, _is_staff(viewer_member), categories,
-                                   has_coffres=has_coffres),
+            view=MainInventoryView(character_id, viewer_member.id, _is_staff(viewer_member), categories),
         )
 
     # =================================================================
@@ -559,11 +572,14 @@ class Inventaire(commands.Cog):
         if not categorie:
             return
         cat_id = int(categorie)
-        # Mémorise l'état de pagination pour ce joueur/personnage (page 0). La catégorie est
-        # désormais identifiée par son id (categorie_id), pas par un texte.
-        self._page_state[(interaction.user.id, character_id)] = {"categorie": cat_id, "page": 0}
+        cat_name = _category_name(cat_id)
+        # Mémorise l'état de pagination + le nom de catégorie (pour reconstruire les boutons contextuels).
+        self._page_state[(interaction.user.id, character_id)] = {
+            "categorie": cat_id, "page": 0, "cat_name": cat_name}
         path, total_pages, page = self._render_category_page(character_id, cat_id, 0)
-        view = InventoryPageView(character_id, interaction.user.id, page, total_pages) if total_pages > 1 else None
+        view = InventoryPageView(character_id, interaction.user.id, page, total_pages, cat_name=cat_name)
+        if not view.children:  # aucune pagination ni bouton contextuel -> pas de vue
+            view = None
         await interaction.channel.send(file=discord.File(path, filename="inventaire.png"), view=view)
         try:
             os.remove(path)
@@ -586,7 +602,9 @@ class Inventaire(commands.Cog):
         new_page = state["page"] + (1 if direction == "next" else -1)
         path, total_pages, page = self._render_category_page(character_id, state["categorie"], new_page)
         state["page"] = page
-        view = InventoryPageView(character_id, user_id, page, total_pages) if total_pages > 1 else None
+        view = InventoryPageView(character_id, user_id, page, total_pages, cat_name=state.get("cat_name"))
+        if not view.children:
+            view = None
         await interaction.response.edit_message(
             attachments=[discord.File(path, filename="inventaire.png")], view=view
         )
