@@ -48,6 +48,7 @@ async def setup_hook():
     await bot.load_extension("cogs.ordre")
     await bot.load_extension("cogs.reservation")
     await bot.load_extension("cogs.welcome")
+    await bot.load_extension("cogs.utils_staff")
 
 
 @bot.event
