@@ -203,9 +203,20 @@ DAILY_MAX_ADVERSAIRE_REROLL = 3
 
 DAILY_PV_FLOOR = 100  # le combat s'arrête dès qu'un camp atteint 100 PV ou moins
 
-# §1 : PV du PNJ calculé sur le « burst » du joueur (évite le one-shot), remplace pv_pct pour le PV seul.
-DAILY_DIFFICULTY_GROUP = {"4": "facile", "3": "moyen", "2": "moyen", "1": "difficile", "S": "difficile"}
-DAILY_PV_MULTIPLIER = {"facile": 4, "moyen": 7, "difficile": 12}
+# §1 : PV du PNJ = burst du joueur × multiplicateur de référence de la classe visée × facteur d'écart de
+# classe RP (gap = classe visée − classe RP du joueur). Formule validée par simulation. Remplace
+# complètement l'ancien couple DAILY_PV_MULTIPLIER / DAILY_DIFFICULTY_GROUP (obsolètes, supprimés).
+DAILY_PV_REF_MULTIPLIER = {"4": 25, "3": 23, "2": 17, "1": 15, "S": 11}
+DAILY_GAP_FACTOR = {-4: 0.45, -3: 0.55, -2: 0.65, -1: 0.82, 0: 1.00, 1: 1.42, 2: 1.68, 3: 1.85, 4: 2.00}
+DAILY_CLASSE_RANK = {"4": 0, "3": 1, "2": 2, "1": 3, "S": 4}
+# Rôles de classe RP (attribués par le staff). Servent à déterminer la classe RP réelle du personnage.
+DAILY_ROLE_CLASSE_RP = {
+    "4": 1551331559418896405,
+    "3": 1551331567752708226,
+    "2": 1551331577215320165,
+    "1": 1551331581799440474,
+    "S": 1551331602204856480,
+}
 
 # §8 : accès VIP 15 jours.
 VIP_ROLE_ID = 1549049286329761924
@@ -526,6 +537,27 @@ async def _remove_role_real_or_virtual(guild, char, role_id, reason):
                 print(f"[daily] Impossible de retirer le rôle {role_id} de {char['user_id']}.")
     else:
         db.remove_virtual_role(char["id"], role_id)
+
+
+async def get_player_rp_classe(guild, character_id):
+    """§1 : détecte la classe RP du personnage (rôle réel si slot 1, virtuel si slot 2/3), du plus haut
+    (S) au plus bas (4). Retourne None si aucun rôle de classe RP n'est détecté. Réutilise la méthode
+    standard character_has_role (réel slot 1 / virtuel slots 2-3)."""
+    from cogs.profil import character_has_role
+    member = None
+    char = db.get_validated_character_by_id(character_id)
+    if char is not None and guild is not None:
+        member = guild.get_member(char["user_id"])
+        if member is None:
+            try:
+                member = await guild.fetch_member(char["user_id"])
+            except (discord.NotFound, discord.HTTPException):
+                member = None
+    for classe in ["S", "1", "2", "3", "4"]:
+        if await character_has_role(guild, member, character_id, DAILY_ROLE_CLASSE_RP[classe]):
+            return classe
+    return None
+
 
 # IA du PNJ : pondération des actions par classe (jamais 100% d'un seul choix). Plus la classe est haute,
 # plus l'IA privilégie l'attaque et le renforcement.
@@ -950,18 +982,34 @@ class Daily(commands.Cog):
     # =================================================================
     async def _difficulty_and_preview(self, channel, user, character_id):
         """Retourne (pnj, classe) prêt au combat, ou (None, None) si annulé."""
+        guild = getattr(channel, "guild", None)
+        # §1 : une classe RP (attribuée par le staff) est OBLIGATOIRE pour jouer, et conditionne les
+        # difficultés accessibles (l'écart de classe « gap » doit rester < 3).
+        player_rp_classe = await get_player_rp_classe(guild, character_id)
+        if player_rp_classe is None:
+            await channel.send(
+                "❌ Tu dois d'abord obtenir une classe RP (attribuée par le staff) avant de pouvoir "
+                "utiliser /daily.")
+            return None, None
         player_stats = self._player_stats(character_id)
         while True:
-            # §2 : choix de la difficulté (réponse 1-5).
+            # §1 : choix de la difficulté — seules les classes dont le gap reste < 3 sont proposées
+            # (les difficultés hors de portée sont RETIRÉES de la liste, jamais présentées au clic).
+            allowed = [c for c in CLASSES_ORDRE
+                       if DAILY_CLASSE_RANK[c] - DAILY_CLASSE_RANK[player_rp_classe] < 3]
+            lignes = "\n".join(f"**{i}.** Classe {c}" for i, c in enumerate(allowed, 1))
             await channel.send(embed=discord.Embed(
                 title="🎯 Choisis la difficulté",
-                description="**1.** Classe 4\n**2.** Classe 3\n**3.** Classe 2\n**4.** Classe 1\n**5.** Classe S",
+                description=f"Ta classe RP actuelle : **Classe {player_rp_classe}**\n\n{lignes}",
                 color=PHOENIX_COLOR))
-            choix = await self._ask_int(channel, user, "Réponds par un numéro de 1 à 5 (ou « annuler »).", 1, 5)
+            choix = await self._ask_int(
+                channel, user, f"Réponds par un numéro de 1 à {len(allowed)} (ou « annuler »).",
+                1, len(allowed))
             if choix is None:
                 await channel.send("⏳ /daily annulé.")
                 return None, None
-            classe = CLASSES_ORDRE[choix - 1]
+            classe = allowed[choix - 1]
+            gap = DAILY_CLASSE_RANK[classe] - DAILY_CLASSE_RANK[player_rp_classe]
 
             # §2 : embed avantages / malus.
             if classe in ("4", "3"):
@@ -980,8 +1028,9 @@ class Daily(commands.Cog):
                              f"🎁 Coffres accessibles : {coffres}"),
                 color=PHOENIX_COLOR))
 
-            # §1+§3-4 : PV du PNJ basé sur le burst du joueur (anti one-shot), reste des stats en %.
-            pv_override = self._burst_pv_override(character_id, player_stats, classe)
+            # §1+§3-4 : PV du PNJ basé sur le burst du joueur (anti one-shot) × réf. de classe × gap, reste
+            # des stats en % (DAILY_STATS_TABLE, inchangé).
+            pv_override = self._burst_pv_override(character_id, player_stats, classe, gap)
             pnj = generate_pnj(player_stats, classe, pv_override=pv_override)
             rerolls = 0
             while True:
@@ -1009,15 +1058,17 @@ class Daily(commands.Cog):
                 rerolls += 1
                 pnj = generate_pnj(player_stats, classe, pv_override=pv_override)
 
-    def _burst_pv_override(self, character_id, player_stats, classe):
-        """§1 : PV du PNJ = burst_power_joueur × multiplicateur de difficulté. burst = max(dégât physique,
-        meilleur dégât de sort secondaire débloqué, meilleur dégât d'arme maudite)."""
+    def _burst_pv_override(self, character_id, player_stats, classe, gap):
+        """§1 : PV du PNJ = burst_power_joueur × DAILY_PV_REF_MULTIPLIER[classe visée] × DAILY_GAP_FACTOR[gap].
+        burst = max(dégât physique, meilleur dégât de sort secondaire débloqué, meilleur dégât d'arme
+        maudite). gap est borné à [-4, 4] pour l'accès à la table de facteurs."""
         phys = player_stats["force"] * DAILY_DAMAGE_RATIO
         best_spell = max((s["damage"] for s in self._unlocked_spells(character_id, player_stats["eo"])),
                          default=0)
         best_arme = max((a["degats_actuel"] or 0 for a in db.get_character_armes(character_id)), default=0)
         burst = max(phys, best_spell, best_arme)
-        return round(burst * DAILY_PV_MULTIPLIER[DAILY_DIFFICULTY_GROUP[classe]])
+        factor = DAILY_GAP_FACTOR[max(-4, min(4, gap))]
+        return round(burst * DAILY_PV_REF_MULTIPLIER[classe] * factor)
 
     async def _send_pnj_pillow(self, channel, pnj):
         import os
@@ -1560,6 +1611,10 @@ class Daily(commands.Cog):
             if count > 0:
                 db.add_stat_base_pts(character_id, key, count * pts)
                 applied[key] = count * pts
+        # §2 : bonus UNIQUE de points à répartir librement (même barème que les points par action, mais
+        # appliqué une seule fois — pas par action). Corrige l'absence de gain de points libres.
+        bonus_libre = pts
+        db.add_points_restants(character_id, bonus_libre)
         # XP de Maîtrise Sort = somme des dégâts infligés par chaque sort (par principal concerné).
         for principal_id, xp in sort_xp.items():
             if xp > 0:
@@ -1587,6 +1642,7 @@ class Daily(commands.Cog):
                        "sorts": "Sorts"}
         recap = "\n".join(f"• +{v} points {stat_labels[k]}" for k, v in applied.items()) or "Aucun point gagné."
         recap += f"\n• +{xp_gagnee:,} XP".replace(",", " ")
+        recap += f"\n🎁 +{bonus_libre} points à répartir librement"
         if issue == "victoire":
             coffres = ", ".join(DAILY_COFFRE_LABELS[k] for k in DAILY_COFFRE_KEYS
                                 if DAILY_COFFRE_ACCESS.get(classe, {}).get(k))

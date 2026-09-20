@@ -97,6 +97,15 @@ def _is_staff(member) -> bool:
     return any(r.id == FICHE_STAFF_ROLE_ID for r in getattr(member, "roles", []))
 
 
+def _parse_profil_todo_cid(cid):
+    """Parse un custom_id de section 'profil_todo_xxx:{character_id}:{user_id}[:s]'. Le suffixe ':s'
+    marque le MODE SPECTATEUR (lecture seule sur le profil d'un autre). Retourne
+    (character_id, user_id, spectator)."""
+    parts = cid.split(":")
+    spectator = len(parts) >= 4 and parts[3] == "s"
+    return int(parts[1]), int(parts[2]), spectator
+
+
 def _tmp_profile(prefix: str) -> str:
     os.makedirs(PROFILE_IMG_DIR, exist_ok=True)
     return os.path.join(PROFILE_IMG_DIR, f"{prefix}_{uuid.uuid4().hex}.png")
@@ -663,6 +672,24 @@ class ArmeConfirmView(discord.ui.View):
 # =====================================================================
 # VUES PERSISTANTES (custom_id dynamiques -> listener on_interaction)
 # =====================================================================
+class ProfilEntryView(discord.ui.View):
+    """Point d'entrée de /profil : voir son propre profil, voir celui d'un autre (lecture seule), et —
+    pour le staff uniquement — accéder au menu de gestion existant."""
+
+    def __init__(self, user_id: int, is_staff: bool):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(
+            label="Voir mon profil", emoji="👤", style=discord.ButtonStyle.primary,
+            custom_id=f"profil_view_self:{user_id}"))
+        self.add_item(discord.ui.Button(
+            label="Voir le profil d'un autre", emoji="🔍", style=discord.ButtonStyle.secondary,
+            custom_id=f"profil_view_other:{user_id}"))
+        if is_staff:
+            self.add_item(discord.ui.Button(
+                label="Gérer les profils", emoji="🛠️", style=discord.ButtonStyle.danger,
+                custom_id=f"profil_manage:{user_id}"))
+
+
 class ProfilStaffChoiceView(discord.ui.View):
     def __init__(self, user_id: int):
         super().__init__(timeout=None)
@@ -675,10 +702,34 @@ class ProfilStaffChoiceView(discord.ui.View):
 
 
 class ProfileView(discord.ui.View):
-    """Boutons persistants sous l'image de profil (mode consultation joueur)."""
+    """Boutons persistants sous l'image de profil.
+    - mode NORMAL (son propre profil / gestion) : tous les boutons (fond + sections éditables).
+    - mode SPECTATEUR (profil d'un autre) : LECTURE SEULE — seules les sections consultables
+      Stats / Relation / Technique sont proposées (suffixe ':s'), sans aucun bouton d'édition/staff.
+    §4 : le bouton « 🎭 Voir les rôles » (custom_id profil_allroles) n'apparaît que si le propriétaire
+    du personnage possède au moins 2 personnages (show_roles)."""
 
-    def __init__(self, character_id: int, user_id: int, slot_number: int):
+    # Sections consultables en lecture seule (mode spectateur) : Stats / Relation / Technique.
+    SPECTATOR_SECTIONS = [("stats", "📊 Stats"), ("relation", "🤝 Relation"), ("technique", "⚡ Technique")]
+
+    def __init__(self, character_id: int, user_id: int, slot_number: int,
+                 spectator: bool = False, show_roles: bool = False):
         super().__init__(timeout=None)
+        if spectator:
+            if show_roles:
+                self.add_item(discord.ui.Button(
+                    label="Voir les rôles", emoji="🎭", style=discord.ButtonStyle.secondary,
+                    custom_id=f"profil_allroles:{character_id}:{user_id}", row=0))
+            # Sections consultables uniquement (suffixe ':s' -> handlers en lecture seule).
+            for i, (key, label) in enumerate(self.SPECTATOR_SECTIONS):
+                self.add_item(discord.ui.Button(
+                    label=label, style=discord.ButtonStyle.secondary,
+                    custom_id=f"profil_todo_{key}:{character_id}:{user_id}:s", row=1))
+            return
+        if show_roles:
+            self.add_item(discord.ui.Button(
+                label="Voir les rôles", emoji="🎭", style=discord.ButtonStyle.secondary,
+                custom_id=f"profil_allroles:{character_id}:{user_id}", row=0))
         if slot_number in (2, 3):
             self.add_item(discord.ui.Button(
                 label="Voir rôles", emoji="🎭", style=discord.ButtonStyle.secondary,
@@ -960,13 +1011,17 @@ class Profil(commands.Cog):
         )
         return path
 
-    async def send_profile(self, channel, character_id, user_id):
+    async def send_profile(self, channel, character_id, user_id, spectator=False):
         char = get_character(character_id)
         slot = char["slot_number"] if char else 1
+        # §4 : le bouton « Voir les rôles » n'apparaît que si le PROPRIÉTAIRE du personnage a >= 2 persos.
+        show_roles = False
+        if char is not None:
+            show_roles = len(get_characters(char["user_id"], char["guild_id"])) >= 2
         path = await self._render_profile(character_id, getattr(channel, "guild", None))
         await channel.send(
             file=discord.File(path, filename="profil.png"),
-            view=ProfileView(character_id, user_id, slot),
+            view=ProfileView(character_id, user_id, slot, spectator=spectator, show_roles=show_roles),
         )
         try:
             os.remove(path)
@@ -1068,9 +1123,10 @@ class Profil(commands.Cog):
         )
         return path, s["points_restants"]
 
-    async def send_stats(self, channel, character_id, user_id):
+    async def send_stats(self, channel, character_id, user_id, spectator=False):
         path, points_restants = await self._render_stats(character_id, getattr(channel, "guild", None))
-        view = StatsPageView(character_id, user_id) if points_restants > 0 else None
+        # Mode spectateur : aucun bouton « Répartir les points » (lecture seule).
+        view = None if spectator else (StatsPageView(character_id, user_id) if points_restants > 0 else None)
         await channel.send(file=discord.File(path, filename="stats.png"), view=view)
         try:
             os.remove(path)
@@ -1137,10 +1193,18 @@ class Profil(commands.Cog):
             pass
 
     async def handle_technique(self, interaction, cid):
-        _, character_id, user_id = cid.split(":")  # profil_todo_technique:{cid}:{uid}
-        character_id, user_id = int(character_id), int(user_id)
+        character_id, user_id, spectator = _parse_profil_todo_cid(cid)  # profil_todo_technique:{cid}:{uid}[:s]
         if interaction.user.id != user_id:
             await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
+            return
+        # Mode spectateur : affichage du pillow d'ensemble si des sorts existent, jamais le flux de création.
+        if spectator:
+            if db.count_character_sorts(character_id) > 0:
+                await interaction.response.defer()
+                await self.send_technique(interaction.channel, character_id, user_id)
+            else:
+                await interaction.response.send_message(
+                    "Ce personnage n'a pas encore de technique.", ephemeral=True)
             return
         # À l'entrée : si le personnage a déjà au moins un sort principal, on affiche le pillow d'ensemble.
         # Sinon, on lance le flux de CRÉATION guidée (validation staff préalable).
@@ -2297,16 +2361,9 @@ class Profil(commands.Cog):
     # ---------- commande ----------
     @app_commands.command(name="profil", description="Consulte un profil de personnage")
     async def profil(self, interaction: discord.Interaction):
-        if _is_staff(interaction.user):
-            embed = discord.Embed(title="👤 Profil", description="Que veux tu faire ?", color=PHOENIX_COLOR)
-            await interaction.response.send_message(embed=embed, view=ProfilStaffChoiceView(interaction.user.id))
-        else:
-            await interaction.response.send_message("👤 Ouverture du profil…", ephemeral=True)
-            character_id = await self.select_character_await(
-                interaction.channel, interaction.user, interaction.user.id, "Tu n'as aucun personnage validé."
-            )
-            if character_id is not None:
-                await self.send_profile(interaction.channel, character_id, interaction.user.id)
+        embed = discord.Embed(title="👤 Profil", description="Que veux tu faire ?", color=PHOENIX_COLOR)
+        await interaction.response.send_message(
+            embed=embed, view=ProfilEntryView(interaction.user.id, _is_staff(interaction.user)))
 
     # =================================================================
     # /technique (STAFF) — conversion des coûts en % vers des points fixes d'EO
@@ -2495,7 +2552,15 @@ class Profil(commands.Cog):
         if interaction.type != discord.InteractionType.component:
             return
         cid = interaction.data.get("custom_id", "")
-        if cid.startswith("profil_self:"):
+        if cid.startswith("profil_view_self:"):
+            await self.handle_view_self(interaction, cid)
+        elif cid.startswith("profil_view_other:"):
+            await self.handle_view_other(interaction, cid)
+        elif cid.startswith("profil_manage:"):
+            await self.handle_manage(interaction, cid)
+        elif cid.startswith("profil_allroles:"):
+            await self.handle_allroles(interaction, cid)
+        elif cid.startswith("profil_self:"):
             await self.handle_self(interaction, cid)
         elif cid.startswith("profil_other:"):
             await self.handle_other(interaction, cid)
@@ -2541,6 +2606,93 @@ class Profil(commands.Cog):
             await interaction.response.send_message(
                 "🔧 Cette section n'est pas encore développée.", ephemeral=True
             )
+
+    # =================================================================
+    # NOUVEAU POINT D'ENTRÉE /profil : voir son profil / celui d'un autre / gérer (staff)
+    # =================================================================
+    async def handle_view_self(self, interaction, cid):
+        """« 👤 Voir mon profil » : un seul perso -> pillow direct ; plusieurs -> sélection puis pillow."""
+        user_id = int(cid.split(":")[1])
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce panneau ne t'appartient pas.", ephemeral=True)
+            return
+        await interaction.response.send_message("👤 Ouverture de ton profil…", ephemeral=True)
+        character_id = await self.select_character_await(
+            interaction.channel, interaction.user, interaction.user.id, "Tu n'as aucun personnage validé."
+        )
+        if character_id is not None:
+            await self.send_profile(interaction.channel, character_id, interaction.user.id)
+
+    async def handle_view_other(self, interaction, cid):
+        """« 🔍 Voir le profil d'un autre » : mention/ID -> personnages validés -> pillow en LECTURE SEULE
+        (mode spectateur). Aucune action d'édition/staff n'est accessible depuis cette entrée."""
+        user_id = int(cid.split(":")[1])
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Ce panneau ne t'appartient pas.", ephemeral=True)
+            return
+        if not self._acquire(user_id):
+            await interaction.response.send_message(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True)
+            return
+        character_id = None
+        try:
+            await interaction.response.send_message("🔍 Consultation d'un profil…", ephemeral=True)
+            channel = interaction.channel
+            await channel.send("Mentionne le joueur ou donne son **ID** dont tu veux voir le profil.")
+            target = None
+            while target is None:
+                m = await self.wait_message(channel, interaction.user)
+                if m is None:
+                    await channel.send("⏳ Annulé.")
+                    return
+                if m.mentions:
+                    target = m.mentions[0]
+                    break
+                raw = m.content.strip()
+                if raw.isdigit():
+                    target = channel.guild.get_member(int(raw))
+                    if target is None:
+                        try:
+                            target = await channel.guild.fetch_member(int(raw))
+                        except (discord.NotFound, discord.HTTPException):
+                            target = None
+                    if target is None:
+                        await channel.send("❌ Aucun membre trouvé avec cet ID. Réessaie (mention ou ID).")
+                else:
+                    await channel.send("Merci de **mentionner** un joueur ou de donner son **ID**.")
+            character_id = await self.select_character_await(
+                channel, target, interaction.user.id, "❌ Ce joueur n'a aucun personnage validé."
+            )
+        finally:
+            self._release(user_id)
+        if character_id is not None:
+            await self.send_profile(interaction.channel, character_id, interaction.user.id, spectator=True)
+
+    async def handle_manage(self, interaction, cid):
+        """« 🛠️ Gérer les profils » (staff uniquement) : ouvre le menu de gestion existant (inchangé)."""
+        user_id = int(cid.split(":")[1])
+        if interaction.user.id != user_id or not _is_staff(interaction.user):
+            await interaction.response.send_message("Action réservée au staff.", ephemeral=True)
+            return
+        embed = discord.Embed(title="🛠️ Gestion des profils", description="Que veux tu faire ?",
+                              color=PHOENIX_COLOR)
+        await interaction.response.send_message(embed=embed, view=ProfilStaffChoiceView(interaction.user.id),
+                                                ephemeral=True)
+
+    async def handle_allroles(self, interaction, cid):
+        """§4 : « 🎭 Voir les rôles » — liste, pour CHAQUE personnage du propriétaire (tous slots), ses
+        rôles (réels slot 1 / virtuels slots 2-3) en mentions. Lecture seule, consultable par n'importe
+        qui. Réutilise le même constructeur que le DM de retour de joueur."""
+        from cogs.depart import _build_departure_roles_lines
+        character_id = int(cid.split(":")[1])
+        char = get_character(character_id)
+        if char is None:
+            await interaction.response.send_message("Ce personnage n'existe plus.", ephemeral=True)
+            return
+        lines = _build_departure_roles_lines(char["user_id"], char["guild_id"])
+        embed = discord.Embed(
+            title="🎭 Rôles des personnages", description=lines or "_(aucun rôle)_", color=PHOENIX_COLOR)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     async def handle_self(self, interaction, cid):
         user_id = int(cid.split(":")[1])
@@ -2641,12 +2793,16 @@ class Profil(commands.Cog):
         clamped = max(1, min(page, total_pages))
         return path, total_pages, clamped
 
-    async def send_relations(self, channel, character_id, user_id, page=1):
-        """Génère et envoie la page Relations d'un personnage, avec les boutons persistants
-        (pagination + créer / retirer). user_id = joueur autorisé à utiliser ces boutons (le
-        propriétaire du personnage affiché)."""
+    async def send_relations(self, channel, character_id, user_id, page=1, spectator=False):
+        """Génère et envoie la page Relations d'un personnage. En mode NORMAL : boutons persistants
+        (pagination + créer / retirer), user_id = propriétaire autorisé. En mode SPECTATEUR : page 1
+        seule, AUCUN bouton (lecture seule)."""
         path, total_pages, clamped = await self._render_relations(character_id, page)
-        view = RelationsPageView(character_id, user_id, clamped, total_pages, db.has_relations(character_id))
+        if spectator:
+            view = None
+        else:
+            view = RelationsPageView(character_id, user_id, clamped, total_pages,
+                                     db.has_relations(character_id))
         await channel.send(file=discord.File(path, filename="relations.png"), view=view)
         try:
             os.remove(path)
@@ -2654,13 +2810,12 @@ class Profil(commands.Cog):
             pass
 
     async def handle_relations(self, interaction, cid):
-        _, character_id, user_id = cid.split(":")  # profil_todo_relation:{cid}:{uid}
-        character_id, user_id = int(character_id), int(user_id)
+        character_id, user_id, spectator = _parse_profil_todo_cid(cid)  # profil_todo_relation:{cid}:{uid}[:s]
         if interaction.user.id != user_id:
             await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
             return
         await interaction.response.defer()
-        await self.send_relations(interaction.channel, character_id, user_id, page=1)
+        await self.send_relations(interaction.channel, character_id, user_id, page=1, spectator=spectator)
 
     async def handle_rel_page(self, interaction, cid, direction):
         _, character_id, user_id, page = cid.split(":")
@@ -2987,13 +3142,12 @@ class Profil(commands.Cog):
     # PAGE STATS + RÉPARTITION (joueur)
     # =================================================================
     async def handle_stats(self, interaction, cid):
-        _, character_id, user_id = cid.split(":")  # profil_todo_stats:{cid}:{uid}
-        character_id, user_id = int(character_id), int(user_id)
+        character_id, user_id, spectator = _parse_profil_todo_cid(cid)  # profil_todo_stats:{cid}:{uid}[:s]
         if interaction.user.id != user_id:
             await interaction.response.send_message("Ce panneau n'est pas le tien.", ephemeral=True)
             return
         await interaction.response.defer()
-        await self.send_stats(interaction.channel, character_id, user_id)
+        await self.send_stats(interaction.channel, character_id, user_id, spectator=spectator)
 
     async def handle_repartir(self, interaction, cid):
         _, character_id, user_id = cid.split(":")
