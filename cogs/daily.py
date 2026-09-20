@@ -569,6 +569,11 @@ DAILY_PNJ_WEIGHTS = {
     "S": {"attaquer": 70, "bloquer": 10, "renforcement": 20},
 }
 
+# Renforcement maudit du PNJ : le bonus de Force PONCTUEL (ce tour uniquement) est borné à ce pourcentage
+# de sa Force de BASE. Empêche l'explosion : l'EO du PNJ est sur une échelle sans commune mesure avec la
+# Force (millions vs milliers), donc on ne pioche JAMAIS un montant d'EO brut à ajouter tel quel à la Force.
+DAILY_PNJ_RENFORT_MAX_PCT = 50
+
 # Potion du JOUEUR en combat : le système de potions existant (soin/force/force_sort) n'a pas de potion
 # « restaure EO ». Décision provisoire documentée : utiliser une potion possédée en consomme 1 et restaure
 # l'EO d'un pourcentage de l'EO max. (À réconcilier si une vraie potion d'EO est ajoutée plus tard.)
@@ -1424,7 +1429,11 @@ class Daily(commands.Cog):
         bonus_force = 0
         choix = weighted_pick(DAILY_PNJ_WEIGHTS[classe])
         if choix == "renforcement" and st["eo_p"] > 0:
-            montant = random.randint(1, st["eo_p"])
+            # Correctif (anti-explosion) : le renfort est un bonus PONCTUEL de CE tour uniquement, borné à
+            # une fraction raisonnable de la Force de BASE du PNJ — jamais un montant d'EO brut (échelle
+            # sans commune mesure). Coût en EO = bonus tiré, plafonné à l'EO réellement disponible.
+            bonus_cap = min(st["eo_p"], max(1, round(st["force_base_p"] * DAILY_PNJ_RENFORT_MAX_PCT / 100)))
+            montant = random.randint(1, bonus_cap)
             st["eo_p"] -= montant
             bonus_force = montant
             # Après renforcement (ne consomme pas le tour) : attaquer ou bloquer.
@@ -1473,19 +1482,30 @@ class Daily(commands.Cog):
                 else:
                     st["crit_chance_j"] = cc + 1  # +1%/échec au delà de 20%
 
-        # §2 / §7.2 : les DEUX attaquent -> clash sur la FORCE ACTUELLE SEULE (les PV n'entrent plus dans
-        # la comparaison). f_j / f_p incluent déjà le bonus de Renforcement Maudit du tour. Égalité
-        # parfaite -> le choc s'annule, aucun dégât.
-        if aj["attacking"] and ap["attacking"]:
+        # §2 (correctif) : le CLASH ne se déclenche QUE si les DEUX camps font une attaque PHYSIQUE pure
+        # (« Attaquer »). Un Sort / une Arme maudite (kind "sort"/"arme") ne déclenche JAMAIS de clash :
+        # il tombe dans la résolution indépendante ci-dessous. Le PNJ ne fait jamais de sort, donc tester
+        # kind == "attaquer" des deux côtés est exact et suffisant. Comparaison sur la FORCE ACTUELLE SEULE
+        # (f_j / f_p incluent déjà le bonus de Renforcement Maudit du tour) ; égalité -> le choc s'annule.
+        if aj["kind"] == "attaquer" and ap["kind"] == "attaquer":
             entete = ("⚔️ **Les deux camps attaquent !**\n\n"
                       f"**{nj}** : **{f_j:,} de Force**\n"
                       f"**{npnj}** : **{f_p:,} de Force**\n\n")
-            if f_j == f_p:
+            # §3 : un critique (Black Flash) remporte AUTOMATIQUEMENT le clash, quelle que soit la Force du
+            # PNJ (même si f_p > f_j). Dégâts ×10 déjà appliqués au dict aj, imblocables. Le PNJ ne riposte
+            # pas, exactement comme une victoire de clash normale.
+            if crit_reussi:
+                st["pv_p"] -= aj["damage"]
+                player_dealt = aj["damage"]
+                gains["force"] += 1
+                gagnant, perdant, deg = nj, npnj, aj["damage"]
+                couleur = "green"
+            elif f_j == f_p:
                 text = entete + (
                     f"⚔️ **Clash égal !** {nj} et {npnj} ont la même puissance ({f_j:,} chacun) — "
                     "le choc s'annule, aucun dégât cette fois.")
                 return text + crit_text, "blue", crit_reussi
-            if f_j > f_p:
+            elif f_j > f_p:
                 st["pv_p"] -= aj["damage"]
                 player_dealt = aj["damage"]
                 gains["force"] += 1
