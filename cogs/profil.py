@@ -962,6 +962,7 @@ class Profil(commands.Cog):
         # d'EO écoulée (§6) à la volée, AVANT de lire character_profiles. No-op sans réserve / EO pleine.
         db.sync_eo_with_fiche(character_id)
         db.apply_eo_regen(character_id)
+        db.apply_pv_regen(character_id)  # régénération des PV à la volée (même mécanisme que l'EO)
         p = db.get_or_create_profile(character_id)
         char = get_character(character_id)
         name = char["character_name"] if char else "?"

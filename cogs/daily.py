@@ -734,11 +734,12 @@ class Daily(commands.Cog):
         self.vip_expiry_loop.cancel()
         self.eo_regen_loop.cancel()
 
-    # §6 : régénération d'EO dans le temps (paliers de 10 min, complète en 1h), pour TOUS les personnages,
-    # en et hors combat. La régénération est aussi appliquée à la volée à l'affichage de /profil.
+    # §6 : régénération d'EO ET des PV dans le temps (paliers de 10 min, complète en 1h), pour TOUS les
+    # personnages, en et hors combat. Les deux sont aussi appliquées à la volée à l'affichage de /profil.
     @tasks.loop(minutes=10)
     async def eo_regen_loop(self):
         db.regen_eo_all()
+        db.pv_regen_all()  # même boucle : régénération des PV (même mécanisme que l'EO)
 
     @eo_regen_loop.before_loop
     async def _before_regen_loop(self):
@@ -1226,11 +1227,12 @@ class Daily(commands.Cog):
                 continue
 
             if act == "potion":
-                used = await self._use_combat_potion(channel, user, character_id, st)
-                if not used:
-                    potions = db.get_owned_potions(character_id)  # re-lecture temps réel
-                    continue  # aucune potion / annulé : redemande une action, ne consomme pas le tour
-                return {"kind": "potion", "attacking": False, "damage": 0, "dtype": None, "blocking": False}
+                # §5 : une potion NE consomme JAMAIS le tour (exactement comme le Renforcement Maudit).
+                # On applique l'effet (si une potion est bien utilisée), on relit l'inventaire en temps
+                # réel puis on REDEMANDE l'action — le joueur peut donc enchaîner plusieurs potions.
+                await self._use_combat_potion(channel, user, character_id, st)
+                potions = db.get_owned_potions(character_id)  # re-lecture temps réel (quantités à jour)
+                continue
 
             if act == "sort":
                 spell = await self._pick_spell(channel, user, character_id, st)

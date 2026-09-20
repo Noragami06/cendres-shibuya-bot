@@ -302,7 +302,8 @@ CREATE TABLE IF NOT EXISTS character_profiles (
     victoires INTEGER DEFAULT 0,
     defaites INTEGER DEFAULT 0,
     nuls INTEGER DEFAULT 0,
-    last_eo_regen_at TEXT           -- §6 : dernier tick de régénération d'EO (ISO)
+    last_eo_regen_at TEXT,          -- §6 : dernier tick de régénération d'EO (ISO)
+    last_pv_regen_at TEXT           -- dernier tick de régénération des PV (ISO), même mécanisme que l'EO
 );
 
 CREATE TABLE IF NOT EXISTS character_backgrounds (
@@ -1201,6 +1202,7 @@ def _ensure_character_profiles_columns(conn):
         ("mastery_rct_level", "INTEGER DEFAULT 1"),
         ("rct_quest_available", "INTEGER DEFAULT 0"),
         ("last_eo_regen_at", "TEXT"),  # §6 : régénération d'EO dans le temps
+        ("last_pv_regen_at", "TEXT"),  # régénération des PV dans le temps (même mécanisme que l'EO)
     ):
         if name not in cols:
             conn.execute(f"ALTER TABLE character_profiles ADD COLUMN {name} {decl}")
@@ -2168,10 +2170,11 @@ def create_profile_from_fiche(character_id: int, eo_value):
                    vitesse_level, vitesse_xp_actuel, vitesse_xp_max,
                    defense_level, defense_xp_actuel, defense_xp_max,
                    maitrise_eo_level,
-                   victoires, defaites, nuls, last_eo_regen_at
+                   victoires, defaites, nuls, last_eo_regen_at, last_pv_regen_at
                ) VALUES (?, 5000, 5000, ?, ?, 1, 0, 1000,
-                         1, 0, 1000, 1, 0, 1000, 1, 0, 1000, 1, 0, 0, 0, ?)""",
-            (character_id, eo, eo, datetime.utcnow().isoformat()),  # §6 : amorce l'horloge de régénération
+                         1, 0, 1000, 1, 0, 1000, 1, 0, 1000, 1, 0, 0, 0, ?, ?)""",
+            # Amorce les DEUX horloges de régénération (EO §6 + PV) à la création de la fiche.
+            (character_id, eo, eo, datetime.utcnow().isoformat(), datetime.utcnow().isoformat()),
         )
 
 
@@ -3393,6 +3396,56 @@ def regen_eo_all() -> int:
             "SELECT character_id FROM character_profiles WHERE eo_actuel < eo_max").fetchall()]
     for cid in ids:
         apply_eo_regen(cid)
+    return len(ids)
+
+
+def apply_pv_regen(character_id: int):
+    """Régénère les PV d'un personnage selon le temps écoulé (paliers de 10 min, complet en 1h, soit
+    6 paliers), en et hors combat. Basée sur un vrai timestamp (last_pv_regen_at) : rattrape donc
+    automatiquement TOUT le temps écoulé même si le bot était éteint entre temps. Fait au moins 1 palier
+    si un intervalle complet s'est écoulé. Sans effet si les PV sont déjà pleins. Même structure que
+    apply_eo_regen. Sûr à appeler à tout moment (loop planifié OU affichage /profil)."""
+    now = datetime.utcnow()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT pv_actuel, pv_max, last_pv_regen_at FROM character_profiles WHERE character_id = ?",
+            (character_id,),
+        ).fetchone()
+        if row is None or row["pv_max"] <= 0 or row["pv_actuel"] >= row["pv_max"]:
+            # PV pleins : on (ré)amorce simplement l'horloge pour repartir proprement.
+            if row is not None:
+                conn.execute("UPDATE character_profiles SET last_pv_regen_at = ? WHERE character_id = ?",
+                             (now.isoformat(), character_id))
+            return
+        last = None
+        if row["last_pv_regen_at"]:
+            try:
+                last = datetime.fromisoformat(row["last_pv_regen_at"])
+            except ValueError:
+                last = None
+        if last is None:
+            # Jamais initialisé : on amorce l'horloge, régénération au prochain palier.
+            conn.execute("UPDATE character_profiles SET last_pv_regen_at = ? WHERE character_id = ?",
+                         (now.isoformat(), character_id))
+            return
+        paliers = int((now - last).total_seconds() // (EO_REGEN_PALIER_MINUTES * 60))
+        if paliers < 1:
+            return
+        regen_par_palier = max(1, row["pv_max"] // EO_REGEN_NB_PALIERS)
+        nouveau = min(row["pv_max"], row["pv_actuel"] + regen_par_palier * paliers)
+        conn.execute(
+            "UPDATE character_profiles SET pv_actuel = ?, last_pv_regen_at = ? WHERE character_id = ?",
+            (nouveau, now.isoformat(), character_id),
+        )
+
+
+def pv_regen_all() -> int:
+    """Applique apply_pv_regen à tous les personnages dont les PV ne sont pas pleins. Retourne le nombre traité."""
+    with get_connection() as conn:
+        ids = [r["character_id"] for r in conn.execute(
+            "SELECT character_id FROM character_profiles WHERE pv_actuel < pv_max").fetchall()]
+    for cid in ids:
+        apply_pv_regen(cid)
     return len(ids)
 
 
