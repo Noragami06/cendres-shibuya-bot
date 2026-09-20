@@ -77,7 +77,113 @@ DAILY_DAMAGE_RATIO = 0.05  # dégâts = force_actuelle * 0.05 (1000 Force = 50 d
 
 # §2 : critique « Black Flash » (JOUEUR uniquement, action Attaquer). Chance de départ 10%, dégâts ×3.
 DAILY_CRIT_BASE = 10
-DAILY_CRIT_MULTIPLIER = 3
+DAILY_CRIT_MULTIPLIER = 10  # ×10, et le critique ignore tout blocage adverse
+
+# GIF affiché lors d'un Black Flash réussi.
+DAILY_BLACK_FLASH_GIF = "https://static2.klipy.com/ii/4493325008d34b7bf8cd6813cd5c1619/56/40/g66mpMA8Q0VwYqqkW.gif"
+
+DAILY_BLACK_FLASH_QUOTES = [
+    "Tu me cours sur les nerfs, PREND ÇA !!",
+    "J'en ai vraiment marre de toi !",
+    "Tu vas comprendre ta douleur !",
+    "Ça suffit maintenant, encaisse !",
+    "J'arrête pas de me retenir, plus maintenant !",
+    "Tu voulais jouer ? Alors joue avec ÇA !",
+    "Fini de rigoler !",
+    "Tu m'as vraiment énervé cette fois !",
+    "Prend ça dans les dents !",
+    "J'en peux plus de tes bêtises !",
+    "Tu vas le regretter !",
+    "C'est la dernière fois que tu me pousses à bout !",
+    "RECULE PAS, ENCAISSE !",
+    "Tu croyais vraiment que j'allais rester calme ?",
+    "Maintenant tu vas voir de quoi je suis capable !",
+    "Assez perdu de temps avec toi !",
+    "Tu m'as cherché, tu m'as trouvé !",
+    "J'te laisse plus aucune chance !",
+    "C'est MON tour maintenant !",
+    "Tu vas ressentir toute ma rage !",
+    "Fini les politesses !",
+    "Prend ça et tais-toi !",
+    "J'explose là, tout de suite !",
+    "Tu croyais que j'allais lâcher ?",
+    "C'en est trop, tu vas tomber !",
+    "Je vais tout donner sur ce coup-là !",
+    "Arrête de me tester !",
+    "Ce coup-là, tu vas t'en souvenir !",
+    "J'ai plus rien à perdre, encaisse !",
+    "Tu m'as poussé à bout, voilà le résultat !",
+    "Cette fois, je frappe pour de vrai !",
+    "Tu vois cette lueur ? C'est ta fin !",
+    "Plus une seconde à perdre !",
+    "J'en ai marre de retenir mes coups !",
+    "Prend cette énergie en pleine face !",
+    "Tu vas ressentir chaque once de ma colère !",
+    "Fini de jouer les gentils !",
+    "Cette fois c'est pour de bon !",
+    "Tu m'as poussé trop loin !",
+    "Je lâche tout, là, maintenant !",
+    "Prend ça, et estime-toi chanceux si tu tiens debout !",
+    "J'ai atteint ma limite !",
+    "Tu croyais m'avoir ? Erreur fatale !",
+    "C'est le moment de tout donner !",
+    "J'te laisse aucune ouverture cette fois !",
+    "Regarde bien, ça va faire mal !",
+    "Tu vas comprendre pourquoi on me craint !",
+    "Assez de retenue, place à la puissance !",
+    "Ce coup vient droit du cœur !",
+    "Tu vas sentir passer celui-là !",
+    "J'arrête de me contenir !",
+    "Prend cette rage en pleine figure !",
+    "Tu m'as vraiment sous-estimé !",
+    "Fini les demi-mesures !",
+    "C'est ici que ça se termine pour toi !",
+    "Tu vas voir ce que ça fait de m'affronter vraiment !",
+    "J'te dois plus rien, encaisse ça !",
+    "Cette fois je ne retiens plus rien !",
+    "Tu m'as poussé à sortir le grand jeu !",
+    "Prend ça en pleine puissance !",
+    "J'en avais marre de faire semblant !",
+    "Tu vas ressentir toute ma détermination !",
+    "C'est le coup de trop pour toi !",
+    "Fini de jouer petit bras !",
+    "Je te montre enfin ma vraie force !",
+    "Prend ce que t'as cherché !",
+    "Tu m'as poussé au bout de ma patience !",
+    "Cette énergie, c'est pour toi !",
+    "J'arrête plus rien maintenant !",
+    "Tu vas ressentir ma vraie puissance !",
+    "Assez attendu, voilà le résultat !",
+    "Prend ça, sans pitié !",
+    "Tu m'as réveillé pour de bon !",
+    "C'est fini pour toi, encaisse !",
+    "J'te laisse plus aucun répit !",
+    "Tu voulais voir ma limite ? La voilà !",
+    "Cette fois, aucune retenue !",
+    "Prend cette frappe de plein fouet !",
+    "Tu as réveillé quelque chose que tu regretteras !",
+    "J'en ai fini avec la patience !",
+    "Voilà ce que ça fait de m'énerver vraiment !",
+    "Tu vas sentir toute ma détresse et ma rage !",
+    "Cette fois, c'est décisif !",
+    "Prend ça, j'ai plus rien à perdre !",
+    "Tu m'as poussé jusqu'ici, assume !",
+    "J'explose de rage, encaisse !",
+    "Tu vas comprendre ce que \"trop c'est trop\" veut dire !",
+    "Cette frappe porte toute ma colère !",
+    "Fini de te ménager !",
+    "Prend ça en pleine puissance brute !",
+    "Tu m'as vraiment mis hors de moi !",
+    "C'est le moment où tout bascule !",
+    "J'te laisse sentir toute ma fureur !",
+    "Tu vas regretter de m'avoir cherché !",
+    "Cette fois, je frappe sans retenue !",
+    "Prend cette rage accumulée !",
+    "Tu m'as poussé à mon point de rupture !",
+    "Voilà ce qui arrive quand on me pousse à bout !",
+    "J'en ai terminé avec la douceur !",
+    "TU VAS LE SENTIR PASSER, CELUI-LÀ !!",
+]
 
 DAILY_BLOCK_CHANCES = [100, 100, 90, 80, 70, 65, 60, 55, 50]  # blocages 1 à 9
 DAILY_BLOCK_DECREMENT_AFTER_9 = 2  # -2% par blocage au delà du 9e, SANS PLANCHER (peut atteindre 0%)
@@ -988,8 +1094,13 @@ class Daily(commands.Cog):
             # --- Action du PNJ. ---
             action_p = self._pnj_turn(classe, st)
 
-            # --- §7 : résolution simultanée du tour (retourne texte de résultat + couleur). ---
-            result_text, color_key = self._resolve_round(st, action_j, action_p, gains, joueur_priorite)
+            # --- §7 : résolution simultanée du tour (texte de résultat, couleur, critique éventuel). ---
+            result_text, color_key, crit_reussi = self._resolve_round(
+                st, action_j, action_p, gains, joueur_priorite)
+
+            # §4 : animation de Black Flash (parole + GIF) AVANT l'embed de résultat, en cas de critique.
+            if crit_reussi:
+                await self._play_black_flash(channel, st["name_j"])
 
             # §3 : embed UNIQUE et structuré, identique pour toutes les actions.
             await channel.send(embed=self._round_embed(tour, st, result_text, color_key))
@@ -1024,12 +1135,16 @@ class Daily(commands.Cog):
             if potions:
                 options.append(("potion", "Utiliser une potion", "🧪", discord.ButtonStyle.success))
             view = DailyChoiceView(user.id, options)
+            desc = (
+                f"PV : **{max(st['pv_j'], DAILY_PV_FLOOR):,}** · Énergie occulte : **{st['eo_j']:,}**"
+                + (f"\n🔮 Renforcement actif ce tour : +{bonus_force} Force" if bonus_force else "")
+                + "\n\n⚡ **Critique (Black Flash)**\n"
+                f"Chance actuelle : **{st.get('crit_chance_j', DAILY_CRIT_BASE)}%**\n"
+                "À chaque échec, ta chance augmente (jusqu'à 20%, puis +1%/échec ensuite). Une réussite "
+                "retombe à 10% et inflige **×10 dégâts**, sans jamais pouvoir être bloqué."
+            )
             await channel.send(
-                embed=discord.Embed(
-                    title="🌀 Ton tour",
-                    description=f"PV : **{max(st['pv_j'], DAILY_PV_FLOOR):,}** · Énergie occulte : **{st['eo_j']:,}**"
-                    + (f"\n🔮 Renforcement actif ce tour : +{bonus_force} Force" if bonus_force else ""),
-                    color=PHOENIX_COLOR),
+                embed=discord.Embed(title="🌀 Ton tour", description=desc, color=PHOENIX_COLOR),
                 view=view)
             await view.wait()
             if view.result is None:
@@ -1276,9 +1391,10 @@ class Daily(commands.Cog):
 
     # ---------- §7 : résolution d'un tour ----------
     def _resolve_round(self, st, aj, ap, gains, joueur_priorite):
-        """Applique le tour et retourne (texte_de_résultat, clé_couleur) pour l'embed unique.
+        """Applique le tour et retourne (texte_de_résultat, clé_couleur, crit_reussi) pour l'embed unique.
         clé_couleur : 'green' (le joueur a placé une action offensive), 'red' (le joueur a subi des
-        dégâts), 'blue' (neutre : blocage, potion, esquive sans dégât)."""
+        dégâts), 'blue' (neutre). crit_reussi : True si un Black Flash a eu lieu ce tour (déclenche
+        l'animation dans la boucle avant l'embed de résultat)."""
         nj, npnj = st["name_j"], st["name_p"]
         pvj0, pvp0 = st["pv_j"], st["pv_p"]  # PV AVANT dégâts (pour l'affichage du clash)
         f_j = aj.get("force_actuelle", current_force(st["force_base_j"], pvj0, st["pv_max_j"]))
@@ -1289,12 +1405,14 @@ class Daily(commands.Cog):
         # §2 : critique « Black Flash » — JOUEUR uniquement, action Attaquer (physique) uniquement (jamais
         # PNJ, ni Bloquer/Sort/Arme/Renforcement/Potion). Le % n'est JAMAIS révélé au joueur.
         crit_text = ""
+        crit_reussi = False
         if aj.get("kind") == "attaquer":
             aj = dict(aj)  # copie locale : ne jamais muter le dict d'action de l'appelant
             if random.randint(1, 100) <= st.get("crit_chance_j", DAILY_CRIT_BASE):
+                crit_reussi = True
                 aj["damage"] = aj["damage"] * DAILY_CRIT_MULTIPLIER
                 st["crit_chance_j"] = DAILY_CRIT_BASE  # réussite -> retombe à 10%
-                crit_text = "\n💥 **BLACK FLASH !** Le coup critique multiplie les dégâts par 3 !"
+                crit_text = "\n💥 **BLACK FLASH !** Le coup critique inflige **×10 dégâts**, imblocable !"
             else:
                 cc = st.get("crit_chance_j", DAILY_CRIT_BASE)
                 if cc == 10:
@@ -1315,7 +1433,7 @@ class Daily(commands.Cog):
                 text = entete + (
                     f"⚔️ **Clash égal !** {nj} et {npnj} ont la même puissance ({f_j:,} chacun) — "
                     "le choc s'annule, aucun dégât cette fois.")
-                return text + crit_text, "blue"
+                return text + crit_text, "blue", crit_reussi
             if f_j > f_p:
                 st["pv_p"] -= aj["damage"]
                 player_dealt = aj["damage"]
@@ -1330,7 +1448,7 @@ class Daily(commands.Cog):
             text = entete + (
                 f"🏆 **{gagnant}** remporte le clash et inflige **{deg:,}** dégâts à {perdant} !\n"
                 f"{perdant} ne riposte pas ce tour-ci.")
-            return text + crit_text, couleur
+            return text + crit_text, couleur, crit_reussi
 
         # Sinon : au plus un camp attaque -> résolution indépendante avec blocage éventuel.
         parts = []
@@ -1338,7 +1456,9 @@ class Daily(commands.Cog):
             parts.append(f"🧪 **{nj}** utilise une potion et récupère de l'énergie occulte.")
 
         if aj["attacking"]:  # le joueur attaque le PNJ ; le PNJ bloque-t-il ?
-            dealt, _ = self._apply_attack(st, aj, defender="p", defender_blocking=ap["blocking"])
+            # §2 : un critique est IMBLOCABLE -> on force defender_blocking=False pour ce coup.
+            dealt, _ = self._apply_attack(
+                st, aj, defender="p", defender_blocking=(ap["blocking"] and not crit_reussi))
             if dealt > 0:
                 player_dealt += dealt
                 gains["force"] += 1
@@ -1372,7 +1492,7 @@ class Daily(commands.Cog):
             color = "red"
         else:
             color = "blue"
-        return text, color
+        return text, color, crit_reussi
 
     def _apply_attack(self, st, attack, defender, defender_blocking):
         """Applique `attack` sur le défenseur 'p' (PNJ) ou 'j' (joueur). Retourne (dégâts_infligés,
@@ -1418,6 +1538,18 @@ class Daily(commands.Cog):
             f"📢 **Résultat de ce tour :**\n{result_text}")
         return discord.Embed(title=f"⚔️ Tour {tour}", description=desc,
                              color=colors.get(color_key, discord.Color.blue()))
+
+    # ---------- §4 : animation de Black Flash ----------
+    async def _play_black_flash(self, channel, nom_joueur):
+        """Joue l'animation d'un critique réussi : réplique aléatoire, puis GIF, avant l'embed de résultat."""
+        quote = random.choice(DAILY_BLACK_FLASH_QUOTES)
+        await channel.send(embed=discord.Embed(
+            description=f"💢 **{nom_joueur}** : \"{quote}\"", color=discord.Color.dark_red()))
+        await asyncio.sleep(1.5)
+        embed2 = discord.Embed(title="💥 BLACK FLASH !!", color=discord.Color.dark_red())
+        embed2.set_image(url=DAILY_BLACK_FLASH_GIF)
+        await channel.send(embed=embed2)
+        await asyncio.sleep(1.5)
 
     # ---------- §9 : fin + récompenses ----------
     async def _finish_combat(self, channel, user, character_id, classe, st, gains, sort_xp, issue):
