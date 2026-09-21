@@ -603,6 +603,85 @@ CREATE TABLE IF NOT EXISTS appearance_reservations (
     refusal_reason TEXT,
     created_at TEXT
 );
+
+-- =====================================================================
+-- RAIDS (Phase 1 : cycle, génération, annonce, amendes, blacklist salon)
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS raid_cycle_state (
+    guild_id INTEGER PRIMARY KEY,
+    active INTEGER DEFAULT 0,
+    next_announce_at TEXT,
+    last_announce_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS raid_instances (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER,
+    channel_id INTEGER,          -- salon où le raid est apparu
+    classe TEXT,
+    stones_json TEXT,            -- ex: {"4": 25, "3": 5}
+    monster_count INTEGER,
+    status TEXT DEFAULT 'attente_reponse',  -- attente_reponse / ouvert / clos_sans_reponse / en_cours / termine
+    ordre_id INTEGER,            -- NULL si le salon n'appartient à personne
+    chief_deadline_at TEXT,      -- deadline des 2h de mention du chef
+    announce_message_id INTEGER, -- id du message d'annonce (EMBED 2) pour l'édition à l'expiration
+    is_public INTEGER DEFAULT 0, -- Phase 2 : 1 si un raid en salon d'Ordre a été rendu public par le chef
+    created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS raid_participants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    raid_id INTEGER,
+    character_id INTEGER,
+    user_id INTEGER,
+    ordre_id INTEGER,            -- Ordre du participant (chef ou membre), NULL si sans Ordre
+    role_slot INTEGER,           -- ordre d'arrivée (1 = premier cliqueur = chef du raid)
+    is_raid_chief INTEGER DEFAULT 0,
+    created_at TEXT,
+    monster_queue_json TEXT,             -- file des monstres restants à affronter (Phase 3)
+    current_monster_state_json TEXT,     -- PV/EO actuels du monstre en cours (Phase 3)
+    total_damage_dealt INTEGER DEFAULT 0,-- cumul des dégâts (MVP Phase 4)
+    is_alive INTEGER DEFAULT 1,
+    thread_id INTEGER                    -- fil de combat courant du participant
+);
+
+CREATE TABLE IF NOT EXISTS raid_amendes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    raid_id INTEGER,
+    ordre_id INTEGER,
+    classe TEXT,                 -- classe du raid (pour la pénalité journalière)
+    montant_base INTEGER,
+    montant_du INTEGER,          -- montant_base + pénalités cumulées, mis à jour chaque jour
+    paye INTEGER DEFAULT 0,
+    created_at TEXT,
+    last_reminder_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS raid_salon_blacklist (
+    channel_id INTEGER,
+    ordre_id INTEGER,
+    chef_character_id INTEGER,   -- chef de l'Ordre débiteur à la saisie (résolution du vrai user_id, anti-contournement)
+    raid_amende_id INTEGER,      -- amende dont l'impayé justifie le blocage (jointure statut de paiement)
+    created_at TEXT,
+    PRIMARY KEY (channel_id, ordre_id)
+);
+
+-- Phase 3 : pool de rôles/fils « RAID N » réutilisables d'un raid à l'autre (slot_number = entier OU 'boss').
+CREATE TABLE IF NOT EXISTS raid_role_pool (
+    guild_id INTEGER,
+    slot_number TEXT,
+    role_id INTEGER,
+    PRIMARY KEY (guild_id, slot_number)
+);
+
+-- Phase 3 : personnages en attente de décision de permadéath (wipe complet non secouru). Mécanisme
+-- TOTALEMENT indépendant de la réserve de 15 jours : suppression définitive à J+10 via cascade.
+CREATE TABLE IF NOT EXISTS raid_permadeath_pending (
+    character_id INTEGER PRIMARY KEY,
+    raid_id INTEGER,
+    started_at TEXT,
+    last_reminder_at TEXT
+);
 """
 
 
@@ -1190,6 +1269,36 @@ def _ensure_order_members_columns(conn):
         "WHERE joined_at IS NULL")
 
 
+def _ensure_raid_instances_columns(conn):
+    """Ajoute les colonnes Phase 2 à une table raid_instances préexistante (is_public)."""
+    cols = _column_names(conn, "raid_instances")
+    if not cols:
+        return
+    for name, decl in (
+        ("is_public", "INTEGER DEFAULT 0"),
+        ("announce_message_id", "INTEGER"),
+        ("classe", "TEXT"),
+    ):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE raid_instances ADD COLUMN {name} {decl}")
+
+
+def _ensure_raid_participants_columns(conn):
+    """Ajoute les colonnes de combat Phase 3 à raid_participants (créée en Phase 2)."""
+    cols = _column_names(conn, "raid_participants")
+    if not cols:
+        return
+    for name, decl in (
+        ("monster_queue_json", "TEXT"),
+        ("current_monster_state_json", "TEXT"),
+        ("total_damage_dealt", "INTEGER DEFAULT 0"),
+        ("is_alive", "INTEGER DEFAULT 1"),
+        ("thread_id", "INTEGER"),
+    ):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE raid_participants ADD COLUMN {name} {decl}")
+
+
 def _ensure_character_profiles_columns(conn):
     """Ajoute les colonnes de maîtrise (EO / Sort / RCT + quête) à une table character_profiles
     préexistante. TODO : mastery_territoire non ajouté (système Territoire différé)."""
@@ -1383,6 +1492,8 @@ def init_db():
         _ensure_order_members_columns(conn)
         _ensure_character_stats_columns(conn)
         _ensure_character_profiles_columns(conn)
+        _ensure_raid_instances_columns(conn)
+        _ensure_raid_participants_columns(conn)
         _ensure_character_sorts_columns(conn)
         _ensure_character_secondary_sorts_columns(conn)
         _ensure_character_territoire_columns(conn)
@@ -3251,6 +3362,341 @@ def set_bot_state(key: str, value: str):
         conn.execute(
             "INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)", (key, value)
         )
+
+
+# =====================================================================
+# RAIDS (Phase 1)
+# =====================================================================
+def raid_get_cycle_state(guild_id: int):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM raid_cycle_state WHERE guild_id = ?", (guild_id,)).fetchone()
+
+
+def raid_set_cycle_active(guild_id: int, active: int, next_announce_at, last_announce_at):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO raid_cycle_state (guild_id, active, next_announce_at, last_announce_at) "
+            "VALUES (?, ?, ?, ?)", (guild_id, active, next_announce_at, last_announce_at))
+
+
+def raid_set_cycle_inactive(guild_id: int):
+    with get_connection() as conn:
+        conn.execute("UPDATE raid_cycle_state SET active = 0 WHERE guild_id = ?", (guild_id,))
+
+
+def raid_get_active_cycles():
+    with get_connection() as conn:
+        return conn.execute("SELECT * FROM raid_cycle_state WHERE active = 1").fetchall()
+
+
+def raid_update_cycle_next(guild_id: int, next_announce_at, last_announce_at):
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE raid_cycle_state SET next_announce_at = ?, last_announce_at = ? WHERE guild_id = ?",
+            (next_announce_at, last_announce_at, guild_id))
+
+
+def raid_create_instance(guild_id, channel_id, classe, stones_json, monster_count,
+                         status, ordre_id, chief_deadline_at, created_at) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO raid_instances (guild_id, channel_id, classe, stones_json, monster_count, "
+            "status, ordre_id, chief_deadline_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (guild_id, channel_id, classe, stones_json, monster_count, status, ordre_id,
+             chief_deadline_at, created_at))
+        return cur.lastrowid
+
+
+def raid_get_instance(raid_id: int):
+    with get_connection() as conn:
+        return conn.execute("SELECT * FROM raid_instances WHERE id = ?", (raid_id,)).fetchone()
+
+
+def raid_set_instance_status(raid_id: int, status: str):
+    with get_connection() as conn:
+        conn.execute("UPDATE raid_instances SET status = ? WHERE id = ?", (status, raid_id))
+
+
+def raid_set_instance_announce_msg(raid_id: int, message_id: int):
+    with get_connection() as conn:
+        conn.execute("UPDATE raid_instances SET announce_message_id = ? WHERE id = ?",
+                     (message_id, raid_id))
+
+
+def raid_get_expired_chief_deadlines(now_iso: str):
+    """Raids encore en 'attente_reponse' dont la deadline chef des 2h est dépassée."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM raid_instances WHERE status = 'attente_reponse' "
+            "AND chief_deadline_at IS NOT NULL AND chief_deadline_at <= ?", (now_iso,)).fetchall()
+
+
+def raid_create_amende(raid_id, ordre_id, classe, montant, created_at) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO raid_amendes (raid_id, ordre_id, classe, montant_base, montant_du, paye, "
+            "created_at) VALUES (?, ?, ?, ?, ?, 0, ?)",
+            (raid_id, ordre_id, classe, montant, montant, created_at))
+        return cur.lastrowid
+
+
+def raid_get_amende(amende_id: int):
+    with get_connection() as conn:
+        return conn.execute("SELECT * FROM raid_amendes WHERE id = ?", (amende_id,)).fetchone()
+
+
+def raid_get_unpaid_amendes():
+    with get_connection() as conn:
+        return conn.execute("SELECT * FROM raid_amendes WHERE paye = 0").fetchall()
+
+
+def raid_set_amende_paid(amende_id: int):
+    with get_connection() as conn:
+        conn.execute("UPDATE raid_amendes SET paye = 1 WHERE id = ?", (amende_id,))
+
+
+def raid_add_amende_penalite(amende_id: int, penalite: int):
+    with get_connection() as conn:
+        conn.execute("UPDATE raid_amendes SET montant_du = montant_du + ? WHERE id = ?",
+                     (penalite, amende_id))
+
+
+def raid_set_amende_reminder(amende_id: int, iso: str):
+    with get_connection() as conn:
+        conn.execute("UPDATE raid_amendes SET last_reminder_at = ? WHERE id = ?", (iso, amende_id))
+
+
+def raid_add_salon_blacklist(channel_id, ordre_id, chef_character_id, raid_amende_id, created_at):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO raid_salon_blacklist (channel_id, ordre_id, chef_character_id, "
+            "raid_amende_id, created_at) VALUES (?, ?, ?, ?, ?)",
+            (channel_id, ordre_id, chef_character_id, raid_amende_id, created_at))
+
+
+def raid_remove_salon_blacklist_by_amende(amende_id: int):
+    """Débloque tous les salons liés à cette amende (appelé au paiement intégral)."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM raid_salon_blacklist WHERE raid_amende_id = ?", (amende_id,))
+
+
+def raid_set_instance_public(raid_id: int, is_public: int):
+    with get_connection() as conn:
+        conn.execute("UPDATE raid_instances SET is_public = ? WHERE id = ?", (is_public, raid_id))
+
+
+def raid_get_open_instances():
+    """Raids dont la participation est encore ouverte (attente_reponse / ouvert)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM raid_instances WHERE status IN ('attente_reponse', 'ouvert')").fetchall()
+
+
+def raid_add_participant(raid_id, character_id, user_id, ordre_id, role_slot, is_raid_chief, created_at) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO raid_participants (raid_id, character_id, user_id, ordre_id, role_slot, "
+            "is_raid_chief, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (raid_id, character_id, user_id, ordre_id, role_slot, is_raid_chief, created_at))
+        return cur.lastrowid
+
+
+def raid_get_participants(raid_id: int):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM raid_participants WHERE raid_id = ? ORDER BY role_slot ASC", (raid_id,)).fetchall()
+
+
+def raid_count_participants(raid_id: int) -> int:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM raid_participants WHERE raid_id = ?", (raid_id,)).fetchone()["n"]
+
+
+def raid_count_participants_for_ordre(raid_id: int, ordre_id: int) -> int:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM raid_participants WHERE raid_id = ? AND ordre_id = ?",
+            (raid_id, ordre_id)).fetchone()["n"]
+
+
+def raid_participant_exists(raid_id: int, character_id: int) -> bool:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT 1 FROM raid_participants WHERE raid_id = ? AND character_id = ? LIMIT 1",
+            (raid_id, character_id)).fetchone() is not None
+
+
+def raid_get_chief(raid_id: int):
+    """Le participant CHEF DU RAID (is_raid_chief = 1), ou None."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM raid_participants WHERE raid_id = ? AND is_raid_chief = 1 LIMIT 1",
+            (raid_id,)).fetchone()
+
+
+def raid_is_ordre_chief_accepted(raid_id: int, ordre_id: int) -> bool:
+    """True si le CHEF de cet Ordre est déjà un participant accepté de ce raid (pour l'auto-join des
+    membres de cet Ordre)."""
+    if ordre_id is None:
+        return False
+    with get_connection() as conn:
+        order = conn.execute("SELECT chef_character_id FROM orders WHERE id = ?", (ordre_id,)).fetchone()
+        if order is None:
+            return False
+        return conn.execute(
+            "SELECT 1 FROM raid_participants WHERE raid_id = ? AND character_id = ? LIMIT 1",
+            (raid_id, order["chef_character_id"])).fetchone() is not None
+
+
+def get_character_order(character_id: int):
+    """Ordre auquel appartient un personnage : celui dont il est CHEF, sinon celui où il est MEMBRE.
+    Retourne la ligne orders, ou None."""
+    with get_connection() as conn:
+        o = conn.execute(
+            "SELECT * FROM orders WHERE chef_character_id = ?", (character_id,)).fetchone()
+        if o is not None:
+            return o
+        m = conn.execute(
+            "SELECT order_id FROM order_members WHERE character_id = ? LIMIT 1", (character_id,)).fetchone()
+        if m is None:
+            return None
+        return conn.execute("SELECT * FROM orders WHERE id = ?", (m["order_id"],)).fetchone()
+
+
+def raid_blacklist_exists_for_amende(amende_id: int) -> bool:
+    """True si une saisie (blacklist) a déjà été enregistrée pour cette amende (évite de re-saisir chaque jour)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT 1 FROM raid_salon_blacklist WHERE raid_amende_id = ? LIMIT 1",
+            (amende_id,)).fetchone() is not None
+
+
+# ---------- Phase 3 : pool de rôles/fils, état de combat, permadéath ----------
+def raid_get_role_pool(guild_id: int, slot_number) -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT role_id FROM raid_role_pool WHERE guild_id = ? AND slot_number = ?",
+            (guild_id, str(slot_number))).fetchone()
+    return row["role_id"] if row else None
+
+
+def raid_set_role_pool(guild_id: int, slot_number, role_id: int):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO raid_role_pool (guild_id, slot_number, role_id) VALUES (?, ?, ?)",
+            (guild_id, str(slot_number), role_id))
+
+
+def raid_update_participant(participant_id: int, **fields):
+    """Met à jour des colonnes arbitraires d'une ligne raid_participants (champs de combat Phase 3)."""
+    if not fields:
+        return
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    with get_connection() as conn:
+        conn.execute(f"UPDATE raid_participants SET {cols} WHERE id = ?",
+                     (*fields.values(), participant_id))
+
+
+def raid_add_participant_damage(participant_id: int, dmg: int):
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE raid_participants SET total_damage_dealt = total_damage_dealt + ? WHERE id = ?",
+            (int(dmg), participant_id))
+
+
+def raid_get_alive_participants(raid_id: int):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM raid_participants WHERE raid_id = ? AND is_alive = 1 ORDER BY role_slot ASC",
+            (raid_id,)).fetchall()
+
+
+def raid_get_participant_row(participant_id: int):
+    with get_connection() as conn:
+        return conn.execute("SELECT * FROM raid_participants WHERE id = ?", (participant_id,)).fetchone()
+
+
+def raid_get_mvp(raid_id: int):
+    """character_id du participant au plus haut total_damage_dealt (monstres + boss), ou None."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT character_id FROM raid_participants WHERE raid_id = ? "
+            "ORDER BY total_damage_dealt DESC LIMIT 1", (raid_id,)).fetchone()
+    return row["character_id"] if row else None
+
+
+def raid_permadeath_add(character_id: int, raid_id: int, now_iso: str):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO raid_permadeath_pending (character_id, raid_id, started_at, "
+            "last_reminder_at) VALUES (?, ?, ?, ?)", (character_id, raid_id, now_iso, now_iso))
+
+
+def raid_permadeath_all():
+    with get_connection() as conn:
+        return conn.execute("SELECT * FROM raid_permadeath_pending").fetchall()
+
+
+def raid_permadeath_by_raid(raid_id: int):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM raid_permadeath_pending WHERE raid_id = ?", (raid_id,)).fetchall()
+
+
+def raid_permadeath_remove(character_id: int):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM raid_permadeath_pending WHERE character_id = ?", (character_id,))
+
+
+def raid_permadeath_set_reminder(character_id: int, now_iso: str):
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE raid_permadeath_pending SET last_reminder_at = ? WHERE character_id = ?",
+            (now_iso, character_id))
+
+
+def raid_salon_seize(channel_id: int):
+    """Saisie du salon : le retire de TOUT ordre (redevient libre). Réutilise le nettoyage de propriété
+    order_salons (aucune colonne ordre_id unique : la propriété = présence d'une ligne 'Acheté'/'Location')."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM order_salons WHERE channel_id = ?", (channel_id,))
+
+
+def salon_acquisition_blocked(channel_id: int, acquiring_user_id: int):
+    """Anti-contournement de blacklist de raid (§9). Retourne montant_du (int) si l'acquisition de ce
+    salon par ce JOUEUR RÉEL (user_id) doit être refusée pour cause d'amende de raid IMPAYÉE, sinon None.
+
+    Bloque le débiteur PEU IMPORTE le personnage ou l'Ordre utilisé : on compare le user_id réel de
+    l'acquéreur au user_id réel du chef débiteur, résolu à la fois depuis chef_character_id (figé à la
+    saisie) ET depuis le chef courant de l'Ordre débiteur s'il existe encore. Jointure raid_amendes
+    pour ne considérer que les amendes non payées (paye = 0)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT b.ordre_id, b.chef_character_id, a.montant_du "
+            "FROM raid_salon_blacklist b JOIN raid_amendes a ON a.id = b.raid_amende_id "
+            "WHERE b.channel_id = ? AND a.paye = 0", (channel_id,)).fetchall()
+        for r in rows:
+            debtor_user_ids = set()
+            if r["chef_character_id"] is not None:
+                ch = conn.execute(
+                    "SELECT user_id FROM validated_characters WHERE id = ?",
+                    (r["chef_character_id"],)).fetchone()
+                if ch:
+                    debtor_user_ids.add(ch["user_id"])
+            if r["ordre_id"] is not None:
+                od = conn.execute(
+                    "SELECT chef_character_id FROM orders WHERE id = ?", (r["ordre_id"],)).fetchone()
+                if od:
+                    cc = conn.execute(
+                        "SELECT user_id FROM validated_characters WHERE id = ?",
+                        (od["chef_character_id"],)).fetchone()
+                    if cc:
+                        debtor_user_ids.add(cc["user_id"])
+            if acquiring_user_id in debtor_user_ids:
+                return r["montant_du"]
+    return None
 
 
 def record_departure(user_id: int, guild_id: int, departed_at: str):

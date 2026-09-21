@@ -825,6 +825,15 @@ class Ordre(commands.Cog):
             return False
         return True
 
+    def _order_chef_user_id(self, order_id):
+        """user_id Discord RÉEL derrière le chef d'un Ordre (peu importe lequel de ses personnages est chef).
+        Sert à la blacklist anti-contournement des raids (§9). None si introuvable."""
+        order = db.get_order(order_id)
+        if not order:
+            return None
+        chef = get_character(order["chef_character_id"])
+        return chef["user_id"] if chef else None
+
     async def _require_staff_manager(self, interaction, order_id) -> bool:
         """Chef ET rôle STAFF_MANAGER (réel slot 1 / virtuel slot 2-3). Répond à la place et
         retourne False si l'une des deux conditions manque."""
@@ -4220,6 +4229,14 @@ class Ordre(commands.Cog):
         buyer_name = buyer_order["name"] if buyer_order else "?"
         final = []
         for ch in batch:
+            # RAID §9 : blacklist anti-contournement. Refuse le rachat par le JOUEUR RÉEL débiteur, peu
+            # importe le personnage/Ordre utilisé (user_id de l'acheteur = user.id, chef vérifié).
+            due = db.salon_acquisition_blocked(ch.id, user.id)
+            if due is not None:
+                await channel.send(
+                    f"❌ Tu ne peux pas récupérer le salon #{ch.name} par un autre personnage ou un autre "
+                    f"Ordre tant que la dette de {_fmt(due)} ¥ n'est pas réglée.")
+                continue
             # Résolution SANS AMBIGUÏTÉ du vrai propriétaire : seule une ligne 'Acheté'/'Location' fait
             # foi (une 'Louée' n'est qu'un miroir chez l'emprunteur, jamais autoritaire).
             owner_row = db.resolve_salon_true_owner(ch.id)
@@ -4433,6 +4450,18 @@ class Ordre(commands.Cog):
         if not buyer_order:
             await channel.send("Ce joueur n'a pas d'ordre.")
             return
+        # RAID §9 : blacklist anti-contournement appliquée au DESTINATAIRE FINAL du transfert. On résout le
+        # user_id réel derrière le chef de l'Ordre acheteur ; s'il est le débiteur (peu importe le perso/Ordre
+        # utilisé), le transfert de tout salon blacklisté est refusé.
+        buyer_uid = self._order_chef_user_id(buyer_order["id"])
+        for ch in channels:
+            due = db.salon_acquisition_blocked(ch.id, buyer_uid) if buyer_uid is not None else None
+            if due is not None:
+                await channel.send(
+                    f"❌ Cet Ordre ne peut pas récupérer le salon #{ch.name} (rachat indirect interdit) : "
+                    f"tant que la dette de {_fmt(due)} ¥ n'est pas réglée, ce joueur reste bloqué sous "
+                    "n'importe quel personnage ou Ordre.")
+                return
         price = await self._ask_positive_int(
             channel, seller_user,
             f"Prix TOTAL pour ces {len(channels)} salon(s) ? (minimum {_fmt(TAXE_SALON)} ¥)")
@@ -4548,6 +4577,16 @@ class Ordre(commands.Cog):
             await channel.send("⏳ Annulé.")
             return
         tenant_order_id = int(view.result)
+        # RAID §9 : blacklist anti-contournement appliquée au LOCATAIRE (destinataire de l'usage du salon).
+        tenant_uid = self._order_chef_user_id(tenant_order_id)
+        for ch in channels:
+            due = db.salon_acquisition_blocked(ch.id, tenant_uid) if tenant_uid is not None else None
+            if due is not None:
+                await channel.send(
+                    f"❌ Impossible de louer le salon #{ch.name} à cet Ordre : son chef reste bloqué "
+                    f"(dette de raid de {_fmt(due)} ¥ impayée, contournement interdit sous tout personnage "
+                    "ou Ordre).")
+                return
         weeks = await self._ask_positive_int(
             channel, user,
             f"Durée de la location en semaines ? (loyer fixé à {_fmt(TAXE_SALON)} ¥ par salon et par semaine)")
