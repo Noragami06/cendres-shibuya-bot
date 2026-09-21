@@ -327,11 +327,17 @@ class Raid(commands.Cog):
             return
         state = db.raid_get_cycle_state(interaction.guild.id)
         if state is None or not state["active"]:
-            next_announce = (datetime.utcnow() + timedelta(hours=RAID_CYCLE_HOURS)).isoformat()
-            db.raid_set_cycle_active(interaction.guild.id, 1, next_announce, None)
+            # TEMPORAIRE — déclenchement immédiat pour phase de test, à retirer/remettre le délai normal
+            # une fois les tests terminés (revenir à next_announce = maintenant + RAID_CYCLE_HOURS sans
+            # appel direct à _trigger_raid).
+            now = datetime.utcnow()
+            db.raid_set_cycle_active(interaction.guild.id, 1, now.isoformat(), None)
             await interaction.response.send_message(
-                f"✅ Cycle de raids activé. Première annonce prévue dans {RAID_CYCLE_HOURS}h.",
-                ephemeral=True)
+                "✅ Cycle de raids activé. Annonce de test déclenchée immédiatement.", ephemeral=True)
+            await self._trigger_raid(interaction.guild.id)  # déclenche tout de suite (Phase 1)
+            # Programme quand même le prochain cycle normalement après ce test.
+            next_announce = (now + timedelta(hours=RAID_CYCLE_HOURS)).isoformat()
+            db.raid_update_cycle_next(interaction.guild.id, next_announce, now.isoformat())
         else:
             db.raid_set_cycle_inactive(interaction.guild.id)
             await interaction.response.send_message(
