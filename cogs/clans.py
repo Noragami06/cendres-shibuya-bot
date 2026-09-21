@@ -2,7 +2,7 @@ import discord
 from discord.ext import commands
 
 from cogs.utils import database as db
-from cogs.utils.coherence_check import run_coherence_check
+from cogs.utils.coherence_check import run_coherence_check, raid_status_lines
 
 # ---------- IDs ----------
 # Rôle marqueur : indique qu'un membre appartient à un clan
@@ -126,6 +126,16 @@ def build_clans_report(guild) -> str:
         lines.extend(lignes_incoherence)
     else:
         lines.append("Aucune incohérence détectée.")
+    lines.append("=" * 50)
+
+    # Statut du cycle /raid, imprimé au même rythme que la section incohérences (startup + toutes les
+    # 120 s). Enveloppé : une panne du statut ne doit jamais casser le rapport.
+    lines.append("")
+    lines.append("=== RAID ===")
+    try:
+        lines.extend(raid_status_lines())
+    except Exception as e:
+        lines.append(f"⚪ [RAID] Statut indisponible : {e}")
     lines.append("=" * 50)
 
     return "\n".join(lines)

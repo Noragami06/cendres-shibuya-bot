@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cogs.utils.coherence_check import (  # noqa: E402  (import après ajustement de sys.path)
     open_db, load_role_point_values, import_cogs, collect_code_roles, group_roles_by_id,
-    pct_sum_ok, run_coherence_check, DB_PATH, SPELL_CLASS_VALUES, SPELL_CLASS_ORDER,
+    pct_sum_ok, run_coherence_check, raid_status_lines, DB_PATH, SPELL_CLASS_VALUES, SPELL_CLASS_ORDER,
     MASTERY_EO_MAX_LEVEL, compute_mastery_eo_reduction,
     MASTERY_SORT_MAX_LEVEL, compute_mastery_sort_bonus,
     MASTERY_TERRITOIRE_MAX_LEVEL,
@@ -255,6 +255,11 @@ def main():
 
     if conn is not None:
         conn.close()
+
+    # Statut du cycle /raid (même source que le rapport périodique du terminal).
+    header("=== RAID ===")
+    for ligne in raid_status_lines():
+        print(f"  {ligne}")
 
     # SECTION FINALE — logique DÉLÉGUÉE au module partagé (identique au status_loop).
     header("=== INCOHÉRENCES ===")

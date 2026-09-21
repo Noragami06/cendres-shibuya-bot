@@ -497,3 +497,66 @@ def run_coherence_check() -> list:
         conn.close()
 
     return [f"❌ {m}" for m in errors] + [f"ℹ️  {m}" for m in notes]
+
+
+# =====================================================================
+# STATUT DU CYCLE /raid (affiché dans le rapport périodique du terminal)
+# =====================================================================
+def _format_hhmm(delta_seconds) -> str:
+    total = max(0, int(delta_seconds))
+    h = total // 3600
+    m = (total % 3600) // 60
+    return f"{h:02d}h{m:02d}"
+
+
+def raid_status_lines() -> list:
+    """Statut du cycle /raid par guilde (LECTURE SEULE, ne lève jamais). Retourne la liste des lignes
+    d'état, imprimées dans le rapport du terminal au même rythme que la section incohérences.
+    - 🔴 ACTIF : temps restant avant la prochaine annonce (ou « en retard » si l'échéance est passée) ;
+    - ⚪ INACTIF : aucune annonce programmée ;
+    - ⚪ « jamais activé » si aucune ligne dans raid_cycle_state."""
+    from datetime import datetime
+    conn = None
+    try:
+        conn = open_db()
+        if conn is None:
+            return ["⚪ [RAID] Base indisponible — statut du cycle inconnu."]
+        try:
+            rows = conn.execute("SELECT * FROM raid_cycle_state").fetchall()
+        except sqlite3.OperationalError:
+            return ["⚪ [RAID] Cycle jamais activé sur ce serveur"]
+        if not rows:
+            return ["⚪ [RAID] Cycle jamais activé sur ce serveur"]
+        now = datetime.utcnow()
+        lines = []
+        for state in rows:
+            gid = state["guild_id"]
+            if state["active"] == 1:
+                due = None
+                if state["next_announce_at"]:
+                    try:
+                        due = datetime.fromisoformat(state["next_announce_at"])
+                    except ValueError:
+                        due = None
+                if due is not None and due > now:
+                    reste = _format_hhmm((due - now).total_seconds())
+                    lines.append(f"🔴 [RAID] Guild {gid} : ACTIF — prochaine annonce dans {reste}")
+                else:
+                    lines.append(
+                        f"🔴 [RAID] Guild {gid} : ACTIF — annonce en retard, déclenchement imminent "
+                        "au prochain passage de la tâche planifiée")
+            else:
+                lines.append(f"⚪ [RAID] Guild {gid} : INACTIF — aucune annonce programmée")
+        return lines
+    except Exception as e:
+        return [f"⚪ [RAID] Statut indisponible : {e}"]
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def print_raid_status():
+    """Impression directe du statut /raid (script autonome check_coherence.py / debug). Le rapport
+    périodique du terminal passe par raid_status_lines() (intégré à build_clans_report)."""
+    for line in raid_status_lines():
+        print(line)
