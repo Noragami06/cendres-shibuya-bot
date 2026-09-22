@@ -17,7 +17,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from cogs.utils import database as db
-from cogs.banque import get_character, get_characters
+from cogs.banque import get_character, get_characters, credit_compte_courant
 # Réutilisation directe des primitives de combat de /daily (mêmes dégâts/blocage/Black Flash/clash).
 from cogs.daily import (
     generate_pnj, current_force, physical_damage, block_chance,
@@ -25,6 +25,7 @@ from cogs.daily import (
     _add_role_real_or_virtual, _remove_role_real_or_virtual,
     DAILY_PV_FLOOR, DAILY_CRIT_BASE, DAILY_DAMAGE_RATIO, DAILY_PNJ_WEIGHTS,
 )
+from cogs.utils.combat_engine import apply_actor_action, DAILY_CRIT_RESET_VALUE
 
 # =====================================================================
 # 0. CONSTANTES
@@ -74,6 +75,28 @@ RAID_STONE_TABLE = {
 RAID_STONE_QUANTITY = {"4": (20, 40), "3": (30, 55), "2": (45, 75), "1": (65, 100), "S": (90, 150)}
 RAID_STONE_PRICE = {"4": (2000, 5000), "3": (8000, 15000), "2": (30000, 60000),
                     "1": (120000, 250000), "S": (500000, 1000000)}
+
+# --- Système économique des pierres (transport / extraction / taxation / répartition) ---
+RAID_TRUCK_CAPACITY = {"1": 20, "2": 45, "3": 80}  # capacité (pierres) par grade de camion
+
+RAID_MINER_EXTRACTION = {
+    "4": {"pierres_par_mineur": 5},
+    "3": {"pierres_par_mineur": 3},
+    "2": {"pierres_par_mineur": 2},
+    "1": {"mineurs_par_pierre": 2},
+    "S": {"mineurs_par_pierre": 4},
+}
+RAID_MINER_SALARY = 5000
+
+RAID_FUEL_LITRE_PER_CHANNEL = 10
+RAID_FUEL_PRICE_PER_LITRE = 2
+
+RAID_SOLO_SHARE_MIN_PCT = 8
+RAID_SOLO_SHARE_MAX_PCT = 12
+RAID_SOLO_SHARE_DEFAULT_PCT = 10  # si un seul joueur solo, rien à comparer
+
+RAID_ORDRE_TAX_PCT = 15   # si au moins un Ordre participe
+# Pas de taux fixe pour le cas « aucun Ordre » : l'État garde ce qui reste après les parts solo.
 
 RAID_MONSTER_COUNT = {"4": (15, 25), "3": (20, 35), "2": (30, 50), "1": (45, 70), "S": (65, 100)}
 
@@ -228,6 +251,7 @@ def _new_monster_runtime(stats: dict, classe: str) -> dict:
     mon["pv"] = mon["pv_max"]
     mon["eo"] = mon["eo_max"]
     mon["bloc"] = 0
+    mon["block_pending"] = False  # posture de blocage du monstre (alternance stricte)
     return mon
 
 
@@ -251,9 +275,11 @@ class _Combatant:
         self.eo = profile["eo_actuel"]
         self.eo_max = profile["eo_max"]
         self.force_base = stats["force"]
-        self.crit_chance = DAILY_CRIT_BASE
+        self.crit_chance = DAILY_CRIT_RESET_VALUE
+        self.crit_echecs = 0
         self.sort_bonus = 0
         self.bloc = 0
+        self.block_pending = False  # posture de blocage du joueur (alternance stricte)
         self.total_damage = 0
         self.alive = True
         self.finished = False   # a terminé sa propre vague
@@ -554,15 +580,21 @@ class Raid(commands.Cog):
             "eo_p": monster["eo"], "eo_max_p": monster["eo_max"], "force_base_p": monster["force"],
             "bloc_j": comb.bloc, "bloc_p": monster["bloc"],
             "potions_p": monster["potions"], "potion_pct_p": monster["potion_pct"],
-            "crit_chance_j": comb.crit_chance, "sort_bonus_j": comb.sort_bonus,
+            "crit_chance_j": comb.crit_chance, "crit_echecs_j": comb.crit_echecs,
+            "sort_bonus_j": comb.sort_bonus,
+            "block_pending_j": comb.block_pending, "block_pending_p": monster.get("block_pending", False),
+            "last_action_j": None, "last_action_p": None,
         }
 
     def _writeback_st(self, st, comb, monster):
         comb.pv = st["pv_j"]; comb.eo = st["eo_j"]
-        comb.crit_chance = st["crit_chance_j"]; comb.sort_bonus = st["sort_bonus_j"]
+        comb.crit_chance = st["crit_chance_j"]; comb.crit_echecs = st.get("crit_echecs_j", 0)
+        comb.sort_bonus = st["sort_bonus_j"]
         comb.bloc = st["bloc_j"]; comb.force_base = st["force_base_j"]
+        comb.block_pending = st.get("block_pending_j", False)
         monster["pv"] = st["pv_p"]; monster["eo"] = st["eo_p"]; monster["bloc"] = st["bloc_p"]
         monster["potions"] = st["potions_p"]; monster["force"] = st["force_base_p"]
+        monster["block_pending"] = st.get("block_pending_p", False)
 
     # ---------- boucle de combat d'un fil ----------
     async def _run_thread(self, raid_id, owner_cid):
@@ -594,37 +626,33 @@ class Raid(commands.Cog):
             for comb in members:
                 if not comb.alive or owner.current is None:
                     break
-                tour += 1
                 monster = owner.current
-                st = self._build_st(comb, monster)
                 gains = {"force": 0, "endurance": 0, "energie_occulte": 0, "sorts": 0}
                 sort_xp = {}
+
+                # --- ROUND DU JOUEUR (alternance stricte : seul le joueur agit ici) ---
+                tour += 1
+                st = self._build_st(comb, monster)
                 pvp_before = st["pv_p"]
                 action = await daily._player_turn(
                     owner.thread, comb.member, comb.character_id, st, gains, sort_xp)
                 if action is None:
-                    # Timeout : le joueur se met en garde d'office (le combat continue).
-                    f_act = current_force(comb.force_base, comb.pv, comb.pv_max)
                     action = {"kind": "bloquer", "attacking": False, "damage": 0, "dtype": None,
-                              "blocking": True, "force_actuelle": f_act}
-                ap = daily._pnj_turn(session.classe, st)
-                text, color, crit = daily._resolve_round(st, action, ap, gains, True)
+                              "blocking": True,
+                              "force_actuelle": current_force(comb.force_base, comb.pv, comb.pv_max)}
+                text, color, crit = apply_actor_action(st, action, True, gains)
+                st["last_action_j"] = action.get("kind")
                 if crit:
                     await daily._play_black_flash(owner.thread, comb.name)
                 self._writeback_st(st, comb, monster)
-                # §4 : cumul des dégâts infligés au monstre (pour le MVP Phase 4).
-                dealt = max(0, pvp_before - monster["pv"])
-                comb.total_damage += dealt
-                db.raid_add_participant_damage(comb.participant_id, dealt)
-                try:
-                    await owner.thread.send(embed=daily._round_embed(tour, st, text, color))
-                except discord.HTTPException:
-                    pass
+                comb.total_damage += max(0, pvp_before - monster["pv"])
+                db.raid_add_participant_damage(comb.participant_id, max(0, pvp_before - monster["pv"]))
+                await self._send_round(owner, st, text, color, tour)
                 db.raid_update_participant(
                     owner.participant_id, current_monster_state_json=json.dumps(monster))
                 await self._update_global_tracker(raid_id)
 
-                # Monstre vaincu -> suivant.
+                # Monstre vaincu -> suivant (le monstre ne joue pas son round).
                 if monster["pv"] <= DAILY_PV_FLOOR:
                     owner.current = owner.queue.pop(0) if owner.queue else None
                     db.raid_update_participant(
@@ -634,20 +662,44 @@ class Raid(commands.Cog):
                     if owner.current is None:
                         await self._on_wave_finished(raid_id, owner)
                         return
-                    else:
-                        try:
-                            await owner.thread.send(embed=discord.Embed(
-                                title="⚔️ Nouvel adversaire",
-                                description=f"**{owner.current['name']}** surgit !", color=RAID_COLOR))
-                        except discord.HTTPException:
-                            pass
+                    try:
+                        await owner.thread.send(embed=discord.Embed(
+                            title="⚔️ Nouvel adversaire",
+                            description=f"**{owner.current['name']}** surgit !", color=RAID_COLOR))
+                    except discord.HTTPException:
+                        pass
                     continue
+
+                # --- ROUND DU MONSTRE (l'autre camp agit, après avoir vu l'action du joueur) ---
+                tour += 1
+                st = self._build_st(comb, monster)
+                ap = daily._pnj_turn(session.classe, st)
+                text2, color2, _ = apply_actor_action(st, ap, False, gains)
+                st["last_action_p"] = ap.get("kind")
+                self._writeback_st(st, comb, monster)
+                await self._send_round(owner, st, text2, color2, tour)
+                db.raid_update_participant(
+                    owner.participant_id, current_monster_state_json=json.dumps(monster))
+                await self._update_global_tracker(raid_id)
 
                 # Joueur tombé -> secours (§5).
                 if comb.pv <= DAILY_PV_FLOOR:
                     stop = await self._on_player_defeated(raid_id, comb)
                     if stop:
                         return  # wipe complet : la session est close ailleurs
+
+    async def _send_round(self, owner, st, text, color, tour):
+        """Embed d'un round dans le fil individuel, avec le rappel des PNJ restants (§6)."""
+        daily = self.bot.get_cog("Daily")
+        if daily is None or owner.thread is None:
+            return
+        try:
+            embed = daily._round_embed(tour, st, text, color)
+            reste = (1 if owner.current else 0) + len(owner.queue)
+            embed.set_footer(text=f"👹 {reste} PNJ restant(s)")
+            await owner.thread.send(embed=embed)
+        except discord.HTTPException:
+            pass
 
     # ---------- §5 : défaite d'un joueur + entraide ----------
     async def _on_player_defeated(self, raid_id, loser) -> bool:
@@ -914,28 +966,23 @@ class Raid(commands.Cog):
         if session is None or daily is None or session.boss is None:
             return None
         boss = session.boss
-        st = self._build_st(comb, boss)
-        cf_boss = current_force(boss["force"], boss["pv"], boss["pv_max"])
-        # Posture du boss pendant le tour du joueur : bloque (si en garde) ou temporise (n'attaque pas).
-        if session.boss_blocking:
-            ap = {"kind": "bloquer", "attacking": False, "damage": 0, "dtype": None,
-                  "blocking": True, "force_actuelle": cf_boss}
-        else:
-            ap = {"kind": "attente", "attacking": False, "damage": 0, "dtype": None,
-                  "blocking": False, "force_actuelle": cf_boss}
         gains = {"force": 0, "endurance": 0, "energie_occulte": 0, "sorts": 0}
         sort_xp = {}
+        # Alternance stricte : seul le joueur agit ici. La posture de blocage du boss (armée à son propre
+        # tour) est testée par cette attaque le cas échéant ; le boss ripostera à SON tour (_boss_turn).
+        st = self._build_st(comb, boss)
+        st["block_pending_p"] = session.boss_blocking
         pvp_before = boss["pv"]
         action = await daily._player_turn(session.boss_thread, comb.member, comb.character_id, st, gains, sort_xp)
         if action is None:
-            f_act = current_force(comb.force_base, comb.pv, comb.pv_max)
             action = {"kind": "bloquer", "attacking": False, "damage": 0, "dtype": None,
-                      "blocking": True, "force_actuelle": f_act}
-        comb.pending_block = (action["kind"] == "bloquer")
-        text, color, crit = daily._resolve_round(st, action, ap, gains, True)
+                      "blocking": True, "force_actuelle": current_force(comb.force_base, comb.pv, comb.pv_max)}
+        comb.pending_block = (action.get("kind") == "bloquer")
+        text, color, crit = apply_actor_action(st, action, True, gains)
         if crit:
             await daily._play_black_flash(session.boss_thread, comb.name)
         self._writeback_st(st, comb, boss)
+        session.boss_blocking = st.get("block_pending_p", False)  # posture consommée si le joueur a attaqué
         dealt = max(0, pvp_before - boss["pv"])
         comb.total_damage += dealt
         db.raid_add_participant_damage(comb.participant_id, dealt)
@@ -1118,6 +1165,123 @@ class Raid(commands.Cog):
         return db.raid_get_mvp(raid_id)
 
     # =================================================================
+    # ÉCONOMIE : répartition finale du bénéfice
+    # =================================================================
+    async def _distribute_raid_profit(self, raid_id, net_final):
+        """§4 : répartit le net final (après carburant + mineurs, déjà déduits manuellement). Les joueurs
+        SOLO (sans Ordre) touchent une part directe (8-12% selon leurs dégâts relatifs, 10% par défaut si
+        seul). Le reste : si des Ordres participent, l'État prélève 15% puis les Ordres se partagent au
+        prorata des dégâts cumulés de leurs membres (crédité au Trésor) ; sinon l'État garde le reste.
+        Retourne un résumé structuré (pour l'embed pédagogique §5)."""
+        raid = db.raid_get_instance(raid_id)
+        parts = db.raid_get_participants(raid_id)
+        solo = [p for p in parts if p["ordre_id"] is None]
+        ordres = {}
+        for p in parts:
+            if p["ordre_id"] is not None:
+                ordres.setdefault(p["ordre_id"], []).append(p)
+
+        summary = {"net_final": net_final, "solo": [], "ordres": [], "taxe_etat": 0, "valeur_pierres": 0}
+        total_solo_verse = 0
+        if solo:
+            if len(solo) == 1:
+                pcts = {solo[0]["id"]: RAID_SOLO_SHARE_DEFAULT_PCT}
+            else:
+                dmgs = [p["total_damage_dealt"] or 0 for p in solo]
+                mn, mx = min(dmgs), max(dmgs)
+                pcts = {}
+                for p in solo:
+                    d = p["total_damage_dealt"] or 0
+                    if mx == mn:
+                        pct = RAID_SOLO_SHARE_DEFAULT_PCT
+                    else:
+                        pct = (RAID_SOLO_SHARE_MIN_PCT
+                               + (RAID_SOLO_SHARE_MAX_PCT - RAID_SOLO_SHARE_MIN_PCT) * (d - mn) / (mx - mn))
+                    pcts[p["id"]] = pct
+            for p in solo:
+                pct = pcts[p["id"]]
+                montant = round(net_final * pct / 100)
+                credit_compte_courant(p["character_id"], montant, "Part de raid", category="revenu")
+                total_solo_verse += montant
+                char = get_character(p["character_id"])
+                nom = (char["character_name"] if char and char["character_name"] else f"#{p['character_id']}")
+                summary["solo"].append({"nom": nom, "montant": montant, "pct": pct})
+
+        reste = net_final - total_solo_verse
+        if ordres:
+            taxe_etat = round(reste * RAID_ORDRE_TAX_PCT / 100)
+            net_ordres = reste - taxe_etat
+            total_degats = sum((p["total_damage_dealt"] or 0) for lst in ordres.values() for p in lst) or 1
+            for oid, lst in ordres.items():
+                degats_ordre = sum((p["total_damage_dealt"] or 0) for p in lst)
+                part_ordre = round(net_ordres * degats_ordre / total_degats)
+                db.adjust_order_solde(oid, part_ordre)
+                db.add_order_transaction(oid, "Part de raid", part_ordre, _now())
+                o = db.get_order(oid)
+                summary["ordres"].append({"nom": o["name"] if o else f"#{oid}", "part": part_ordre})
+            summary["taxe_etat"] = taxe_etat
+        else:
+            summary["taxe_etat"] = reste  # aucun Ordre : l'État garde tout ce qui reste après les solo
+
+        if raid is not None:
+            _, summary["valeur_pierres"] = self._stone_breakdown(raid)
+        return summary
+
+    async def _post_profit_recap(self, raid, summary):
+        """§5 : embed pédagogique de répartition, posté dans le salon du raid (repli : salon d'annonce)."""
+        vp = summary.get("valeur_pierres") or 0
+        lignes = [
+            f"Le trésor total valait **{_fmt(vp)}¥**.",
+            f"Après les frais (carburant + mineurs), il restait **{_fmt(summary['net_final'])}¥**.",
+            "",
+        ]
+        for s in summary["solo"]:
+            lignes.append(
+                f"**{s['nom']}** a reçu **{_fmt(s['montant'])}¥** directement sur son compte "
+                f"({s['pct']:.1f}% de sa part, selon ses efforts au combat).")
+        if summary["ordres"]:
+            lignes.append(f"L'État a prélevé **{_fmt(summary['taxe_etat'])}¥** ({RAID_ORDRE_TAX_PCT}%).")
+            for o in summary["ordres"]:
+                lignes.append(
+                    f"La trésorerie de **{o['nom']}** a reçu **{_fmt(o['part'])}¥** "
+                    "(selon les dégâts cumulés de ses membres).")
+        elif not summary["solo"]:
+            lignes.append(f"L'État a tout conservé (**{_fmt(summary['taxe_etat'])}¥**).")
+        embed = discord.Embed(title="💰 Répartition des gains du raid",
+                              description="\n".join(lignes), color=discord.Color.gold())
+        channel = (self.bot.get_channel(raid["channel_id"]) if raid else None) \
+            or self.bot.get_channel(RAID_ANNOUNCE_CHANNEL_ID)
+        if channel is not None:
+            try:
+                await channel.send(embed=embed)
+            except discord.HTTPException:
+                pass
+
+    @app_commands.command(
+        name="raid-repartition",
+        description="Saisit le net final d'un raid terminé et répartit les gains (staff/owner)")
+    @app_commands.describe(raid_id="ID du raid terminé",
+                           net_final="Montant net final (après carburant + mineurs déjà déduits)")
+    async def raid_repartition(self, interaction: discord.Interaction, raid_id: int, net_final: int):
+        is_staff = any(r.id == FICHE_STAFF_ROLE_ID for r in getattr(interaction.user, "roles", []))
+        if not is_staff and interaction.user.id != OWNER_ID:
+            await interaction.response.send_message(
+                "❌ Commande réservée au staff / à l'owner.", ephemeral=True)
+            return
+        raid = db.raid_get_instance(raid_id)
+        if raid is None:
+            await interaction.response.send_message("❌ Raid introuvable.", ephemeral=True)
+            return
+        if net_final < 0:
+            await interaction.response.send_message("❌ Le net final doit être positif.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        summary = await self._distribute_raid_profit(raid_id, net_final)
+        await self._post_profit_recap(raid, summary)
+        await interaction.followup.send(
+            f"✅ Répartition effectuée pour le raid #{raid_id} (net {_fmt(net_final)}¥).", ephemeral=True)
+
+    # =================================================================
     # PHASE 5 : NETTOYAGE + RÉCOMPENSES + RÉCAP OWNER
     # =================================================================
     def _pool_role(self, guild, slot_number):
@@ -1225,6 +1389,21 @@ class Raid(commands.Cog):
         # Découpe sous 2000 caractères, sans jamais couper une ligne participant.
         for chunk in self._chunk_recap(header, lignes):
             await self._dm_user(OWNER_ID, content=chunk)
+
+        # Section économique : valeur des pierres + éléments à calculer manuellement + formules + commande.
+        stone_lignes, valeur_pierres = self._stone_breakdown(raid)
+        eco = (
+            f"💎 **Valeur des pierres du raid : {_fmt(valeur_pierres)}¥**\n"
+            + ("\n".join(stone_lignes) if stone_lignes else "—") + "\n\n"
+            "⚠️ À renseigner **manuellement** (hors bot, formules du PDF — non automatisées) :\n"
+            "• le nombre de camions envoyés et leur grade\n"
+            "• le nombre de mineurs\n"
+            "• la distance en salons\n\n"
+            "🚛 Carburant : distance × 2 (aller-retour) × 10 L × 2¥, **par camion** envoyé.\n"
+            "⛏️ Mineurs : voir la capacité d'extraction par classe de pierre (salaire 5000¥/mineur).\n\n"
+            f"Une fois le NET final connu (après carburant + mineurs), lance la répartition :\n"
+            f"`/raid-repartition raid_id:{raid_id} net_final:<montant>`")
+        await self._dm_user(OWNER_ID, content=eco)
 
     def _chunk_recap(self, header, lignes, limit=1950):
         """Regroupe header + lignes en messages <= limit, sans couper une ligne. Le header ouvre le
@@ -1502,8 +1681,8 @@ class Raid(commands.Cog):
                 continue
             reste = (1 if c.current else 0) + len(c.queue)
             lignes.append(
-                f"• **{c.name}** — PV {max(c.pv, 0):,} / {c.pv_max:,} · EO {max(c.eo, 0):,} · "
-                f"crit {c.crit_chance}% · monstres restants : {reste}".replace(",", " "))
+                f"**{c.name}** — PV: {max(c.pv, 0):,}/{c.pv_max:,} · EO: {max(c.eo, 0):,}/{c.eo_max:,} · "
+                f"Crit: {c.crit_chance}% · 👹 {reste} PNJ restant(s)".replace(",", " "))
         if session.boss is not None:
             b = session.boss
             lignes.append(
@@ -1540,6 +1719,9 @@ class Raid(commands.Cog):
         raid_id = db.raid_create_instance(
             guild_id, channel_id, classe, json.dumps(stones), monster_count,
             status, ordre_id, chief_deadline, _now())
+        # §2 : prix unitaire fixe tiré une seule fois pour CHAQUE classe de pierre présente dans ce raid.
+        stone_prices = {c: random.randint(*RAID_STONE_PRICE[c]) for c, q in stones.items() if q > 0}
+        db.raid_set_instance_stone_prices(raid_id, json.dumps(stone_prices))
 
         # EMBED 1 : dans le salon où le raid apparaît.
         raid_channel = self.bot.get_channel(channel_id)
@@ -1600,22 +1782,37 @@ class Raid(commands.Cog):
             lignes.append(f"**{nom}** (Slot {slot}) — <@{owner}>{marqueur}")
         return f"👥 **Participants actuels ({len(parts)})**\n" + "\n".join(lignes)
 
+    def _stone_breakdown(self, raid):
+        """Détail des pierres du raid : liste ('{q}x Pierre Classe {c} — {pu}¥/unité') + valeur totale
+        (somme q×prix_unitaire), à partir de stones_json + stone_prices_json (prix fixés au déclenchement)."""
+        stones = json.loads(raid["stones_json"] or "{}")
+        prices_raw = raid["stone_prices_json"] if "stone_prices_json" in raid.keys() else None
+        prices = json.loads(prices_raw) if prices_raw else {}
+        lignes, total = [], 0
+        for c, q in stones.items():
+            if q <= 0:
+                continue
+            pu = prices.get(c) or 0
+            total += q * pu
+            lignes.append(f"{q}x Pierre Classe {c} — {_fmt(pu)}¥/unité")
+        return lignes, total
+
     def _build_announce_embed(self, raid):
         """EMBED 2 (annonce officielle) : 3 catégories 📍 SITUATION / 💎 BUTIN & EFFECTIF / 🏆 RÉCOMPENSES
         + 👥 PARTICIPANTS, couleur rouge, GIF en pied de page. Récompenses = RAID_REWARDS[classe] (XP /
-        stats à répartir / coffres uniquement). MVP +1,5% : TODO Phase 4-5 (non fonctionnel ici)."""
+        stats à répartir / coffres uniquement)."""
         classe = raid["classe"]
         monster_count = raid["monster_count"]
         channel_id = raid["channel_id"]
-        stones = json.loads(raid["stones_json"] or "{}")
         r = RAID_REWARDS[classe]
-        prix = RAID_STONE_PRICE[classe]
         eff_lo, eff_hi = self._suggested_effectif(classe)
         coffres = ", ".join(RAID_LABELS_COFFRE[c] for c in r["coffres"])
         sep = "━━━━━━━━━━━━━━━━━━━━"
         reserve = ""
         if raid["ordre_id"] and not raid["is_public"]:
             reserve = "\n🔒 Raid réservé à l'Ordre propriétaire du salon (non public)."
+        stone_lignes, valeur_totale = self._stone_breakdown(raid)
+        butin = "\n".join(stone_lignes) if stone_lignes else "—"
         desc = (
             f"📍 **SITUATION**\n"
             f"Salon touché : <#{channel_id}>\n"
@@ -1623,8 +1820,8 @@ class Raid(commands.Cog):
             f"Entités détectées : **{monster_count}**{reserve}\n\n"
             f"{sep}\n"
             f"💎 **BUTIN & EFFECTIF**\n"
-            f"Pierres occultes : {_stones_text(stones)}\n"
-            f"Valeur estimée d'une pierre : {_fmt(prix[0])} – {_fmt(prix[1])} ¥\n"
+            f"{butin}\n"
+            f"Valeur totale estimée : **{_fmt(valeur_totale)}¥**\n"
             f"Effectif suggéré : **{eff_lo} à {eff_hi}** participant(s).\n\n"
             f"{sep}\n"
             f"🏆 **RÉCOMPENSES**\n"

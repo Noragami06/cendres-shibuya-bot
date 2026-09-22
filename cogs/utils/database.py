@@ -620,6 +620,7 @@ CREATE TABLE IF NOT EXISTS raid_instances (
     channel_id INTEGER,          -- salon où le raid est apparu
     classe TEXT,
     stones_json TEXT,            -- ex: {"4": 25, "3": 5}
+    stone_prices_json TEXT,      -- prix unitaire fixe tiré pour ce raid, par classe ex: {"4": 3200}
     monster_count INTEGER,
     status TEXT DEFAULT 'attente_reponse',  -- attente_reponse / ouvert / clos_sans_reponse / en_cours / termine
     ordre_id INTEGER,            -- NULL si le salon n'appartient à personne
@@ -1278,6 +1279,7 @@ def _ensure_raid_instances_columns(conn):
         ("is_public", "INTEGER DEFAULT 0"),
         ("announce_message_id", "INTEGER"),
         ("classe", "TEXT"),
+        ("stone_prices_json", "TEXT"),
     ):
         if name not in cols:
             conn.execute(f"ALTER TABLE raid_instances ADD COLUMN {name} {decl}")
@@ -3422,6 +3424,12 @@ def raid_set_instance_announce_msg(raid_id: int, message_id: int):
     with get_connection() as conn:
         conn.execute("UPDATE raid_instances SET announce_message_id = ? WHERE id = ?",
                      (message_id, raid_id))
+
+
+def raid_set_instance_stone_prices(raid_id: int, stone_prices_json: str):
+    with get_connection() as conn:
+        conn.execute("UPDATE raid_instances SET stone_prices_json = ? WHERE id = ?",
+                     (stone_prices_json, raid_id))
 
 
 def raid_get_expired_chief_deadlines(now_iso: str):

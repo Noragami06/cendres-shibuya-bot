@@ -15,6 +15,9 @@ from discord.ext import commands, tasks
 
 from cogs.utils import database as db
 from cogs.utils.image_gen import generate_daily_enemy_image, generate_coffre_image
+from cogs.utils.combat_engine import (
+    apply_actor_action, init_combat_fields, DAILY_CRIT_RESET_VALUE,
+)
 from cogs.banque import get_characters, get_character, credit_compte_courant, PHOENIX_COLOR
 
 # =====================================================================
@@ -1109,11 +1112,12 @@ class Daily(commands.Cog):
             "pv_p": pnj["pv_max"], "pv_max_p": pnj["pv_max"],
             "eo_p": pnj["eo_max"], "eo_max_p": pnj["eo_max"],
             "force_base_p": pnj["force"],
-            "bloc_j": 0, "bloc_p": 0,          # compteurs de blocage (chance dégressive)
+            "bloc_j": 0, "bloc_p": 0,          # compteurs de blocage RÉELLEMENT testés (chance dégressive)
             "potions_p": pnj["potions"], "potion_pct_p": pnj["potion_pct"],
-            "crit_chance_j": DAILY_CRIT_BASE,  # §2 : chance de Black Flash, persiste tout le combat
+            "crit_chance_j": DAILY_CRIT_RESET_VALUE,  # §2 : chance de Black Flash (progression centralisée)
             "sort_bonus_j": 0,                 # bonus de dégâts de sort/arme (potion « force du sort »)
         }
+        init_combat_fields(st)  # crit_echecs_j, block_pending_j/p, last_action_j/p
         gains = {"force": 0, "endurance": 0, "energie_occulte": 0, "sorts": 0}
         sort_xp = {}  # principal_id -> xp total à accorder
 
@@ -1134,41 +1138,41 @@ class Daily(commands.Cog):
                 f"Le combat se termine dès qu'un camp atteint **{DAILY_PV_FLOOR} PV ou moins**."),
             color=discord.Color.red()))
 
-        # §6 : qui commence (n'influe que sur l'ordre d'affichage/priorité en cas d'égalité de total).
-        joueur_priorite = random.choice([True, False])
+        # §6 : tirage du camp qui commence (inchangé). Ensuite, ALTERNANCE STRICTE : un seul camp agit
+        # par round, l'autre a déjà vu ce choix avant de décider au round suivant.
+        actor_is_player = random.choice([True, False])
         await channel.send(
-            f"🎲 {'Tu commences' if joueur_priorite else 'Ton adversaire commence'} ce combat.")
+            f"🎲 {'Tu commences' if actor_is_player else 'Ton adversaire commence'} ce combat.")
 
         tour = 0
         issue = None  # "victoire" / "defaite"
         while True:
             tour += 1
-            # --- Action du JOUEUR (peut inclure un renforcement qui ne consomme pas le tour). ---
-            action_j = await self._player_turn(channel, user, character_id, st, gains, sort_xp)
-            if action_j is None:
-                await channel.send("⏳ Combat interrompu (temps écoulé). Aucune récompense enregistrée.")
-                return
-            # --- Action du PNJ. ---
-            action_p = self._pnj_turn(classe, st)
+            if actor_is_player:
+                # Menu complet (Renforcement/Potion ne consomment pas le round : redemande ensuite).
+                action = await self._player_turn(channel, user, character_id, st, gains, sort_xp)
+                if action is None:
+                    await channel.send("⏳ Combat interrompu (temps écoulé). Aucune récompense enregistrée.")
+                    return
+                text, color_key, crit_reussi = apply_actor_action(st, action, True, gains)
+                st["last_action_j"] = action.get("kind")
+                if crit_reussi:
+                    await self._play_black_flash(channel, st["name_j"])
+            else:
+                action = self._pnj_turn(classe, st)
+                text, color_key, crit_reussi = apply_actor_action(st, action, False, gains)
+                st["last_action_p"] = action.get("kind")
 
-            # --- §7 : résolution simultanée du tour (texte de résultat, couleur, critique éventuel). ---
-            result_text, color_key, crit_reussi = self._resolve_round(
-                st, action_j, action_p, gains, joueur_priorite)
+            await channel.send(embed=self._round_embed(tour, st, text, color_key))
 
-            # §4 : animation de Black Flash (parole + GIF) AVANT l'embed de résultat, en cas de critique.
-            if crit_reussi:
-                await self._play_black_flash(channel, st["name_j"])
-
-            # §3 : embed UNIQUE et structuré, identique pour toutes les actions.
-            await channel.send(embed=self._round_embed(tour, st, result_text, color_key))
-
-            # --- §8 : fin de combat. ---
+            # --- §8 : fin de combat (vérifiée après CHAQUE round, car un seul camp agit). ---
             if st["pv_p"] <= DAILY_PV_FLOOR:
                 issue = "victoire"
                 break
             if st["pv_j"] <= DAILY_PV_FLOOR:
                 issue = "defaite"
                 break
+            actor_is_player = not actor_is_player  # §3 : alternance obligatoire
 
         # §9 : application des récompenses + persistance.
         await self._finish_combat(channel, user, character_id, classe, st, gains, sort_xp, issue)
@@ -1192,13 +1196,23 @@ class Daily(commands.Cog):
             if potions:
                 options.append(("potion", "Utiliser une potion", "🧪", discord.ButtonStyle.success))
             view = DailyChoiceView(user.id, options)
+            # §5 : rappel de ce que l'adversaire vient de faire au round précédent (alternance stricte).
+            preambule = ""
+            last_p = st.get("last_action_p")
+            if last_p:
+                libelles = {"attaquer": "d'Attaquer", "bloquer": "de se mettre en garde"}
+                preambule = (f"🔎 **{st['name_p']}** vient {libelles.get(last_p, f'de {last_p}')} "
+                             "au round précédent !\n\n")
+            garde = "\n🛡️ Ta garde est levée (elle parera la prochaine attaque)." if st.get("block_pending_j") else ""
             desc = (
-                f"PV : **{max(st['pv_j'], DAILY_PV_FLOOR):,}** · Énergie occulte : **{st['eo_j']:,}**"
+                preambule
+                + f"PV : **{max(st['pv_j'], DAILY_PV_FLOOR):,}** · Énergie occulte : **{st['eo_j']:,}**"
                 + (f"\n🔮 Renforcement actif ce tour : +{bonus_force} Force" if bonus_force else "")
+                + garde
                 + "\n\n⚡ **Critique (Black Flash)**\n"
-                f"Chance actuelle : **{st.get('crit_chance_j', DAILY_CRIT_BASE)}%**\n"
-                "À chaque échec, ta chance augmente (jusqu'à 20%, puis +1%/échec ensuite). Une réussite "
-                "retombe à 10% et inflige **×10 dégâts**, sans jamais pouvoir être bloqué."
+                f"Chance actuelle : **{st.get('crit_chance_j', DAILY_CRIT_RESET_VALUE)}%**\n"
+                "À chaque échec, ta chance augmente (5%, puis 10%, puis +1%/échec ensuite). Une réussite "
+                "retombe à 1% et inflige **×10 dégâts**, sans jamais pouvoir être bloqué."
             )
             await channel.send(
                 embed=discord.Embed(title="🌀 Ton tour", description=desc, color=PHOENIX_COLOR),
@@ -1452,121 +1466,10 @@ class Daily(commands.Cog):
                 "force_actuelle": f_act}
 
     # ---------- §7 : résolution d'un tour ----------
-    def _resolve_round(self, st, aj, ap, gains, joueur_priorite):
-        """Applique le tour et retourne (texte_de_résultat, clé_couleur, crit_reussi) pour l'embed unique.
-        clé_couleur : 'green' (le joueur a placé une action offensive), 'red' (le joueur a subi des
-        dégâts), 'blue' (neutre). crit_reussi : True si un Black Flash a eu lieu ce tour (déclenche
-        l'animation dans la boucle avant l'embed de résultat)."""
-        nj, npnj = st["name_j"], st["name_p"]
-        pvj0, pvp0 = st["pv_j"], st["pv_p"]  # PV AVANT dégâts (pour l'affichage du clash)
-        f_j = aj.get("force_actuelle", current_force(st["force_base_j"], pvj0, st["pv_max_j"]))
-        f_p = ap.get("force_actuelle", current_force(st["force_base_p"], pvp0, st["pv_max_p"]))
-        player_dealt = 0
-        player_took = 0
-
-        # §2 : critique « Black Flash » — JOUEUR uniquement, action Attaquer (physique) uniquement (jamais
-        # PNJ, ni Bloquer/Sort/Arme/Renforcement/Potion). Le % n'est JAMAIS révélé au joueur.
-        crit_text = ""
-        crit_reussi = False
-        if aj.get("kind") == "attaquer":
-            aj = dict(aj)  # copie locale : ne jamais muter le dict d'action de l'appelant
-            if random.randint(1, 100) <= st.get("crit_chance_j", DAILY_CRIT_BASE):
-                crit_reussi = True
-                aj["damage"] = aj["damage"] * DAILY_CRIT_MULTIPLIER
-                st["crit_chance_j"] = DAILY_CRIT_BASE  # réussite -> retombe à 10%
-                crit_text = "\n💥 **BLACK FLASH !** Le coup critique inflige **×10 dégâts**, imblocable !"
-            else:
-                cc = st.get("crit_chance_j", DAILY_CRIT_BASE)
-                if cc == 10:
-                    st["crit_chance_j"] = 15
-                elif cc == 15:
-                    st["crit_chance_j"] = 20
-                else:
-                    st["crit_chance_j"] = cc + 1  # +1%/échec au delà de 20%
-
-        # §2 (correctif) : le CLASH ne se déclenche QUE si les DEUX camps font une attaque PHYSIQUE pure
-        # (« Attaquer »). Un Sort / une Arme maudite (kind "sort"/"arme") ne déclenche JAMAIS de clash :
-        # il tombe dans la résolution indépendante ci-dessous. Le PNJ ne fait jamais de sort, donc tester
-        # kind == "attaquer" des deux côtés est exact et suffisant. Comparaison sur la FORCE ACTUELLE SEULE
-        # (f_j / f_p incluent déjà le bonus de Renforcement Maudit du tour) ; égalité -> le choc s'annule.
-        if aj["kind"] == "attaquer" and ap["kind"] == "attaquer":
-            entete = ("⚔️ **Les deux camps attaquent !**\n\n"
-                      f"**{nj}** : **{f_j:,} de Force**\n"
-                      f"**{npnj}** : **{f_p:,} de Force**\n\n")
-            # §3 : un critique (Black Flash) remporte AUTOMATIQUEMENT le clash, quelle que soit la Force du
-            # PNJ (même si f_p > f_j). Dégâts ×10 déjà appliqués au dict aj, imblocables. Le PNJ ne riposte
-            # pas, exactement comme une victoire de clash normale.
-            if crit_reussi:
-                st["pv_p"] -= aj["damage"]
-                player_dealt = aj["damage"]
-                gains["force"] += 1
-                gagnant, perdant, deg = nj, npnj, aj["damage"]
-                couleur = "green"
-            elif f_j == f_p:
-                text = entete + (
-                    f"⚔️ **Clash égal !** {nj} et {npnj} ont la même puissance ({f_j:,} chacun) — "
-                    "le choc s'annule, aucun dégât cette fois.")
-                return text + crit_text, "blue", crit_reussi
-            elif f_j > f_p:
-                st["pv_p"] -= aj["damage"]
-                player_dealt = aj["damage"]
-                gains["force"] += 1
-                gagnant, perdant, deg = nj, npnj, aj["damage"]
-                couleur = "green"
-            else:
-                st["pv_j"] -= ap["damage"]
-                player_took = ap["damage"]
-                gagnant, perdant, deg = npnj, nj, ap["damage"]
-                couleur = "red"
-            text = entete + (
-                f"🏆 **{gagnant}** remporte le clash et inflige **{deg:,}** dégâts à {perdant} !\n"
-                f"{perdant} ne riposte pas ce tour-ci.")
-            return text + crit_text, couleur, crit_reussi
-
-        # Sinon : au plus un camp attaque -> résolution indépendante avec blocage éventuel.
-        parts = []
-        if aj["kind"] == "potion":
-            parts.append(f"🧪 **{nj}** utilise une potion et récupère de l'énergie occulte.")
-
-        if aj["attacking"]:  # le joueur attaque le PNJ ; le PNJ bloque-t-il ?
-            # §2 : un critique est IMBLOCABLE -> on force defender_blocking=False pour ce coup.
-            dealt, _ = self._apply_attack(
-                st, aj, defender="p", defender_blocking=(ap["blocking"] and not crit_reussi))
-            if dealt > 0:
-                player_dealt += dealt
-                gains["force"] += 1
-                if aj["dtype"] == "spell":
-                    sn = aj.get("spell_name") or "un sort"
-                    if aj.get("kind") == "arme":
-                        parts.append(f"🗡️ **{nj}** frappe avec **{sn}** et inflige **{dealt:,}** dégâts à {npnj} !")
-                    else:
-                        parts.append(f"✨ **{nj}** lance **{sn}** et inflige **{dealt:,}** dégâts à {npnj} !")
-                else:
-                    parts.append(f"🗡️ **{nj}** attaque et inflige **{dealt:,}** dégâts à {npnj} !")
-            else:
-                parts.append(f"🛡️ {npnj} bloque l'attaque de **{nj}** — aucun dégât.")
-
-        if ap["attacking"]:  # le PNJ attaque le joueur ; le joueur bloque-t-il ?
-            dealt, block_ok = self._apply_attack(st, ap, defender="j", defender_blocking=aj["blocking"])
-            if block_ok:
-                gains["endurance"] += 1
-                parts.append(f"🛡️ **Blocage réussi !** {nj} n'a subi aucun dégât de {npnj}.")
-            elif dealt > 0:
-                player_took += dealt
-                parts.append(f"💥 **{npnj}** attaque et inflige **{dealt:,}** dégâts à {nj} !")
-
-        if not aj["attacking"] and not ap["attacking"] and aj["kind"] != "potion":
-            parts.append(f"🌀 **{nj}** se met en garde tandis que **{npnj}** temporise.")
-
-        text = ("\n".join(parts) if parts else f"{nj} et {npnj} s'observent.") + crit_text
-        if player_dealt > 0:
-            color = "green"
-        elif player_took > 0:
-            color = "red"
-        else:
-            color = "blue"
-        return text, color, crit_reussi
-
+    # NOTE : l'ancien _resolve_round (modèle SIMULTANÉ avec clash Force-vs-Force) a été retiré. La
+    # résolution passe désormais par le moteur partagé cogs/utils/combat_engine.apply_actor_action
+    # (alternance stricte : un seul camp agit par round). _apply_attack reste utilisé par le tour du
+    # boss de /raid (attaque 1-vs-plusieurs).
     def _apply_attack(self, st, attack, defender, defender_blocking):
         """Applique `attack` sur le défenseur 'p' (PNJ) ou 'j' (joueur). Retourne (dégâts_infligés,
         blocage_réussi). blocage_réussi = le défenseur bloquait ET l'attaque a été annulée/réduite."""
