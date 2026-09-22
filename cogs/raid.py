@@ -327,17 +327,11 @@ class Raid(commands.Cog):
             return
         state = db.raid_get_cycle_state(interaction.guild.id)
         if state is None or not state["active"]:
-            # TEMPORAIRE — déclenchement immédiat pour phase de test, à retirer/remettre le délai normal
-            # une fois les tests terminés (revenir à next_announce = maintenant + RAID_CYCLE_HOURS sans
-            # appel direct à _trigger_raid).
-            now = datetime.utcnow()
-            db.raid_set_cycle_active(interaction.guild.id, 1, now.isoformat(), None)
+            next_announce = (datetime.utcnow() + timedelta(hours=RAID_CYCLE_HOURS)).isoformat()
+            db.raid_set_cycle_active(interaction.guild.id, 1, next_announce, None)
             await interaction.response.send_message(
-                "✅ Cycle de raids activé. Annonce de test déclenchée immédiatement.", ephemeral=True)
-            await self._trigger_raid(interaction.guild.id)  # déclenche tout de suite (Phase 1)
-            # Programme quand même le prochain cycle normalement après ce test.
-            next_announce = (now + timedelta(hours=RAID_CYCLE_HOURS)).isoformat()
-            db.raid_update_cycle_next(interaction.guild.id, next_announce, now.isoformat())
+                f"✅ Cycle de raids activé. Première annonce prévue dans {RAID_CYCLE_HOURS}h.",
+                ephemeral=True)
         else:
             db.raid_set_cycle_inactive(interaction.guild.id)
             await interaction.response.send_message(
@@ -480,6 +474,8 @@ class Raid(commands.Cog):
         """§3 : ferme la participation et lance le combat. Mentionne les participants, attribue les rôles
         du pool, crée un fil par participant, répartit les monstres au prorata du burst, génère les
         monstres (règles /daily, sans filtre de classe RP) et démarre le combat de chaque fil."""
+        if raid_id in self._sessions:
+            return  # combat déjà démarré (garde anti double-lancement : clic manuel + fermeture auto)
         raid = db.raid_get_instance(raid_id)
         daily = self.bot.get_cog("Daily")
         if raid is None or daily is None:
@@ -1588,21 +1584,21 @@ class Raid(commands.Cog):
         return RAID_EFFECTIF_SUGGERE[classe]
 
     def _participants_section(self, raid_id):
-        """Section « 👥 Participants actuels » de l'EMBED 2 (recalculée à chaque changement)."""
+        """Section « 👥 Participants actuels » de l'EMBED 2 (recalculée à chaque changement). Chaque ligne
+        affiche le personnage, son slot, et la MENTION du vrai propriétaire Discord (jamais juste le nom du
+        personnage), + un marqueur pour le chef du raid — même principe que « Voir les rôles » de /profil."""
         parts = db.raid_get_participants(raid_id)
         if not parts:
-            return "👥 **PARTICIPANTS**\nAucun participant pour l'instant."
+            return "👥 **Participants actuels (0)**\nAucun participant pour l'instant."
         lignes = []
-        chief_txt = "—"
         for p in parts:
             char = get_character(p["character_id"])
-            nom = (char["character_name"] if char else None) or f"#{p['character_id']}"
-            if p["is_raid_chief"]:
-                chief_txt = f"<@{p['user_id']}> ({nom})"
-                lignes.append(f"• 👑 **{nom}** (chef du raid)")
-            else:
-                lignes.append(f"• {nom}")
-        return "👥 **PARTICIPANTS ACTUELS**\n" + "\n".join(lignes) + f"\nChef du raid : {chief_txt}"
+            nom = (char["character_name"] if char and char["character_name"] else None) or f"#{p['character_id']}"
+            slot = char["slot_number"] if char else "?"
+            owner = char["user_id"] if char else p["user_id"]
+            marqueur = " — 👑 Chef du raid" if p["is_raid_chief"] else ""
+            lignes.append(f"**{nom}** (Slot {slot}) — <@{owner}>{marqueur}")
+        return f"👥 **Participants actuels ({len(parts)})**\n" + "\n".join(lignes)
 
     def _build_announce_embed(self, raid):
         """EMBED 2 (annonce officielle) : 3 catégories 📍 SITUATION / 💎 BUTIN & EFFECTIF / 🏆 RÉCOMPENSES
@@ -1645,7 +1641,8 @@ class Raid(commands.Cog):
         return embed
 
     def _participation_view(self, raid):
-        """Boutons sous l'EMBED 2 : « ⚔️ Participer » (+ « 🌍 Mettre en public » si salon d'Ordre)."""
+        """Boutons sous l'EMBED 2 : « ⚔️ Participer » (+ « 🌍 Mettre en public » si salon d'Ordre, +
+        « 🔒 Fermer les participations » dès qu'un chef de raid existe)."""
         view = discord.ui.View(timeout=None)
         view.add_item(discord.ui.Button(
             label="Participer", emoji="⚔️", style=discord.ButtonStyle.success,
@@ -1654,6 +1651,11 @@ class Raid(commands.Cog):
             view.add_item(discord.ui.Button(
                 label="Mettre en public", emoji="🌍", style=discord.ButtonStyle.secondary,
                 custom_id=f"raid_public:{raid['id']}"))
+        # Raccourci optionnel du chef du raid (dès le 1er participant accepté) : ferme quand il veut.
+        if db.raid_get_chief(raid["id"]) is not None:
+            view.add_item(discord.ui.Button(
+                label="Fermer les participations", emoji="🔒", style=discord.ButtonStyle.danger,
+                custom_id=f"raid_close:{raid['id']}"))
         return view
 
     async def _refresh_announce(self, raid_id):
@@ -1666,7 +1668,8 @@ class Raid(commands.Cog):
             return
         try:
             msg = await channel.fetch_message(raid["announce_message_id"])
-            await msg.edit(embed=self._build_announce_embed(raid))
+            # Ré-attache la vue : fait apparaître « 🔒 Fermer les participations » dès qu'un chef existe.
+            await msg.edit(embed=self._build_announce_embed(raid), view=self._participation_view(raid))
         except discord.HTTPException:
             pass
 
@@ -1784,6 +1787,8 @@ class Raid(commands.Cog):
             await self._handle_join(interaction, cid)
         elif cid.startswith("raid_public:"):
             await self._handle_public(interaction, cid)
+        elif cid.startswith("raid_close:"):
+            await self._handle_close(interaction, cid)
         elif cid.startswith("raid_approve:"):
             await self._handle_approval(interaction, cid, accepted=True)
         elif cid.startswith("raid_refuse:"):
@@ -2028,6 +2033,32 @@ class Raid(commands.Cog):
         # TODO Phase 2 (nuance) : proposer le choix toi-même/membres à un chef d'Ordre accepté par ce
         # chemin d'approbation (ici, il rejoint seul ; l'auto-amenée de membres reste dispo via son propre
         # clic « Participer »).
+
+    async def _handle_close(self, interaction, cid):
+        """§2 : le chef du raid ferme la participation à tout moment (aucun minimum), raccourci optionnel
+        qui ne remplace pas les filets de sécurité automatiques (2h/1h). Réutilise la fermeture standard
+        (_close_and_start_combat : statut 'en_cours', embed figé, lancement du combat)."""
+        raid_id = int(cid.split(":")[1])
+        raid = db.raid_get_instance(raid_id)
+        if raid is None or raid["status"] not in ("attente_reponse", "ouvert"):
+            await interaction.response.send_message(
+                "La participation à ce raid est déjà terminée.", ephemeral=True)
+            return
+        chief = db.raid_get_chief(raid_id)
+        if chief is None or interaction.user.id != chief["user_id"]:
+            await interaction.response.send_message(
+                "❌ Seul le chef du raid peut fermer les participations.", ephemeral=True)
+            return
+        # Désactive immédiatement les boutons de l'annonce.
+        try:
+            await interaction.response.edit_message(view=None)
+        except discord.HTTPException:
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException:
+                pass
+        # Fermeture standard -> statut 'en_cours', embed figé, combat lancé (comme les fermetures auto).
+        await self._close_and_start_combat(raid_id)
 
     async def _handle_public(self, interaction, cid):
         raid_id = int(cid.split(":")[1])
