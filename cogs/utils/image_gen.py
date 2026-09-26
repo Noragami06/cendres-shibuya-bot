@@ -603,13 +603,19 @@ def generate_inventaire_image(character_name: str, items: list, total_value: str
         color = CLASS_COLORS_INV.get(cls, CLASS_COLORS_INV["sans"])
         d.rounded_rectangle((x, yy, x + col_w, yy + row_h), radius=10, fill=CARD)
         d.rounded_rectangle((x, yy, x + col_w, yy + 8), radius=4, fill=color)
+        # Nom + quantité COLLÉE juste après le nom (jamais posée à droite, donc jamais superposée à la
+        # disponibilité/prix, quelle que soit la longueur du nom).
         d.text((x + 24, yy + 22), name, font=font(15, True), fill=TEXT)
+        name_w = text_w(d, name, font(15, True))
+        d.text((x + 24 + name_w + 10, yy + 24), f"x{qty}", font=font(13, True), fill=SUB)
         d.text((x + 24, yy + 46), desc, font=font(11), fill=SUB)
         classe_label = _inv_classe_label(cls)
         d.text((x + 24, yy + 70), classe_label, font=font(11, True), fill=color)
-        d.text((x + col_w - 140, yy + 22), f"x{qty}", font=font(13, True), fill=TEXT)
+        # Disponibilité / prix : ligne SÉPARÉE, en bas de carte, alignée à droite (aucun chevauchement).
+        indispo = "disponible" in val.lower()
+        val_color = SUB if indispo else (120, 220, 160, 255)
         vw = text_w(d, val, font(13, True))
-        d.text((x + col_w - 24 - vw, yy + 22), val, font=font(13, True), fill=(120, 220, 160, 255))
+        d.text((x + col_w - 24 - vw, yy + row_h - 34), val, font=font(13, True), fill=val_color)
 
     # legende
     ly = H - 60

@@ -12,6 +12,7 @@ from cogs.utils.database import get_bot_state, set_bot_state
 from cogs.profil import (
     backfill_pv_system, backfill_secondary_sort_values, backfill_sort_unlock_status,
     backfill_territoire_defaults, backfill_fiche_record,
+    backfill_reorder_secondary_sorts_by_classe,
 )
 from cogs.shop import backfill_shop_prices_new_ranges
 from cogs.utils.database import init_db
@@ -83,6 +84,10 @@ async def on_ready():
         _profil_backfills_done = True
         await backfill_pv_system()
         await backfill_secondary_sort_values()
+        # Réordonne le déblocage des sorts secondaires par classe (4→3→2→1→S) puis dégâts croissants, au
+        # lieu de l'ordre de création. APRÈS backfill_secondary_sort_values (les dégâts servent au tri).
+        # Idempotent via bot_state 'reorder_sorts_by_classe_done'.
+        await backfill_reorder_secondary_sorts_by_classe()
         await backfill_sort_unlock_status()
         await backfill_territoire_defaults()
         # Rattrapage UNIQUE de fiche_record (source de vérité permanente de l'EO). Ensuite, la

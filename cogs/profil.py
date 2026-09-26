@@ -80,6 +80,8 @@ TECHNIQUE_SORT_PALETTE = [
 ]
 # Les 5 classes de sorts valides (saisies par le joueur lors du flux guidé).
 TECHNIQUE_VALID_CLASSES = ("4", "3", "2", "1", "S")
+# Ordre de déblocage des sorts secondaires : de la classe la plus FAIBLE à la plus forte (4→3→2→1→S).
+SECONDARY_CLASSE_RANK = {"4": 0, "3": 1, "2": 2, "1": 3, "S": 4}
 # Seul cet utilisateur précis peut valider une demande de création de techniques (bouton ✅ Confirmer).
 TECHNIQUE_VALIDATOR_ID = 396615332346855428
 # Propriétaire du bot (même identifiant) : seul habilité à modifier un coût encore exprimé en %.
@@ -2099,6 +2101,14 @@ class Profil(commands.Cog):
         # du sort principal (unlock_level), calculée avant l'écriture. running_level enchaîne les paliers
         # d'un sort principal au suivant ; max_niveau_requis est conservé LOCALEMENT à chaque principal
         # (seuil de fin de Phase 1 = max_level_threshold). ---
+        # Pré-passe : on FIGE dès maintenant les dégâts de base + le coût EO de chaque sort secondaire
+        # (tirage unique par la classe), car les DÉGÂTS servent de critère de départage du tri de déblocage.
+        for principal in plan:
+            for sec in principal["secondaires"]:
+                sec["cout_pct"] = SPELL_CLASS_VALUES[sec["classe"]]["cout_pct"]
+                sec["degats"] = random.randint(SPELL_CLASS_VALUES[sec["classe"]]["degats_min"],
+                                               SPELL_CLASS_VALUES[sec["classe"]]["degats_max"])
+
         LEVEL_STEP = 5
         running_level = 1
         for principal in plan:
@@ -2106,9 +2116,14 @@ class Profil(commands.Cog):
             secondaires = principal["secondaires"]
             total_secondaires = len(secondaires)
             default_unlocked = max(1, total_secondaires // 4)
+            # Ordre de déblocage = CLASSE croissante (4→3→2→1→S), départage par DÉGÂTS croissants (le plus
+            # faible débloqué en premier). Les paliers eux-mêmes (running_level, +5, +10…) sont inchangés :
+            # seul QUEL sort reçoit QUEL palier change.
+            ordre = sorted(secondaires,
+                           key=lambda s: (SECONDARY_CLASSE_RANK.get(s["classe"], 9), s.get("degats", 0)))
             locked_index = 0
             max_niveau_requis = running_level
-            for j, sec in enumerate(secondaires):
+            for j, sec in enumerate(ordre):
                 if j < default_unlocked:
                     sec["niveau_requis"] = running_level
                 else:
@@ -2136,20 +2151,11 @@ class Profil(commands.Cog):
                 is_unlocked=is_unlocked,
             )
             for sec_index, sec in enumerate(principal["secondaires"]):
-                # Coût en % résolu depuis le barème validé (source unique SPELL_CLASS_VALUES).
-                cout_pct = SPELL_CLASS_VALUES[sec["classe"]]["cout_pct"]
-                # Ce tirage donne la valeur de dégâts DE BASE pour ce sort précis, fixée une seule fois à
-                # la création. La progression de dégâts par niveau (+55/niveau via grant_sort_xp) s'ajoute
-                # ensuite. La conversion du coût % en EO fixe au premier usage réel reste un point non
-                # abordé (aucun système de combat existant pour le déclencher).
-                degats_min = SPELL_CLASS_VALUES[sec["classe"]]["degats_min"]
-                degats_max = SPELL_CLASS_VALUES[sec["classe"]]["degats_max"]
-                degats = random.randint(degats_min, degats_max)
-                # TODO : le seuil des 40% de réserve minimum pour pouvoir déclencher une technique encore
-                # en % n'est pas implémenté (aucun système de combat pour le vérifier).
+                # Coût % et dégâts de base ont été figés dans la pré-passe ci-dessus (les dégâts servent
+                # de critère de départage à classe égale). slot_index conserve l'ordre de création.
                 db.insert_secondary_sort(
-                    sort_id, sec_index, sec["name"], sec["classe"], cout_pct,
-                    sec["description"], sec["faiblesse"], degats=degats,
+                    sort_id, sec_index, sec["name"], sec["classe"], sec["cout_pct"],
+                    sec["description"], sec["faiblesse"], degats=sec["degats"],
                     niveau_requis=sec["niveau_requis"],
                 )
 
@@ -4388,6 +4394,39 @@ async def backfill_secondary_sort_values():
                 (cout_pct, degats, s["id"]),
             )
             print(f"🔍 [backfill sorts] Sort {s['id']} (classe {s['classe']}) : coût {cout_pct}%, dégâts {degats}")
+
+
+async def backfill_reorder_secondary_sorts_by_classe():
+    """Rattrapage UNIQUE : réordonne le déblocage des sorts secondaires par CLASSE croissante (4→3→2→1→S),
+    départage par DÉGÂTS croissants, au lieu de l'ancien ordre de création. Opère PAR SORT PRINCIPAL
+    (niveau_requis est une chaîne de paliers propre à chaque principal). Les VALEURS de paliers ne changent
+    jamais — seul QUEL sort reçoit QUEL palier change. Le déblocage effectif étant DYNAMIQUE (niveau du
+    principal >= niveau_requis), aucune colonne is_unlocked de secondaire n'existe ni n'est touchée : le
+    statut se recalcule tout seul à l'affichage. Ne touche jamais nom/dégâts/coût. Idempotent via bot_state."""
+    if db.get_bot_state("reorder_sorts_by_classe_done"):
+        return
+    corriges = set()
+    with db.get_connection() as conn:
+        principaux = conn.execute("SELECT id, character_id FROM character_sorts").fetchall()
+        for p in principaux:
+            secs = conn.execute(
+                "SELECT id, slot_index, classe, niveau_requis, degats FROM character_secondary_sorts "
+                "WHERE sort_id = ? AND classe IS NOT NULL AND name IS NOT NULL "
+                "ORDER BY niveau_requis ASC, slot_index ASC", (p["id"],)).fetchall()
+            if len(secs) <= 1:
+                continue
+            paliers = [s["niveau_requis"] for s in secs]  # conservés tels quels
+            tries = sorted(secs, key=lambda s: (SECONDARY_CLASSE_RANK.get(s["classe"], 9),
+                                                s["degats"] if s["degats"] is not None else 0))
+            if [s["id"] for s in secs] == [t["id"] for t in tries]:
+                continue  # déjà dans l'ordre classe/dégâts -> rien à faire
+            for i, sort in enumerate(tries):
+                conn.execute("UPDATE character_secondary_sorts SET niveau_requis = ? WHERE id = ?",
+                             (paliers[i], sort["id"]))
+            corriges.add(p["character_id"])
+    db.set_bot_state("reorder_sorts_by_classe_done", "1")
+    print(f"🔍 [backfill sorts] {len(corriges)} personnage(s) réordonnés par classe (4→3→2→1→S) "
+          "puis dégâts croissants, au lieu de l'ordre de création.")
 
 
 async def backfill_sort_unlock_status():
