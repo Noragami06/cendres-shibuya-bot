@@ -25,7 +25,7 @@ from cogs.daily import (
     _add_role_real_or_virtual, _remove_role_real_or_virtual,
     DAILY_PV_FLOOR, DAILY_CRIT_BASE, DAILY_DAMAGE_RATIO, DAILY_PNJ_WEIGHTS,
 )
-from cogs.utils.combat_engine import apply_actor_action, DAILY_CRIT_RESET_VALUE
+from cogs.utils.combat_engine import resolve_exchange, DAILY_CRIT_RESET_VALUE
 
 # =====================================================================
 # 0. CONSTANTES
@@ -629,19 +629,20 @@ class Raid(commands.Cog):
                 monster = owner.current
                 gains = {"force": 0, "endurance": 0, "energie_occulte": 0, "sorts": 0}
                 sort_xp = {}
-
-                # --- ROUND DU JOUEUR (alternance stricte : seul le joueur agit ici) ---
                 tour += 1
+
+                # UN ÉCHANGE (moteur partagé) : le joueur DÉCLARE (menu complet), le monstre RÉAGIT en
+                # direct (IA), puis resolve_exchange centralise clash / blocage / crit / renfort défensif.
                 st = self._build_st(comb, monster)
                 pvp_before = st["pv_p"]
                 action = await daily._player_turn(
                     owner.thread, comb.member, comb.character_id, st, gains, sort_xp)
                 if action is None:
-                    action = {"kind": "bloquer", "attacking": False, "damage": 0, "dtype": None,
-                              "blocking": True,
+                    action = {"kind": "defendre", "attacking": False, "damage": 0, "dtype": None,
+                              "blocking": True, "def_reinforce": 0, "def_endurance": 0,
                               "force_actuelle": current_force(comb.force_base, comb.pv, comb.pv_max)}
-                text, color, crit = apply_actor_action(st, action, True, gains)
-                st["last_action_j"] = action.get("kind")
+                ap = daily._pnj_turn(session.classe, st)
+                text, color, crit = resolve_exchange(st, action, ap, gains)
                 if crit:
                     await daily._play_black_flash(owner.thread, comb.name)
                 self._writeback_st(st, comb, monster)
@@ -652,7 +653,7 @@ class Raid(commands.Cog):
                     owner.participant_id, current_monster_state_json=json.dumps(monster))
                 await self._update_global_tracker(raid_id)
 
-                # Monstre vaincu -> suivant (le monstre ne joue pas son round).
+                # Monstre vaincu -> monstre suivant de la file.
                 if monster["pv"] <= DAILY_PV_FLOOR:
                     owner.current = owner.queue.pop(0) if owner.queue else None
                     db.raid_update_participant(
@@ -669,18 +670,6 @@ class Raid(commands.Cog):
                     except discord.HTTPException:
                         pass
                     continue
-
-                # --- ROUND DU MONSTRE (l'autre camp agit, après avoir vu l'action du joueur) ---
-                tour += 1
-                st = self._build_st(comb, monster)
-                ap = daily._pnj_turn(session.classe, st)
-                text2, color2, _ = apply_actor_action(st, ap, False, gains)
-                st["last_action_p"] = ap.get("kind")
-                self._writeback_st(st, comb, monster)
-                await self._send_round(owner, st, text2, color2, tour)
-                db.raid_update_participant(
-                    owner.participant_id, current_monster_state_json=json.dumps(monster))
-                await self._update_global_tracker(raid_id)
 
                 # Joueur tombé -> secours (§5).
                 if comb.pv <= DAILY_PV_FLOOR:
@@ -968,21 +957,27 @@ class Raid(commands.Cog):
         boss = session.boss
         gains = {"force": 0, "endurance": 0, "energie_occulte": 0, "sorts": 0}
         sort_xp = {}
-        # Alternance stricte : seul le joueur agit ici. La posture de blocage du boss (armée à son propre
-        # tour) est testée par cette attaque le cas échéant ; le boss ripostera à SON tour (_boss_turn).
+        # Le joueur DÉCLARE, le boss RÉAGIT : s'il est en garde -> Défendre (blocage), sinon il temporise
+        # (il ripostera à SON tour, _boss_turn). Résolution centralisée par resolve_exchange.
         st = self._build_st(comb, boss)
-        st["block_pending_p"] = session.boss_blocking
         pvp_before = boss["pv"]
         action = await daily._player_turn(session.boss_thread, comb.member, comb.character_id, st, gains, sort_xp)
         if action is None:
-            action = {"kind": "bloquer", "attacking": False, "damage": 0, "dtype": None,
-                      "blocking": True, "force_actuelle": current_force(comb.force_base, comb.pv, comb.pv_max)}
-        comb.pending_block = (action.get("kind") == "bloquer")
-        text, color, crit = apply_actor_action(st, action, True, gains)
+            action = {"kind": "defendre", "attacking": False, "damage": 0, "dtype": None,
+                      "blocking": True, "def_reinforce": 0, "def_endurance": 0,
+                      "force_actuelle": current_force(comb.force_base, comb.pv, comb.pv_max)}
+        comb.pending_block = (action.get("kind") == "defendre")
+        if session.boss_blocking:
+            ap = {"kind": "defendre", "attacking": False, "damage": 0, "dtype": None, "blocking": True,
+                  "def_reinforce": 0, "def_endurance": 0, "force_actuelle": 0}
+        else:
+            ap = {"kind": "attente", "attacking": False, "damage": 0, "dtype": None, "blocking": False,
+                  "force_actuelle": 0}
+        text, color, crit = resolve_exchange(st, action, ap, gains)
         if crit:
             await daily._play_black_flash(session.boss_thread, comb.name)
         self._writeback_st(st, comb, boss)
-        session.boss_blocking = st.get("block_pending_p", False)  # posture consommée si le joueur a attaqué
+        session.boss_blocking = False  # posture testée/consommée par l'échange
         dealt = max(0, pvp_before - boss["pv"])
         comb.total_damage += dealt
         db.raid_add_participant_damage(comb.participant_id, dealt)

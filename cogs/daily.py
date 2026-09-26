@@ -16,7 +16,7 @@ from discord.ext import commands, tasks
 from cogs.utils import database as db
 from cogs.utils.image_gen import generate_daily_enemy_image, generate_coffre_image
 from cogs.utils.combat_engine import (
-    apply_actor_action, init_combat_fields, DAILY_CRIT_RESET_VALUE,
+    run_combat, resolve_exchange, init_combat_fields, estimate_win_rate, DAILY_CRIT_RESET_VALUE,
 )
 from cogs.banque import get_characters, get_character, credit_compte_courant, PHOENIX_COLOR
 
@@ -1001,71 +1001,117 @@ class Daily(commands.Cog):
                 "utiliser /daily.")
             return None, None
         player_stats = self._player_stats(character_id)
+
+        # §1 : conseil de difficulté personnalisé (taux de victoire estimé par classe accessible).
+        allowed = [c for c in CLASSES_ORDRE
+                   if DAILY_CLASSE_RANK[c] - DAILY_CLASSE_RANK[player_rp_classe] < 3]
+        rates = {c: estimate_win_rate(DAILY_CLASSE_RANK[c] - DAILY_CLASSE_RANK[player_rp_classe])
+                 for c in allowed}
+
+        def _highest_in(lo, hi):
+            # CLASSES_ORDRE est ordonné 4->S, donc le dernier candidat est la classe la plus haute.
+            cands = [c for c in allowed if lo <= rates[c] <= hi]
+            return cands[-1] if cands else None
+
+        largement = _highest_in(80, 100)
+        conseillee = _highest_in(40, 65)
+        risquee = _highest_in(10, 35)
+        # Cas limite : aucune classe ne franchit un palier (ex: joueur si fort que tout dépasse 80%).
+        if largement is None and conseillee is None and risquee is None:
+            largement = allowed[-1]
+
+        classe = await self._choose_difficulty(channel, user, player_rp_classe, allowed, rates,
+                                               largement, conseillee, risquee)
+        if classe is None:
+            await channel.send("⏳ /daily annulé.")
+            return None, None
+        gap = DAILY_CLASSE_RANK[classe] - DAILY_CLASSE_RANK[player_rp_classe]
+
+        # §2 : ordre pré-combat = PNJ d'abord, PUIS l'embed d'informations, PUIS attente, PUIS « Commencer ».
+        pv_override = self._burst_pv_override(character_id, player_stats, classe, gap)
+        pnj = generate_pnj(player_stats, classe, pv_override=pv_override)
+        await self._send_pnj_pillow(channel, pnj)  # 1) pillow du PNJ EN PREMIER
+        await channel.send(embed=self._info_embed(classe, rates.get(classe, 50)))  # 2) infos ensuite
+        await asyncio.sleep(random.uniform(3, 5))  # 4) petite attente
+        view = DailyChoiceView(user.id, [("start", "Commencer", "▶️", discord.ButtonStyle.success)])
+        await channel.send("Prêt ?", view=view)  # 5) bouton unique « Commencer »
+        await view.wait()
+        if view.result != "start":
+            await channel.send("⏳ /daily annulé (temps écoulé).")
+            return None, None
+        return pnj, classe
+
+    async def _choose_difficulty(self, channel, user, player_rp_classe, allowed, rates,
+                                 largement, conseillee, risquee):
+        """§1 : embed de conseil + 4 boutons (largement gagnable / conseillée / risquée / au choix).
+        Retourne la classe choisie, ou None si annulé."""
         while True:
-            # §1 : choix de la difficulté — seules les classes dont le gap reste < 3 sont proposées
-            # (les difficultés hors de portée sont RETIRÉES de la liste, jamais présentées au clic).
-            allowed = [c for c in CLASSES_ORDRE
-                       if DAILY_CLASSE_RANK[c] - DAILY_CLASSE_RANK[player_rp_classe] < 3]
-            lignes = "\n".join(f"**{i}.** Classe {c}" for i, c in enumerate(allowed, 1))
+            lignes = [f"Ta classe RP actuelle : **Classe {player_rp_classe}**", ""]
+            options = []
+            if largement:
+                lignes.append(f"✅ **Classe {largement}** — Largement gagnable (~{rates[largement]}%)")
+                options.append(("adv_largement", f"Classe {largement} — Largement gagnable", "✅",
+                                discord.ButtonStyle.success))
+            if conseillee:
+                lignes.append(f"⭐ **Classe {conseillee}** — Meilleur choix conseillé (~{rates[conseillee]}%)")
+                options.append(("adv_conseillee", f"Classe {conseillee} — Meilleur choix conseillé", "⭐",
+                                discord.ButtonStyle.primary))
+            if risquee:
+                lignes.append(f"⚠️ **Classe {risquee}** — Risqué mais accessible (~{rates[risquee]}%)")
+                options.append(("adv_risquee", f"Classe {risquee} — Risqué mais accessible", "⚠️",
+                                discord.ButtonStyle.danger))
+            options.append(("libre", "Choisir une classe au choix", "📋", discord.ButtonStyle.secondary))
+            await channel.send(
+                embed=discord.Embed(title="🎯 Conseil de difficulté", description="\n".join(lignes),
+                                    color=PHOENIX_COLOR),
+                view=(v := DailyChoiceView(user.id, options)))
+            await v.wait()
+            if v.result is None:
+                return None
+            if v.result == "adv_largement":
+                return largement
+            if v.result == "adv_conseillee":
+                return conseillee
+            if v.result == "adv_risquee":
+                return risquee
+            # « au choix » : liste numérotée des classes accessibles (contraintes de gap déjà appliquées).
+            liste = "\n".join(f"**{i}.** Classe {c} (~{rates[c]}% de victoire estimé)"
+                              for i, c in enumerate(allowed, 1))
             await channel.send(embed=discord.Embed(
-                title="🎯 Choisis la difficulté",
-                description=f"Ta classe RP actuelle : **Classe {player_rp_classe}**\n\n{lignes}",
-                color=PHOENIX_COLOR))
+                title="📋 Choisis une classe", description=liste, color=PHOENIX_COLOR))
             choix = await self._ask_int(
                 channel, user, f"Réponds par un numéro de 1 à {len(allowed)} (ou « annuler »).",
                 1, len(allowed))
             if choix is None:
-                await channel.send("⏳ /daily annulé.")
-                return None, None
-            classe = allowed[choix - 1]
-            gap = DAILY_CLASSE_RANK[classe] - DAILY_CLASSE_RANK[player_rp_classe]
+                return None
+            return allowed[choix - 1]
 
-            # §2 : embed avantages / malus.
-            if classe in ("4", "3"):
-                adv = "nettement plus faible que toi"
-            elif classe == "2":
-                adv = "à ton niveau (parfois plus fort, parfois plus faible)"
-            else:
-                adv = "plus fort que toi"
-            coffres = ", ".join(DAILY_COFFRE_LABELS[k] for k in DAILY_COFFRE_KEYS
-                                if DAILY_COFFRE_ACCESS.get(classe, {}).get(k))
-            await channel.send(embed=discord.Embed(
-                title=f"📋 Classe {classe} sélectionnée",
-                description=(f"🎁 Points par action réussie : **+{DAILY_REWARD_POINTS[classe]['victoire']}** "
-                             f"(victoire) / **+{DAILY_REWARD_POINTS[classe]['defaite']}** (défaite)\n"
-                             f"⚔️ Adversaire : **{adv}**\n"
-                             f"🎁 Coffres accessibles : {coffres}"),
-                color=PHOENIX_COLOR))
-
-            # §1+§3-4 : PV du PNJ basé sur le burst du joueur (anti one-shot) × réf. de classe × gap, reste
-            # des stats en % (DAILY_STATS_TABLE, inchangé).
-            pv_override = self._burst_pv_override(character_id, player_stats, classe, gap)
-            pnj = generate_pnj(player_stats, classe, pv_override=pv_override)
-            rerolls = 0
-            while True:
-                await self._send_pnj_pillow(channel, pnj)
-                restants = DAILY_MAX_ADVERSAIRE_REROLL - rerolls
-                view = DailyChoiceView(user.id, [
-                    ("reroll", f"Changer d'adversaire ({restants}/{DAILY_MAX_ADVERSAIRE_REROLL})", "🔄",
-                     discord.ButtonStyle.secondary),
-                    ("difficulte", "Changer de difficulté", "🔀", discord.ButtonStyle.primary),
-                    ("start", "Commencer le combat", "⚔️", discord.ButtonStyle.success),
-                ])
-                await channel.send("Que veux tu faire ?", view=view)
-                await view.wait()
-                if view.result is None:
-                    await channel.send("⏳ /daily annulé (temps écoulé).")
-                    return None, None
-                if view.result == "start":
-                    return pnj, classe
-                if view.result == "difficulte":
-                    break  # retourne au choix de difficulté
-                # reroll
-                if rerolls >= DAILY_MAX_ADVERSAIRE_REROLL:
-                    await channel.send("❌ Tu as déjà changé d'adversaire 3 fois : plus de changement possible.")
-                    continue
-                rerolls += 1
-                pnj = generate_pnj(player_stats, classe, pv_override=pv_override)
+    def _info_embed(self, classe, win_rate):
+        """§3 : embed d'informations catégorisé. Couleur selon le palier (vert / orange / rouge)."""
+        if win_rate >= 80:
+            color, palier = discord.Color.green(), "largement gagnable"
+        elif win_rate >= 40:
+            color, palier = discord.Color.orange(), "équilibré"
+        else:
+            color, palier = discord.Color.red(), "risqué"
+        if classe in ("4", "3"):
+            diff = "Adversaire **nettement plus faible** que toi."
+        elif classe == "2":
+            diff = "Adversaire **à ton niveau** (parfois plus fort, parfois plus faible)."
+        else:
+            diff = "Adversaire **plus fort** que toi."
+        coffres = "\n".join(
+            f"• {DAILY_COFFRE_LABELS[k]} — {DAILY_COFFRE_ACCESS[classe][k]}%"
+            for k in DAILY_COFFRE_KEYS if DAILY_COFFRE_ACCESS.get(classe, {}).get(k)) or "—"
+        sep = "━━━━━━━━━━━━━━━"
+        desc = (
+            f"{sep}\n🎯 **RÉCOMPENSES PAR ACTION**\n{sep}\n"
+            f"Victoire : **+{DAILY_REWARD_POINTS[classe]['victoire']}** points par action réussie\n"
+            f"Défaite : **+{DAILY_REWARD_POINTS[classe]['defaite']}** points par action réussie\n\n"
+            f"{sep}\n🎁 **COFFRES ACCESSIBLES**\n{sep}\n{coffres}\n\n"
+            f"{sep}\n⚔️ **NIVEAU DE DIFFICULTÉ**\n{sep}\n{diff}\nCombat estimé **{palier}** (~{win_rate}%)."
+        )
+        return discord.Embed(title=f"📋 Classe {classe} sélectionnée", description=desc, color=color)
 
     def _burst_pv_override(self, character_id, player_stats, classe, gap):
         """§1 : PV du PNJ = burst_power_joueur × DAILY_PV_REF_MULTIPLIER[classe visée] × DAILY_GAP_FACTOR[gap].
@@ -1138,84 +1184,72 @@ class Daily(commands.Cog):
                 f"Le combat se termine dès qu'un camp atteint **{DAILY_PV_FLOOR} PV ou moins**."),
             color=discord.Color.red()))
 
-        # §6 : tirage du camp qui commence (inchangé). Ensuite, ALTERNANCE STRICTE : un seul camp agit
-        # par round, l'autre a déjà vu ce choix avant de décider au round suivant.
-        actor_is_player = random.choice([True, False])
-        await channel.send(
-            f"🎲 {'Tu commences' if actor_is_player else 'Ton adversaire commence'} ce combat.")
+        # §6/§7 : combat en ALTERNANCE CONTINUE avec RÉACTION EN DIRECT, piloté par le moteur partagé.
+        tour = {"n": 0}
 
-        tour = 0
-        issue = None  # "victoire" / "defaite"
-        while True:
-            tour += 1
-            if actor_is_player:
-                # Menu complet (Renforcement/Potion ne consomment pas le round : redemande ensuite).
-                action = await self._player_turn(channel, user, character_id, st, gains, sort_xp)
-                if action is None:
-                    await channel.send("⏳ Combat interrompu (temps écoulé). Aucune récompense enregistrée.")
-                    return
-                text, color_key, crit_reussi = apply_actor_action(st, action, True, gains)
-                st["last_action_j"] = action.get("kind")
-                if crit_reussi:
-                    await self._play_black_flash(channel, st["name_j"])
-            else:
-                action = self._pnj_turn(classe, st)
-                text, color_key, crit_reussi = apply_actor_action(st, action, False, gains)
-                st["last_action_p"] = action.get("kind")
+        def make_round_embed(text, color_key):
+            tour["n"] += 1
+            return self._round_embed(tour["n"], st, text, color_key)
 
-            await channel.send(embed=self._round_embed(tour, st, text, color_key))
+        is_vip = db.is_vip_active(character_id)
+        issue = await run_combat(
+            channel=channel, st=st, gains=gains, is_player_vip=is_vip,
+            player_declare=lambda: self._player_turn(channel, user, character_id, st, gains, sort_xp),
+            player_react=lambda incoming: self._player_turn(
+                channel, user, character_id, st, gains, sort_xp, reaction=True, incoming=incoming),
+            pnj_declare=lambda: self._pnj_turn(classe, st),
+            pnj_react=lambda incoming: self._pnj_turn(classe, st),
+            make_round_embed=make_round_embed,
+            play_crit=lambda nom: self._play_black_flash(channel, nom),
+            pv_floor=DAILY_PV_FLOOR, phoenix_color=PHOENIX_COLOR)
 
-            # --- §8 : fin de combat (vérifiée après CHAQUE round, car un seul camp agit). ---
-            if st["pv_p"] <= DAILY_PV_FLOOR:
-                issue = "victoire"
-                break
-            if st["pv_j"] <= DAILY_PV_FLOOR:
-                issue = "defaite"
-                break
-            actor_is_player = not actor_is_player  # §3 : alternance obligatoire
+        if issue == "interrupt":
+            await channel.send("⏳ Combat interrompu (temps écoulé). Aucune récompense enregistrée.")
+            return
 
         # §9 : application des récompenses + persistance.
         await self._finish_combat(channel, user, character_id, classe, st, gains, sort_xp, issue)
 
-    # ---------- tour joueur ----------
-    async def _player_turn(self, channel, user, character_id, st, gains, sort_xp):
-        """Retourne un dict d'action {kind, attacking, damage, dtype, blocking} ou None (timeout).
-        Le renforcement maudit boucle sans consommer le tour."""
+    # ---------- déclaration / réaction du joueur ----------
+    async def _player_turn(self, channel, user, character_id, st, gains, sort_xp,
+                           reaction=False, incoming=None):
+        """Collecte l'action du joueur. En DÉCLARATION (reaction=False) : menu complet (Renfort/Potion ne
+        consomment pas le tour, redemande ensuite). En RÉACTION (reaction=True) : seules Attaquer /
+        Défendre[+renfort défensif] / Sort / Arme sont proposées (jamais Renfort offensif ni Potion).
+        Retourne un dict d'action, ou None (timeout)."""
         bonus_force = 0
         potions = db.get_owned_potions(character_id)
         armes = db.get_character_armes(character_id)  # §2 : armes maudites créées par le joueur
         while True:
             options = [
                 ("attaquer", "Attaquer", "⚔️", discord.ButtonStyle.danger),
-                ("bloquer", "Bloquer", "🛡️", discord.ButtonStyle.secondary),
-                ("renfort", "Renforcement maudit", "🔮", discord.ButtonStyle.primary),
+                ("defendre", "Défendre", "🛡️", discord.ButtonStyle.secondary),
                 ("sort", "Utiliser un sort", "✨", discord.ButtonStyle.primary),
             ]
             if armes:
                 options.append(("arme", "Utiliser une arme maudite", "🗡️", discord.ButtonStyle.primary))
-            if potions:
-                options.append(("potion", "Utiliser une potion", "🧪", discord.ButtonStyle.success))
+            if not reaction:
+                # Renfort maudit offensif + Potion : uniquement en DÉCLARATION (ne consomment pas le tour).
+                options.insert(2, ("renfort", "Renforcement maudit", "🔮", discord.ButtonStyle.primary))
+                if potions:
+                    options.append(("potion", "Utiliser une potion", "🧪", discord.ButtonStyle.success))
             view = DailyChoiceView(user.id, options)
-            # §5 : rappel de ce que l'adversaire vient de faire au round précédent (alternance stricte).
+            titre = "🛡️ Ta réaction" if reaction else "🌀 Ta déclaration"
             preambule = ""
-            last_p = st.get("last_action_p")
-            if last_p:
-                libelles = {"attaquer": "d'Attaquer", "bloquer": "de se mettre en garde"}
-                preambule = (f"🔎 **{st['name_p']}** vient {libelles.get(last_p, f'de {last_p}')} "
-                             "au round précédent !\n\n")
-            garde = "\n🛡️ Ta garde est levée (elle parera la prochaine attaque)." if st.get("block_pending_j") else ""
+            if reaction and incoming is not None:
+                from cogs.utils.combat_engine import _potential_text
+                preambule = f"🔎 **{st['name_p']}** {_potential_text(incoming)}. À toi de réagir !\n\n"
             desc = (
                 preambule
                 + f"PV : **{max(st['pv_j'], DAILY_PV_FLOOR):,}** · Énergie occulte : **{st['eo_j']:,}**"
-                + (f"\n🔮 Renforcement actif ce tour : +{bonus_force} Force" if bonus_force else "")
-                + garde
+                + (f"\n🔮 Renforcement actif : +{bonus_force} Force" if bonus_force else "")
                 + "\n\n⚡ **Critique (Black Flash)**\n"
                 f"Chance actuelle : **{st.get('crit_chance_j', DAILY_CRIT_RESET_VALUE)}%**\n"
-                "À chaque échec, ta chance augmente (5%, puis 10%, puis +1%/échec ensuite). Une réussite "
-                "retombe à 1% et inflige **×10 dégâts**, sans jamais pouvoir être bloqué."
+                "À chaque échec : 5%, puis 10%, puis +1%/échec. Une réussite retombe à 1% et inflige "
+                "**×10 dégâts**, imblocable."
             )
             await channel.send(
-                embed=discord.Embed(title="🌀 Ton tour", description=desc, color=PHOENIX_COLOR),
+                embed=discord.Embed(title=titre, description=desc, color=PHOENIX_COLOR),
                 view=view)
             await view.wait()
             if view.result is None:
@@ -1273,9 +1307,32 @@ class Daily(commands.Cog):
                 return {"kind": "attaquer", "attacking": True, "damage": physical_damage(f_act),
                         "dtype": "phys", "blocking": False, "force_actuelle": f_act}
 
-            if act == "bloquer":
-                return {"kind": "bloquer", "attacking": False, "damage": 0, "dtype": None,
-                        "blocking": True, "force_actuelle": f_act}
+            if act == "defendre":
+                return await self._collect_defense(channel, user, character_id, st, f_act)
+
+    async def _collect_defense(self, channel, user, character_id, st, f_act):
+        """§5 : construit une action « Défendre » avec renforcement défensif OPTIONNEL. L'EO proposée
+        n'est PAS débitée ici (elle ne l'est, dans resolve_exchange, que si le blocage classique échoue)."""
+        endurance = (db.get_stat_base_pts(character_id, "endurance")
+                     + db.sum_buff_points(character_id, "endurance"))
+        def_reinforce = 0
+        if st["eo_j"] > 0:
+            view = DailyChoiceView(user.id, [
+                ("oui", "Oui, me renforcer", "🔮", discord.ButtonStyle.primary),
+                ("non", "Non, garde simple", "🛡️", discord.ButtonStyle.secondary)])
+            await channel.send("🛡️ Tu te mets en garde. Veux-tu aussi **te renforcer** pour cette défense ?",
+                               view=view)
+            await view.wait()
+            if view.result == "oui":
+                montant = await self._ask_int(
+                    channel, user,
+                    f"Combien d'énergie occulte investir dans cette défense ? (réserve : {st['eo_j']}) "
+                    "Elle ne sera débitée que si ton blocage échoue.", 1, st["eo_j"])
+                if montant:
+                    def_reinforce = montant
+        return {"kind": "defendre", "attacking": False, "damage": 0, "dtype": None,
+                "blocking": True, "force_actuelle": f_act,
+                "def_reinforce": def_reinforce, "def_endurance": endurance}
 
     async def _use_combat_potion(self, channel, user, character_id, st):
         """§2/§3/§4 : sélection RÉELLE parmi les potions possédées (lues EN DIRECT), application de l'effet
@@ -1462,14 +1519,18 @@ class Daily(commands.Cog):
         if choix == "attaquer":
             return {"kind": "attaquer", "attacking": True, "damage": physical_damage(f_act),
                     "dtype": "phys", "blocking": False, "force_actuelle": f_act}
-        return {"kind": "bloquer", "attacking": False, "damage": 0, "dtype": None, "blocking": True,
-                "force_actuelle": f_act}
+        # Défense IA : le PNJ peut se renforcer défensivement avec une fraction bornée de son EO (§5).
+        def_reinforce = 0
+        if bonus_force == 0 and st["eo_p"] > 0:
+            cap = min(st["eo_p"], max(1, round(st["force_base_p"] * DAILY_PNJ_RENFORT_MAX_PCT / 100)))
+            def_reinforce = random.randint(0, cap)
+        return {"kind": "defendre", "attacking": False, "damage": 0, "dtype": None, "blocking": True,
+                "force_actuelle": f_act, "def_reinforce": def_reinforce, "def_endurance": 0}
 
     # ---------- §7 : résolution d'un tour ----------
-    # NOTE : l'ancien _resolve_round (modèle SIMULTANÉ avec clash Force-vs-Force) a été retiré. La
-    # résolution passe désormais par le moteur partagé cogs/utils/combat_engine.apply_actor_action
-    # (alternance stricte : un seul camp agit par round). _apply_attack reste utilisé par le tour du
-    # boss de /raid (attaque 1-vs-plusieurs).
+    # NOTE : la résolution d'un échange est centralisée dans cogs/utils/combat_engine.resolve_exchange,
+    # pilotée par run_combat (alternance continue + réaction en direct). _apply_attack reste utilisé par
+    # le tour du boss de /raid (attaque 1-vs-plusieurs).
     def _apply_attack(self, st, attack, defender, defender_blocking):
         """Applique `attack` sur le défenseur 'p' (PNJ) ou 'j' (joueur). Retourne (dégâts_infligés,
         blocage_réussi). blocage_réussi = le défenseur bloquait ET l'attaque a été annulée/réduite."""
