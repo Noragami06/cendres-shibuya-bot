@@ -226,6 +226,23 @@ def _potential_text(action):
     return "temporise"
 
 
+def _reaction_text(rea, incoming):
+    """Libellé de la réaction, contextualisé par l'action reçue (incoming)."""
+    kind = rea.get("kind")
+    incoming_is_spell = incoming.get("dtype") == "spell"
+    incoming_is_attack = incoming.get("attacking")
+    if kind == "attaquer":
+        return "**contre-attaque !**" if incoming_is_attack else "**attaque !**"
+    if kind == "defendre":
+        if incoming_is_spell:
+            return "**tente de bloquer le sort !**"
+        return "**se met en garde !**"
+    if kind in ("sort", "arme"):
+        sn = rea.get("spell_name") or ("une arme maudite" if kind == "arme" else "un sort")
+        return f"**riposte avec {sn} !**"
+    return "**réagit.**"
+
+
 async def _maybe_await(value):
     if inspect.isawaitable(value):
         return await value
@@ -278,6 +295,14 @@ async def run_combat(*, channel, st, gains, is_player_vip,
                 return "interrupt"
         else:
             rea = await _maybe_await(pnj_react(decl))
+        # 5. Annonce de la réaction : embed DÉDIÉ et TOUJOURS visible (joueur comme PNJ), distinct de
+        # l'annonce de déclaration (étape 3) et du verdict (étape 7).
+        nom_rea = st["name_j"] if reactant == "j" else st["name_p"]
+        try:
+            await channel.send(embed=discord.Embed(
+                description=f"⚡ **{nom_rea}** réagit : {_reaction_text(rea, decl)}", color=phoenix_color))
+        except discord.HTTPException:
+            pass
         await asyncio.sleep(1)
 
         # 6. Résolution de l'échange (j = joueur, p = PNJ).
