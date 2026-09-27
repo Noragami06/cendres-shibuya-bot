@@ -36,6 +36,12 @@ def _is_staff(member) -> bool:
     return any(r.id == FICHE_STAFF_ROLE_ID for r in getattr(member, "roles", []))
 
 
+def _is_hybride(character_id: int) -> bool:
+    """True si le personnage est de camp Hybride (seul camp autorisé à avaler des Reliques)."""
+    char = get_character(character_id)
+    return bool(char) and (char["camp"] == "hybride")
+
+
 # =====================================================================
 # ACCÈS BASE DE DONNÉES
 # =====================================================================
@@ -93,6 +99,20 @@ def get_inventory_items(character_id: int, categorie_id: int):
             "FROM item_definitions d JOIN character_inventory c ON d.id = c.item_id "
             "WHERE c.character_id = ? AND d.categorie_id = ? AND c.quantity > 0 ORDER BY d.name",
             (character_id, categorie_id),
+        ).fetchall()
+
+
+def get_owned_reliques(character_id: int):
+    """Reliques POSSÉDÉES (catégorie « Relique », quantité > 0) : item_id, name, classe, quantity."""
+    with db.get_connection() as conn:
+        return conn.execute(
+            "SELECT c.item_id, d.name, d.classe, c.quantity "
+            "FROM character_inventory c "
+            "JOIN item_definitions d ON d.id = c.item_id "
+            "JOIN shop_categories s ON s.id = d.categorie_id "
+            "WHERE c.character_id = ? AND LOWER(s.name) = 'relique' AND c.quantity > 0 "
+            "ORDER BY d.name",
+            (character_id,),
         ).fetchall()
 
 
@@ -325,12 +345,40 @@ class MainInventoryView(discord.ui.View):
                 custom_id=f"inv_remove:{user_id}", row=2))
 
 
+class _YesNoView(discord.ui.View):
+    """Confirmation Oui/Non en session (le joueur est déjà dans son flux verrouillé). result = True/False/None."""
+
+    def __init__(self, owner_id: int, timeout=WAIT_TIMEOUT):
+        super().__init__(timeout=timeout)
+        self.owner_id = owner_id
+        self.result = None
+        oui = discord.ui.Button(label="Oui, avaler", emoji="✅", style=discord.ButtonStyle.danger)
+        non = discord.ui.Button(label="Non, annuler", emoji="❌", style=discord.ButtonStyle.secondary)
+        oui.callback = self._make(True)
+        non.callback = self._make(False)
+        self.add_item(oui)
+        self.add_item(non)
+
+    def _make(self, val):
+        async def cb(interaction: discord.Interaction):
+            if interaction.user.id != self.owner_id:
+                await interaction.response.send_message("Ce choix ne t'appartient pas.", ephemeral=True)
+                return
+            self.result = val
+            try:
+                await interaction.response.edit_message(view=None)
+            except discord.HTTPException:
+                pass
+            self.stop()
+        return cb
+
+
 class InventoryPageView(discord.ui.View):
     """Boutons SOUS l'image d'une catégorie précise. Pagination (si >1 page) + boutons d'action
     SPÉCIFIQUES à la catégorie affichée (§9) : « Utiliser une potion » pour Potion, « Ouvrir » pour
-    Coffre — jamais présents ailleurs ni par défaut."""
+    Coffre, « Avaler » pour Relique (Hybrides uniquement) — jamais présents ailleurs ni par défaut."""
 
-    def __init__(self, character_id, user_id, page, total_pages, cat_name=None):
+    def __init__(self, character_id, user_id, page, total_pages, cat_name=None, can_avaler=False):
         super().__init__(timeout=None)
         if total_pages > 1:
             self.add_item(discord.ui.Button(
@@ -350,6 +398,11 @@ class InventoryPageView(discord.ui.View):
             self.add_item(discord.ui.Button(
                 label="Ouvrir", emoji="🔓", style=discord.ButtonStyle.success,
                 custom_id=f"inv_open_coffre:{character_id}:{user_id}", row=1))
+        elif norm == "relique" and can_avaler:
+            # Bouton « Avaler » réservé aux Hybrides : ABSENT (pas juste désactivé) pour les autres camps.
+            self.add_item(discord.ui.Button(
+                label="Avaler", emoji="🍽️", style=discord.ButtonStyle.danger,
+                custom_id=f"inv_avaler:{character_id}:{user_id}", row=1))
 
 
 # =====================================================================
@@ -540,6 +593,8 @@ class Inventaire(commands.Cog):
             await self.handle_use_potion(interaction, cid)
         elif cid.startswith("inv_open_coffre:"):
             await self.handle_open_coffre(interaction, cid)
+        elif cid.startswith("inv_avaler:"):
+            await self.handle_avaler(interaction, cid)
         elif cid.startswith("inv_remove:"):
             await self.handle_remove(interaction, cid)
 
@@ -577,7 +632,9 @@ class Inventaire(commands.Cog):
         self._page_state[(interaction.user.id, character_id)] = {
             "categorie": cat_id, "page": 0, "cat_name": cat_name}
         path, total_pages, page = self._render_category_page(character_id, cat_id, 0)
-        view = InventoryPageView(character_id, interaction.user.id, page, total_pages, cat_name=cat_name)
+        can_avaler = _is_hybride(character_id)
+        view = InventoryPageView(character_id, interaction.user.id, page, total_pages,
+                                 cat_name=cat_name, can_avaler=can_avaler)
         if not view.children:  # aucune pagination ni bouton contextuel -> pas de vue
             view = None
         await interaction.channel.send(file=discord.File(path, filename="inventaire.png"), view=view)
@@ -602,7 +659,8 @@ class Inventaire(commands.Cog):
         new_page = state["page"] + (1 if direction == "next" else -1)
         path, total_pages, page = self._render_category_page(character_id, state["categorie"], new_page)
         state["page"] = page
-        view = InventoryPageView(character_id, user_id, page, total_pages, cat_name=state.get("cat_name"))
+        view = InventoryPageView(character_id, user_id, page, total_pages, cat_name=state.get("cat_name"),
+                                 can_avaler=_is_hybride(character_id))
         if not view.children:
             view = None
         await interaction.response.edit_message(
@@ -718,6 +776,129 @@ class Inventaire(commands.Cog):
                                              channel.id, interaction.user.id)
         finally:
             self._release(user_id)
+
+    async def handle_avaler(self, interaction, cid):
+        """🍽️ Avaler une Relique (Hybrides uniquement). Choix DÉFINITIF : 2 max, jamais de retrait. Applique
+        RELIQUE_STAT_BONUS[classe] à Force/Vitesse/Endurance/Sort, + RCT/Territoire SI débloqués."""
+        _, character_id, user_id = cid.split(":")
+        character_id, user_id = int(character_id), int(user_id)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Cet inventaire n'est pas le tien.", ephemeral=True)
+            return
+        # Revérification de sécurité : seul un Hybride peut avaler (le bouton est déjà masqué sinon).
+        if not _is_hybride(character_id):
+            await interaction.response.send_message(
+                "❌ Seuls les Hybrides peuvent absorber des Reliques.", ephemeral=True)
+            return
+        reliques = get_owned_reliques(character_id)
+        if not reliques:
+            await interaction.response.send_message("Tu n'as aucune Relique à avaler.", ephemeral=True)
+            return
+
+        if not self._acquire(user_id):
+            await interaction.response.send_message(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True)
+            return
+        try:
+            await interaction.response.send_message("🍽️ Absorption d'une Relique…", ephemeral=True)
+            channel = interaction.channel
+
+            # 2. Plafond ABSOLU de 2 Reliques, sans retour arrière possible.
+            deja = db.count_reliques_avalees(character_id)
+            if deja >= db.RELIQUE_MAX_AVALEES:
+                await channel.send(
+                    "❌ Tu as déjà avalé 2 Reliques, le maximum absolu. Il est IMPOSSIBLE de revenir en "
+                    "arrière ou d'en retirer une pour faire de la place — cette Relique restera dans ton "
+                    "inventaire tant que tu n'auras pas fait ce choix définitif.")
+                return
+
+            # Sélection de la Relique (numéro si plusieurs, directe si une seule).
+            if len(reliques) == 1:
+                relique = reliques[0]
+            else:
+                lignes = "\n".join(
+                    f"**{i}.** {r['quantity']}x {r['name']} (Classe {r['classe']})"
+                    for i, r in enumerate(reliques, 1))
+                await channel.send(embed=discord.Embed(
+                    title="🍽️ Quelle Relique avaler ?",
+                    description=lignes + "\n\nRéponds avec le **numéro** correspondant.",
+                    color=PHOENIX_COLOR))
+                relique = None
+                while relique is None:
+                    m = await self.wait_message(channel, interaction.user)
+                    if m is None:
+                        await channel.send("⏳ Absorption annulée.")
+                        return
+                    c = m.content.strip()
+                    if c.isdigit() and 1 <= int(c) <= len(reliques):
+                        relique = reliques[int(c) - 1]
+                    else:
+                        await channel.send(f"Réponds avec un numéro entre 1 et {len(reliques)}.")
+
+            classe = relique["classe"]
+            if classe not in db.RELIQUE_STAT_BONUS:
+                await channel.send(
+                    f"❌ Cette Relique a une classe non reconnue ('{classe}'). Absorption impossible.")
+                return
+
+            # 3. Confirmation explicite (choix définitif).
+            view = _YesNoView(interaction.user.id)
+            await channel.send(
+                embed=discord.Embed(
+                    title="⚠️ Choix définitif",
+                    description=(f"Tu t'apprêtes à avaler **{relique['name']}** (Classe {classe}).\n"
+                                 f"Une fois avalée, cette Relique ne pourra **JAMAIS** être retirée ni "
+                                 f"remplacée. Confirmer ?"),
+                    color=discord.Color.orange()),
+                view=view)
+            await view.wait()
+            if view.result is not True:
+                await channel.send("Absorption annulée. La Relique reste dans ton inventaire.")
+                return
+
+            # 4. Revérifications TEMPS RÉEL (anti double-clic / course) juste avant d'agir.
+            if db.count_reliques_avalees(character_id) >= db.RELIQUE_MAX_AVALEES:
+                await channel.send("❌ Tu as atteint le maximum de 2 Reliques entre-temps. Rien n'a été avalé.")
+                return
+            if get_inventory_qty(character_id, relique["item_id"]) <= 0:
+                await channel.send("❌ Cette Relique n'est plus dans ton inventaire. Rien n'a été avalé.")
+                return
+
+            bonus = db.RELIQUE_STAT_BONUS[classe]
+            # Stats TOUJOURS boostées.
+            for stat in ("force", "vitesse", "endurance", "sorts"):
+                db.add_stat_base_pts(character_id, stat, bonus)
+            # RCT / Territoire : boostées UNIQUEMENT si débloquées (sinon bonus perdu, aucune compensation).
+            extras = []
+            if await self._rct_unlocked(interaction.guild, character_id):
+                db.add_stat_base_pts(character_id, "rct", bonus)
+                extras.append("RCT")
+            if self._territoire_unlocked(character_id):
+                db.add_stat_base_pts(character_id, "territoire", bonus)
+                extras.append("Territoire")
+
+            db.add_relique_avalee(character_id, classe, _now())
+            inv_remove(character_id, relique["item_id"], 1)
+
+            suffix = ("/" + "/".join(extras)) if extras else ""
+            await channel.send(
+                f"✅ Relique Classe {classe} absorbée avec succès ! **+{bonus}** appliqué en permanence "
+                f"sur Force/Vitesse/Endurance/Sort{suffix}. "
+                f"(Reliques absorbées : {db.count_reliques_avalees(character_id)}/{db.RELIQUE_MAX_AVALEES})")
+        finally:
+            self._release(user_id)
+
+    async def _rct_unlocked(self, guild, character_id) -> bool:
+        """RCT débloqué = le personnage possède un rôle RCT (réel slot 1 / virtuel slot 2-3)."""
+        try:
+            from cogs.profil import get_current_rct_stage
+            return await get_current_rct_stage(guild, character_id) is not None
+        except Exception:
+            return False
+
+    def _territoire_unlocked(self, character_id) -> bool:
+        terr = db.get_territoire(character_id)
+        return bool(terr) and bool(terr["is_unlocked"])
 
     async def _use_potion_soin(self, channel, player, character_id, potion, classe, info):
         """Potion de soin (instantanée, cumulable) : demande la quantité, restaure les PV, retire du stock."""

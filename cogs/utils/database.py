@@ -389,6 +389,16 @@ CREATE TABLE IF NOT EXISTS character_secondary_sorts (
     degats INTEGER DEFAULT NULL  -- dégâts de BASE tirés une seule fois à la création (dans la fourchette de la classe)
 );
 
+-- Reliques ABSORBÉES par un personnage (Hybrides uniquement). Choix DÉFINITIF, 2 maximum, jamais de
+-- retrait. Une ligne = une Relique avalée (classe + date). Le bonus de stat est appliqué en dur au moment
+-- de l'absorption (character_stats) ; cette table sert de compteur/historique du choix.
+CREATE TABLE IF NOT EXISTS character_reliques_avalees (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id INTEGER,
+    classe TEXT,
+    avale_at TEXT
+);
+
 -- Territoire (Extension du Territoire) propre à un personnage (/profil → 🗺️ Territoire). Le flux de
 -- création/staff n'est pas encore construit ; seule la lecture (pillow) est branchée pour l'instant.
 CREATE TABLE IF NOT EXISTS character_territoire (
@@ -2884,6 +2894,37 @@ def set_stat_base_pts(character_id: int, stat_key: str, value: int):
         conn.execute(
             f"UPDATE character_stats SET {col} = ? WHERE character_id = ?", (int(value), character_id)
         )
+
+
+# =====================================================================
+# RELIQUES ABSORBABLES (Hybrides uniquement)
+# =====================================================================
+# Bonus de stat par classe de Relique, appliqué en dur à l'absorption (Force/Vitesse/Endurance/Sort, +
+# RCT/Territoire SI débloqués). Choix DÉFINITIF : jamais de retrait, 2 maximum toutes classes confondues.
+RELIQUE_STAT_BONUS = {"4": 50, "3": 120, "2": 250, "1": 500, "S": 1200}
+RELIQUE_MAX_AVALEES = 2  # STRICT, peu importe les classes, jamais plus, jamais de retrait possible
+
+
+def count_reliques_avalees(character_id: int) -> int:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM character_reliques_avalees WHERE character_id = ?",
+            (character_id,)).fetchone()["n"]
+
+
+def get_reliques_avalees(character_id: int):
+    """Liste des Reliques déjà absorbées (classe, date), de la plus ancienne à la plus récente."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT classe, avale_at FROM character_reliques_avalees WHERE character_id = ? "
+            "ORDER BY id ASC", (character_id,)).fetchall()
+
+
+def add_relique_avalee(character_id: int, classe: str, avale_at: str):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO character_reliques_avalees (character_id, classe, avale_at) VALUES (?, ?, ?)",
+            (character_id, classe, avale_at))
 
 
 def add_stat_base_pts(character_id: int, stat_key: str, n: int):

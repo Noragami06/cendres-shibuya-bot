@@ -3015,6 +3015,8 @@ def delete_character_cascade(character_id):
         conn.execute("DELETE FROM character_daily_cooldown WHERE character_id = ?", (character_id,))
         conn.execute("DELETE FROM character_token_usage WHERE character_id = ?", (character_id,))
         conn.execute("DELETE FROM character_vip_status WHERE character_id = ?", (character_id,))
+        # Reliques absorbées (Hybrides) : compteur/historique du choix définitif, propre au personnage.
+        conn.execute("DELETE FROM character_reliques_avalees WHERE character_id = ?", (character_id,))
         # /raid : lignes de participation et attente de permadéath référençant ce personnage. (La
         # blacklist de salon n'est PAS purgée ici : elle est liée à une dette d'Ordre, pas à l'existence
         # du personnage, et sa résolution retombe sur le chef courant de l'Ordre.)

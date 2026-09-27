@@ -2087,9 +2087,31 @@ class Raid(commands.Cog):
             return
         await self._do_join(interaction, raid, character_id, user)
 
+    def _distinct_engaged_ordres(self, raid_id):
+        """Ensemble des ordre_id DISTINCTS déjà engagés dans ce raid (participants sans Ordre exclus)."""
+        return {p["ordre_id"] for p in db.raid_get_participants(raid_id) if p["ordre_id"] is not None}
+
+    def _ordre_limit_message(self, engaged):
+        noms = []
+        for oid in engaged:
+            o = db.get_order(oid)
+            noms.append(o["name"] if o else f"#{oid}")
+        liste = " et ".join(f"**{n}**" for n in noms) if noms else "un autre"
+        return (f"❌ Ce raid compte déjà des membres de l'Ordre {liste}. Un raid ne peut jamais réunir "
+                "plus de 2 Ordres différents. Rejoins sans Ordre, ou attends un futur raid.")
+
+    def _ordre_cap_blocks(self, raid_id, char_order_id):
+        """True si accepter ce personnage introduirait un 3e Ordre distinct (max 2). Un joueur SANS Ordre,
+        ou d'un Ordre DÉJÀ engagé, ne bloque jamais. S'applique à tous les contextes (salon libre / public)."""
+        if char_order_id is None:
+            return False
+        engaged = self._distinct_engaged_ordres(raid_id)
+        return char_order_id not in engaged and len(engaged) >= 2
+
     async def _do_join(self, interaction, raid, character_id, user):
         """Logique commune (salon libre / public / membre prioritaire) : chef du raid = premier cliqueur,
-        auto-join des membres d'un Ordre déjà accepté ou de l'Ordre propriétaire, sinon demande au chef."""
+        auto-join des membres d'un Ordre déjà accepté ou de l'Ordre propriétaire, sinon demande au chef.
+        Limite stricte : jamais plus de 2 Ordres DISTINCTS dans un même raid."""
         raid_id = raid["id"]
         if db.raid_participant_exists(raid_id, character_id):
             await interaction.followup.send("Tu participes déjà à ce raid.", ephemeral=True)
@@ -2103,11 +2125,17 @@ class Raid(commands.Cog):
 
         participants = db.raid_get_participants(raid_id)
         if not participants:
-            # 1er cliqueur = chef du raid.
+            # 1er cliqueur = chef du raid : accepté quel que soit son Ordre (ou sans Ordre).
             db.raid_add_participant(raid_id, character_id, user.id, char_order_id, 1, 1, _now())
             await interaction.followup.send("👑 Tu es le **chef du raid** !", ephemeral=True)
             await self._maybe_bring_members(interaction, raid_id, character_id, user, char_order)
             await self._refresh_announce(raid_id)
+            return
+
+        # Limite de 2 Ordres distincts : un 3e Ordre différent est toujours refusé (tout contexte).
+        if self._ordre_cap_blocks(raid_id, char_order_id):
+            await interaction.followup.send(
+                self._ordre_limit_message(self._distinct_engaged_ordres(raid_id)), ephemeral=True)
             return
 
         # Auto-join : membre de l'Ordre propriétaire (toujours prioritaire) OU membre d'un Ordre dont le
@@ -2212,6 +2240,15 @@ class Raid(commands.Cog):
             return
         req_order = db.get_character_order(req_cid)
         req_oid = req_order["id"] if req_order else None
+        # Limite de 2 Ordres distincts, revérifiée à l'acceptation (une demande en attente ne peut pas
+        # introduire un 3e Ordre entre-temps).
+        if self._ordre_cap_blocks(raid_id, req_oid):
+            await interaction.response.edit_message(
+                content=self._ordre_limit_message(self._distinct_engaged_ordres(raid_id)), view=None)
+            if requester_uid:
+                await self._dm_user(requester_uid, content=self._ordre_limit_message(
+                    self._distinct_engaged_ordres(raid_id)))
+            return
         if req_oid and db.raid_count_participants_for_ordre(raid_id, req_oid) >= 4:
             await interaction.response.edit_message(
                 content=f"L'Ordre de {nom} est déjà au maximum de participants (4).", view=None)

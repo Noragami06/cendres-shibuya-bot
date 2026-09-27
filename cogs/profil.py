@@ -1141,6 +1141,12 @@ class Profil(commands.Cog):
         debt = db.get_or_create_stats(character_id)["points_debt"]
         if debt and debt > 0:
             await channel.send(f"⚠️ Dette de points : **-{debt}** sur le prochain gain.")
+        # Reliques absorbées (Hybrides) : trace du choix DÉFINITIF (nombre + classes déjà avalées).
+        nb_rel = db.count_reliques_avalees(character_id)
+        if nb_rel > 0:
+            classes = [f"Classe {r['classe']}" for r in db.get_reliques_avalees(character_id)]
+            await channel.send(
+                f"🍽️ **Reliques absorbées : {nb_rel}/{db.RELIQUE_MAX_AVALEES}** — " + ", ".join(classes))
 
     # ---------- écran Techniques Occultes (⚡ Technique) ----------
     # TODO (points NON abordés) : aucun bouton de gestion pour l'instant (ajouter un sort, monter de
