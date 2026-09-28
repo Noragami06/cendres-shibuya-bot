@@ -2887,3 +2887,90 @@ def generate_coffre_image(rarete: str, out_path: str, width=700, height=600):
     img = big.resize((width, height), Image.LANCZOS)
     img.save(out_path)
     return out_path
+
+
+# =====================================================================
+# /entrainement — mini-jeu Mastermind (thème « Sanctuaire gelé »)
+# =====================================================================
+ENTRAINEMENT_PEG_COLORS = [
+    (230, 60, 60), (70, 130, 230), (70, 200, 120), (235, 200, 60),
+    (170, 80, 230), (240, 140, 40), (235, 235, 240),
+]
+ENTRAINEMENT_FB_GREEN = (70, 200, 120, 255)
+ENTRAINEMENT_FB_ORANGE = (240, 170, 50, 255)
+ENTRAINEMENT_FB_RED = (220, 60, 60, 255)
+ENTRAINEMENT_SS = 3
+
+
+def _entrainement_fb_pegs_row(d, x_start, y, spacing, fb, r):
+    for k, fbtype in enumerate(fb):
+        fx = x_start + k * spacing
+        col = ENTRAINEMENT_FB_GREEN if fbtype == "vert" else (ENTRAINEMENT_FB_ORANGE if fbtype == "orange" else ENTRAINEMENT_FB_RED)
+        d.ellipse((fx-r, y-r, fx+r, y+r), fill=col)
+
+
+def _entrainement_legend(d, x0, y0, w, ss, text_color, box_color):
+    d.rounded_rectangle((x0, y0, x0+w, y0+90*ss), radius=10*ss, fill=box_color)
+    items = [(ENTRAINEMENT_FB_GREEN, "Bonne couleur, bon emplacement"), (ENTRAINEMENT_FB_ORANGE, "Bonne couleur, mauvais emplacement"), (ENTRAINEMENT_FB_RED, "Couleur absente du code")]
+    yy = y0 + 20*ss
+    for col, label in items:
+        d.ellipse((x0+20*ss, yy-9*ss, x0+38*ss, yy+9*ss), fill=col)
+        d.text((x0+50*ss, yy-11*ss), label, font=font(20*ss), fill=text_color)
+        yy += 26*ss
+
+
+def generate_entrainement_image(stat_name: str, rows: list, attempts_max: int, out_path: str, W=1450, H=1150):
+    """
+    stat_name : "Force", "Vitesse", "Endurance", "Sort", "Énergie Occulte", ou "Arme Maudite"
+                (jamais Territoire/RCT, exclus de /entrainement)
+    rows : liste de (guess, feedback) — guess = liste de 4 index de couleur (0-6),
+           feedback = liste de 4 "vert"/"orange"/"rouge", dans l'ordre des tentatives jouées
+    attempts_max : nombre total de tentatives autorisées pour la classe choisie
+    """
+    ss = ENTRAINEMENT_SS
+    bg = (10, 18, 26, 255)
+    title = f"ENTRAINEMENT {stat_name.upper()}"
+    title_color = (140, 210, 255, 255)
+    panel_fill = (18, 28, 40, 235)
+    panel_outline = (140, 210, 255, 255)
+    peg_outline = (255, 255, 255, 180)
+    legend_box = (15, 24, 34, 255)
+    legend_text = (210, 235, 255, 255)
+
+    big = Image.new("RGBA", (W * ss, H * ss), bg)
+    d = ImageDraw.Draw(big)
+
+    tw = text_w(d, title, font(38*ss, True))
+    d.text((big.size[0]/2 - tw/2, 45*ss), title, font=font(38*ss, True), fill=title_color)
+    d.line((90*ss, 105*ss, big.size[0]-90*ss, 105*ss), fill=title_color[:3]+(120,), width=2*ss)
+
+    panel = Image.new("RGBA", big.size, (0,0,0,0))
+    pd = ImageDraw.Draw(panel)
+    pd.rounded_rectangle((70*ss, 125*ss, big.size[0]-70*ss, big.size[1]-160*ss), radius=16*ss, fill=panel_fill, outline=panel_outline, width=4*ss)
+    big.alpha_composite(panel)
+    d = ImageDraw.Draw(big)
+
+    row_h = 130 * ss
+    start_y = 175 * ss
+    peg_spacing = 95 * ss
+    peg_x0 = 190 * ss
+    fb_x0 = 880 * ss
+    fb_spacing = 55 * ss
+
+    for i, (row, fb) in enumerate(rows):
+        y = start_y + i * row_h
+        d.text((105*ss, y - 12*ss), f"{i+1}", font=font(26*ss, True), fill=title_color)
+        for j, c in enumerate(row):
+            cx = peg_x0 + j * peg_spacing
+            col = ENTRAINEMENT_PEG_COLORS[c]
+            r = 30*ss
+            d.polygon([(cx, y-r), (cx+r, y), (cx, y+r), (cx-r, y)], fill=col+(255,), outline=peg_outline)
+        d.line((fb_x0 - 45*ss, y-35*ss, fb_x0 - 45*ss, y+35*ss), fill=panel_outline[:3]+(150,), width=2*ss)
+        _entrainement_fb_pegs_row(d, fb_x0, y, fb_spacing, fb, 14*ss)
+
+    d.text((105*ss, start_y + len(rows)*row_h + 10*ss), f"Tentative {len(rows)}/{attempts_max}", font=font(24*ss, True), fill=title_color)
+    _entrainement_legend(d, 90*ss, big.size[1]-135*ss, big.size[0]-180*ss, ss, legend_text, legend_box)
+
+    img = big.resize((W, H), Image.LANCZOS)
+    img.save(out_path)
+    return out_path

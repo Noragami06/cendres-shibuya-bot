@@ -196,3 +196,13 @@ from cogs.utils.image_gen import generate_coffre_image
 for rarete in ["commun", "rare", "epic", "legendaire", "mythique"]:
     generate_coffre_image(rarete, f"temp/preview_coffre_{rarete}.png")
     print(f"Coffre {rarete} généré dans temp/")
+
+from cogs.utils.image_gen import generate_entrainement_image
+
+rows_exemple = [
+    ([0, 1, 2, 3], ["vert", "orange", "rouge", "rouge"]),
+    ([1, 0, 4, 3], ["orange", "orange", "vert", "rouge"]),
+    ([4, 1, 3, 0], ["vert", "vert", "orange", "orange"]),
+]
+generate_entrainement_image("Force", rows_exemple, attempts_max=8, out_path="temp/preview_entrainement.png")
+print("Pillow entraînement généré dans temp/")

@@ -116,6 +116,42 @@ def get_owned_reliques(character_id: int):
         ).fetchall()
 
 
+def get_owned_tokens_stats(character_id: int):
+    """Tokens Stats CLASSÉS possédés (catégorie « Token », nom « Token Stats … », classe non NULL,
+    quantité > 0). Les tokens classless (legacy, sans classe) sont exclus : leur valeur est indexée par
+    classe, ils ne peuvent donc pas être utilisés par ce système."""
+    with db.get_connection() as conn:
+        return conn.execute(
+            "SELECT c.item_id, d.name, d.classe, c.quantity "
+            "FROM character_inventory c "
+            "JOIN item_definitions d ON d.id = c.item_id "
+            "JOIN shop_categories s ON s.id = d.categorie_id "
+            "WHERE c.character_id = ? AND LOWER(s.name) = 'token' AND d.name LIKE 'Token Stats %' "
+            "AND d.classe IS NOT NULL AND c.quantity > 0 ORDER BY d.name",
+            (character_id,),
+        ).fetchall()
+
+
+# Type de Token Stats -> (stat_key, mode). mode: 'points' (direct) / 'eo_terr' / 'sort_arme'.
+_TOKEN_STATS_TYPES = {
+    "Force": ("force", "points"), "Vitesse": ("vitesse", "points"),
+    "Endurance": ("endurance", "points"), "EO": ("energie_occulte", "eo_terr"),
+    "Territoire": ("territoire", "eo_terr"), "Sort": ("sorts", "sort_arme"),
+    "Arme Maudite": ("armes_maudites", "sort_arme"),
+}
+_TOKEN_STATS_LABEL_AFFICHE = {
+    "force": "Force", "vitesse": "Vitesse", "endurance": "Endurance",
+    "energie_occulte": "EO", "territoire": "Territoire", "sorts": "Sort", "armes_maudites": "Arme Maudite",
+}
+
+
+def _token_stats_type_from_name(name: str):
+    """Extrait le type d'un « Token Stats {Type}[ Classe X] » (ex: 'Force', 'Arme Maudite'). None si inconnu."""
+    base = name[len("Token Stats "):] if name.startswith("Token Stats ") else name
+    base = base.split(" Classe ")[0].strip()
+    return base if base in _TOKEN_STATS_TYPES else None
+
+
 def get_inventory_qty(character_id: int, item_id: int) -> int:
     with db.get_connection() as conn:
         r = conn.execute(
@@ -403,6 +439,10 @@ class InventoryPageView(discord.ui.View):
             self.add_item(discord.ui.Button(
                 label="Avaler", emoji="🍽️", style=discord.ButtonStyle.danger,
                 custom_id=f"inv_avaler:{character_id}:{user_id}", row=1))
+        elif norm == "token":
+            self.add_item(discord.ui.Button(
+                label="Utiliser", emoji="✨", style=discord.ButtonStyle.success,
+                custom_id=f"inv_use_token:{character_id}:{user_id}", row=1))
 
 
 # =====================================================================
@@ -595,6 +635,8 @@ class Inventaire(commands.Cog):
             await self.handle_open_coffre(interaction, cid)
         elif cid.startswith("inv_avaler:"):
             await self.handle_avaler(interaction, cid)
+        elif cid.startswith("inv_use_token:"):
+            await self.handle_use_token_stats(interaction, cid)
         elif cid.startswith("inv_remove:"):
             await self.handle_remove(interaction, cid)
 
@@ -885,6 +927,100 @@ class Inventaire(commands.Cog):
                 f"✅ Relique Classe {classe} absorbée avec succès ! **+{bonus}** appliqué en permanence "
                 f"sur Force/Vitesse/Endurance/Sort{suffix}. "
                 f"(Reliques absorbées : {db.count_reliques_avalees(character_id)}/{db.RELIQUE_MAX_AVALEES})")
+        finally:
+            self._release(user_id)
+
+    async def handle_use_token_stats(self, interaction, cid):
+        """✨ Utiliser un Token Stats : applique sa valeur exacte (par classe). Force/Vitesse/Endurance =
+        points directs ; EO/Territoire = niveaux de Maîtrise (cap 30/105) ; Sort/Arme = niveaux (cap
+        150/60). Retire 1 exemplaire."""
+        from cogs.profil import (
+            points_to_level_xp_capped, STAT_XP_RATIO,
+            MASTERY_EO_MAX_LEVEL, MASTERY_SORT_MAX_LEVEL, MASTERY_TERRITOIRE_MAX_LEVEL, MASTERY_ARME_MAX_LEVEL,
+        )
+        _, character_id, user_id = cid.split(":")
+        character_id, user_id = int(character_id), int(user_id)
+        if interaction.user.id != user_id:
+            await interaction.response.send_message("Cet inventaire n'est pas le tien.", ephemeral=True)
+            return
+        tokens = get_owned_tokens_stats(character_id)
+        if not tokens:
+            await interaction.response.send_message(
+                "Tu n'as aucun Token Stats classé à utiliser.", ephemeral=True)
+            return
+        if not self._acquire(user_id):
+            await interaction.response.send_message(
+                "Tu as déjà une action en cours, termine la d'abord.", ephemeral=True)
+            return
+        try:
+            await interaction.response.send_message("✨ Utilisation d'un Token Stats…", ephemeral=True)
+            channel = interaction.channel
+            # Sélection (directe si un seul, numéro sinon).
+            if len(tokens) == 1:
+                token = tokens[0]
+            else:
+                lignes = "\n".join(
+                    f"**{i}.** {t['quantity']}x {t['name']}" for i, t in enumerate(tokens, 1))
+                await channel.send(embed=discord.Embed(
+                    title="✨ Quel Token Stats utiliser ?",
+                    description=lignes + "\n\nRéponds avec le **numéro** correspondant.",
+                    color=PHOENIX_COLOR))
+                token = None
+                while token is None:
+                    m = await self.wait_message(channel, interaction.user)
+                    if m is None:
+                        await channel.send("⏳ Utilisation annulée.")
+                        return
+                    c = m.content.strip()
+                    if c.isdigit() and 1 <= int(c) <= len(tokens):
+                        token = tokens[int(c) - 1]
+                    else:
+                        await channel.send(f"Réponds avec un numéro entre 1 et {len(tokens)}.")
+
+            ttype = _token_stats_type_from_name(token["name"])
+            classe = token["classe"]
+            if ttype is None or classe not in ("4", "3", "2", "1", "S"):
+                await channel.send("❌ Ce Token Stats n'a pas de type/classe reconnu. Aucune action.")
+                return
+            # Revérif temps réel de la possession (anti double-clic).
+            if get_inventory_qty(character_id, token["item_id"]) <= 0:
+                await channel.send("❌ Ce Token n'est plus dans ton inventaire.")
+                return
+
+            stat_key, mode = _TOKEN_STATS_TYPES[ttype]
+            if mode == "points":
+                points = db.TOKEN_STATS_POINTS_DIRECTS[classe]
+                db.add_stat_base_pts(character_id, stat_key, points)
+                msg = f"✅ +{points} points directement en {ttype} !"
+            else:
+                cap = {"energie_occulte": MASTERY_EO_MAX_LEVEL, "territoire": MASTERY_TERRITOIRE_MAX_LEVEL,
+                       "sorts": MASTERY_SORT_MAX_LEVEL, "armes_maudites": MASTERY_ARME_MAX_LEVEL}[stat_key]
+                niveaux = (db.TOKEN_STATS_NIVEAUX_EO_TERRITOIRE[classe] if mode == "eo_terr"
+                           else db.TOKEN_STATS_NIVEAUX_SORT_ARME[classe])
+
+                def _points_for_level(lvl):
+                    # Division PLAFOND (ceil) : garantit assez de points pour ATTEINDRE le niveau visé
+                    # (round() pouvait laisser un niveau de moins à la frontière).
+                    lvl = min(lvl, cap)
+                    total_xp = sum(db.xp_required_for_level(l) for l in range(1, lvl))
+                    return -(-total_xp // STAT_XP_RATIO)
+
+                base = db.get_stat_base_pts(character_id, stat_key)
+                level, _, _ = points_to_level_xp_capped(base, cap)
+                target = min(cap, level + niveaux)
+                gagnes = target - level
+                if gagnes > 0:
+                    db.add_stat_base_pts(character_id, stat_key, _points_for_level(target) - _points_for_level(level))
+                label = _TOKEN_STATS_LABEL_AFFICHE.get(stat_key, ttype)
+                if gagnes <= 0:
+                    msg = f"✅ Maîtrise {label} déjà au plafond ({cap}) : aucun niveau ajouté (Token consommé)."
+                elif gagnes < niveaux:
+                    msg = f"✅ +{gagnes} niveaux de Maîtrise {label} (plafond {cap} atteint) !"
+                else:
+                    msg = f"✅ +{niveaux} niveaux de Maîtrise {label} !"
+
+            inv_remove(character_id, token["item_id"], 1)
+            await channel.send(msg)
         finally:
             self._release(user_id)
 

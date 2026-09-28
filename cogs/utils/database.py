@@ -886,13 +886,14 @@ _CANONICAL_POTIONS = {
 }
 # Tokens NON achetables (prix NULL), obtenus uniquement via /daily.
 _TOKEN_ITEM_NAMES = [
+    # « Token Stats RCT » RETIRÉ : la Maîtrise RCT n'a pas de niveaux numériques, ce token n'a jamais eu de sens.
     "Token RCT", "Token Territoire", "Token Stats Force", "Token Stats Vitesse",
-    "Token Stats Endurance", "Token Stats Arme Maudite", "Token Stats RCT",
+    "Token Stats Endurance", "Token Stats Arme Maudite",
     "Token Stats Territoire", "Token Stats Sort", "Token Stats EO",
 ]
-# Tokens Stats ACHETABLES : 8 types × 5 classes (prix auto = fourchette des potions). Nom = « Token Stats
-# {Label} Classe {c} » pour ne pas entrer en collision avec les tokens classless ci-dessus.
-_TOKEN_STATS_LABELS = ["Force", "Vitesse", "Endurance", "Arme Maudite", "RCT", "Territoire", "Sort", "EO"]
+# Tokens Stats ACHETABLES : 7 types × 5 classes (prix auto = fourchette des potions). Nom = « Token Stats
+# {Label} Classe {c} » pour ne pas entrer en collision avec les tokens classless ci-dessus. RCT retiré.
+_TOKEN_STATS_LABELS = ["Force", "Vitesse", "Endurance", "Arme Maudite", "Territoire", "Sort", "EO"]
 
 
 def _migrate_merge_eo_potion_category(conn):
@@ -934,6 +935,58 @@ def _seed_canonical_potions(conn):
                         "categorie_id, potion_type) VALUES (?, ?, ?, ?, ?, ?)",
                         (f"{base_nom} Classe {classe}", "Potion.", classe, _r.randint(lo, hi), cat_id, ptype),
                     )
+
+
+# Valeurs EXACTES des Tokens Stats, par classe.
+TOKEN_STATS_POINTS_DIRECTS = {  # Force, Vitesse, Endurance : points ajoutés directement à la stat
+    "4": 150, "3": 550, "2": 1700, "1": 4000, "S": 10000,
+}
+TOKEN_STATS_NIVEAUX_EO_TERRITOIRE = {  # EO, Territoire : niveaux de Maîtrise (plafonds 30 / 105)
+    "4": 1, "3": 2, "2": 4, "1": 7, "S": 15,
+}
+TOKEN_STATS_NIVEAUX_SORT_ARME = {  # Sort, Arme Maudite : niveaux de Maîtrise (plafonds 150 / 60)
+    "4": 1, "3": 3, "2": 6, "1": 12, "S": 25,
+}
+
+
+def _migrate_remove_token_stats_rct(conn):
+    """Retire définitivement « Token Stats RCT » (classless + 5 versions classées). Les exemplaires DÉJÀ
+    possédés par des joueurs sont CONVERTIS en « Token Stats Sort » de MÊME classe (classless -> classless),
+    solution la plus simple restant dans l'économie des tokens. Idempotent (no-op si déjà retiré)."""
+    rct_items = conn.execute(
+        "SELECT id, classe FROM item_definitions WHERE name LIKE 'Token Stats RCT%' COLLATE NOCASE"
+    ).fetchall()
+    for it in rct_items:
+        # Token Sort équivalent (même classe ; NULL <-> classless).
+        if it["classe"] is None:
+            sort = conn.execute(
+                "SELECT id FROM item_definitions WHERE name = 'Token Stats Sort' COLLATE NOCASE "
+                "AND classe IS NULL").fetchone()
+        else:
+            sort = conn.execute(
+                "SELECT id FROM item_definitions WHERE name = ? COLLATE NOCASE",
+                (f"Token Stats Sort Classe {it['classe']}",)).fetchone()
+        if sort is not None:
+            # Fusionne chaque inventaire possédant le token RCT vers le token Sort équivalent.
+            for inv in conn.execute(
+                    "SELECT character_id, quantity FROM character_inventory WHERE item_id = ?",
+                    (it["id"],)).fetchall():
+                existing = conn.execute(
+                    "SELECT id, quantity FROM character_inventory WHERE character_id = ? AND item_id = ?",
+                    (inv["character_id"], sort["id"])).fetchone()
+                if existing is not None:
+                    conn.execute("UPDATE character_inventory SET quantity = quantity + ? WHERE id = ?",
+                                 (inv["quantity"], existing["id"]))
+                else:
+                    conn.execute(
+                        "INSERT INTO character_inventory (character_id, item_id, quantity) VALUES (?, ?, ?)",
+                        (inv["character_id"], sort["id"], inv["quantity"]))
+        # Supprime les lignes d'inventaire du token RCT puis sa définition (plus jamais proposé au shop).
+        conn.execute("DELETE FROM character_inventory WHERE item_id = ?", (it["id"],))
+        conn.execute("DELETE FROM item_definitions WHERE id = ?", (it["id"],))
+    if rct_items:
+        print(f"🔍 [migration tokens] {len(rct_items)} définition(s) « Token Stats RCT » retirée(s), "
+              "exemplaires possédés convertis en « Token Stats Sort » de même classe.")
 
 
 def _seed_token_items(conn):
@@ -1527,6 +1580,7 @@ def init_db():
         _migrate_merge_eo_potion_category(conn)  # après le seed potions : fusionne l'ancienne cat. séparée
         _migrate_dedup_potions(conn)             # §5 : supprime les doublons de nom dans « Potion »
         _seed_token_items(conn)
+        _migrate_remove_token_stats_rct(conn)  # retire Token Stats RCT + convertit les exemplaires possédés
 
 
 # =====================================================================

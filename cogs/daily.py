@@ -239,7 +239,7 @@ COFFRE_TOKEN_NAMES = {
     "token_rct": "Token RCT", "token_territoire": "Token Territoire",
     "token_stats_force": "Token Stats Force", "token_stats_vitesse": "Token Stats Vitesse",
     "token_stats_endurance": "Token Stats Endurance", "token_stats_arme": "Token Stats Arme Maudite",
-    "token_stats_rct": "Token Stats RCT", "token_stats_territoire": "Token Stats Territoire",
+    "token_stats_territoire": "Token Stats Territoire",
     "token_stats_sort": "Token Stats Sort", "token_stats_eo": "Token Stats EO",
 }
 # stats_force/vitesse/endurance -> colonne de stat (add_stat_base_pts).
@@ -340,9 +340,9 @@ DAILY_COFFRE_REWARDS = {
         {"type": "token_stats_vitesse", "qty": 1, "pct": 1},
         {"type": "token_stats_endurance", "qty": 1, "pct": 1},
         {"type": "token_stats_arme", "qty": 1, "pct": 1},
-        {"type": "token_stats_rct", "qty": 1, "pct": 1},
         {"type": "token_stats_territoire", "qty": 1, "pct": 1},
-        {"type": "token_stats_sort", "qty": 1, "pct": 1},
+        # Token Stats RCT retiré (n'a jamais eu de sens) : son % est reversé sur Token Stats Sort.
+        {"type": "token_stats_sort", "qty": 1, "pct": 2},
         {"type": "token_stats_eo", "qty": 1, "pct": 1},
     ],
     "mythique": [
@@ -367,9 +367,9 @@ DAILY_COFFRE_REWARDS = {
         {"type": "token_stats_vitesse", "qty": 1, "pct": 3},
         {"type": "token_stats_endurance", "qty": 1, "pct": 3},
         {"type": "token_stats_arme", "qty": 1, "pct": 3},
-        {"type": "token_stats_rct", "qty": 1, "pct": 3},
         {"type": "token_stats_territoire", "qty": 1, "pct": 3},
-        {"type": "token_stats_sort", "qty": 1, "pct": 3},
+        # Token Stats RCT retiré : son % (3) est reversé sur Token Stats Sort.
+        {"type": "token_stats_sort", "qty": 1, "pct": 6},
         {"type": "token_stats_eo", "qty": 1, "pct": 3},
         {"type": "vip_15j", "pct": 2},
     ],
