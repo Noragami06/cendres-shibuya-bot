@@ -303,7 +303,8 @@ CREATE TABLE IF NOT EXISTS character_profiles (
     defaites INTEGER DEFAULT 0,
     nuls INTEGER DEFAULT 0,
     last_eo_regen_at TEXT,          -- §6 : dernier tick de régénération d'EO (ISO)
-    last_pv_regen_at TEXT           -- dernier tick de régénération des PV (ISO), même mécanisme que l'EO
+    last_pv_regen_at TEXT,          -- dernier tick de régénération des PV (ISO), même mécanisme que l'EO
+    last_train_at TEXT              -- dernier /train (ISO) : base du cooldown d'entraînement
 );
 
 CREATE TABLE IF NOT EXISTS character_backgrounds (
@@ -1377,6 +1378,7 @@ def _ensure_character_profiles_columns(conn):
         ("rct_quest_available", "INTEGER DEFAULT 0"),
         ("last_eo_regen_at", "TEXT"),  # §6 : régénération d'EO dans le temps
         ("last_pv_regen_at", "TEXT"),  # régénération des PV dans le temps (même mécanisme que l'EO)
+        ("last_train_at", "TEXT"),     # cooldown de /train
     ):
         if name not in cols:
             conn.execute(f"ALTER TABLE character_profiles ADD COLUMN {name} {decl}")
@@ -2294,7 +2296,7 @@ _PROFILE_COLUMNS = frozenset({
     "maitrise_eo_level", "victoires", "defaites", "nuls",
     # mastery_*_level ne sont plus modifiables (maîtrises dérivées des points de stats). Seul
     # rct_quest_available reste écrit (flag de quête RCT, via get_mastery_rct).
-    "rct_quest_available",
+    "rct_quest_available", "last_train_at",
 })
 
 
