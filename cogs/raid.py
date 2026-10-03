@@ -1168,7 +1168,9 @@ class Raid(commands.Cog):
         seul). Le reste : si des Ordres participent, l'État prélève 15% puis les Ordres se partagent au
         prorata des dégâts cumulés de leurs membres (crédité au Trésor) ; sinon l'État garde le reste.
         Retourne un résumé structuré (pour l'embed pédagogique §5)."""
+        from cogs.utils.rewards import multiplier_for_character  # règle universelle VIP/Booster ×2
         raid = db.raid_get_instance(raid_id)
+        guild = self.bot.get_guild(raid["guild_id"]) if raid else None
         parts = db.raid_get_participants(raid_id)
         solo = [p for p in parts if p["ordre_id"] is None]
         ordres = {}
@@ -1195,7 +1197,8 @@ class Raid(commands.Cog):
                     pcts[p["id"]] = pct
             for p in solo:
                 pct = pcts[p["id"]]
-                montant = round(net_final * pct / 100)
+                # VIP/Booster : part doublée (le bonus est financé par l'État, hors du pool net_final).
+                montant = round(net_final * pct / 100) * multiplier_for_character(guild, p["character_id"])
                 credit_compte_courant(p["character_id"], montant, "Part de raid", category="revenu")
                 total_solo_verse += montant
                 char = get_character(p["character_id"])
@@ -1210,9 +1213,12 @@ class Raid(commands.Cog):
             for oid, lst in ordres.items():
                 degats_ordre = sum((p["total_damage_dealt"] or 0) for p in lst)
                 part_ordre = round(net_ordres * degats_ordre / total_degats)
+                # VIP/Booster du CHEF de l'Ordre -> part de Trésor doublée.
+                o = db.get_order(oid)
+                if o is not None:
+                    part_ordre *= multiplier_for_character(guild, o["chef_character_id"])
                 db.adjust_order_solde(oid, part_ordre)
                 db.add_order_transaction(oid, "Part de raid", part_ordre, _now())
-                o = db.get_order(oid)
                 summary["ordres"].append({"nom": o["name"] if o else f"#{oid}", "part": part_ordre})
             summary["taxe_etat"] = taxe_etat
         else:
@@ -1347,6 +1353,8 @@ class Raid(commands.Cog):
         reward = RAID_REWARDS.get(classe)
         if reward is None:
             return
+        from cogs.utils.rewards import multiplier_for_character  # règle universelle VIP/Booster ×2
+        guild = self.bot.get_guild(raid["guild_id"])
         mvp_cid = db.raid_get_mvp(raid_id)
         alive = db.raid_get_alive_participants(raid_id)  # ordre = role_slot (ordre d'arrivée)
         mvp_mult = 1 + RAID_MVP_BONUS_PCT / 100
@@ -1355,11 +1363,12 @@ class Raid(commands.Cog):
             cid = p["character_id"]
             est_mvp = (cid == mvp_cid)
             mult = mvp_mult if est_mvp else 1.0
-            xp = round(random.randint(*reward["xp"]) * mult)
-            stats_libre = round(random.randint(*reward["stats_libre"]) * mult)
+            vb = multiplier_for_character(guild, cid)  # ×2 si VIP/Booster, sinon ×1
+            xp = round(random.randint(*reward["xp"]) * mult) * vb
+            stats_libre = round(random.randint(*reward["stats_libre"]) * mult) * vb
             await db.grant_character_xp(cid, xp)
             db.add_points_restants(cid, stats_libre)
-            # Coffre : poids égaux, le plus rare légèrement favorisé pour le MVP.
+            # Coffre : poids égaux, le plus rare légèrement favorisé pour le MVP. Quantité ×2 pour VIP/Booster.
             coffres = list(reward["coffres"])
             poids = [1.0] * len(coffres)
             if est_mvp and poids:
@@ -1368,11 +1377,12 @@ class Raid(commands.Cog):
             item = db.get_coffre_item_by_rarete(rarete)
             coffre_nom = item["name"] if item else f"Coffre {RAID_LABELS_COFFRE.get(rarete, rarete)}"
             if item is not None:
-                db.inv_add_item(cid, item["id"], 1)  # ajouté DIRECTEMENT (jamais de choix stocker/ouvrir)
+                db.inv_add_item(cid, item["id"], vb)  # ajouté DIRECTEMENT (1, ou 2 pour VIP/Booster)
             char = get_character(cid)
             nom = (char["character_name"] if char and char["character_name"] else f"#{cid}")
             marqueur = " ⭐ MVP" if est_mvp else ""
-            lignes.append(f"{nom}{marqueur} — +{xp} XP, +{stats_libre} stats, {coffre_nom}")
+            qte_coffre = f"{vb}x " if vb > 1 else ""
+            lignes.append(f"{nom}{marqueur} — +{xp} XP, +{stats_libre} stats, {qte_coffre}{coffre_nom}")
 
         mvp_char = get_character(mvp_cid) if mvp_cid else None
         mvp_nom = (mvp_char["character_name"] if mvp_char and mvp_char["character_name"]

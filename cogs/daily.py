@@ -421,11 +421,13 @@ def _coffre_entries_for(character_id, rarete):
 
 
 async def roll_coffre_reward(character_id, guild, rarete) -> dict:
-    """Tire une récompense pondérée dans DAILY_COFFRE_REWARDS[rarete] et l'applique. Retourne
-    {"texte": description lisible}. Applique le multiplicateur VIP ×2 aux gains NUMÉRIQUES (argent, xp,
-    stats, quantités) ; les tirages d'objet unique (arme/relique) restent à 1 exemplaire."""
+    """Tire une récompense pondérée dans DAILY_COFFRE_REWARDS[rarete] et l'applique. Règle universelle
+    VIP/Booster : ×2 sur TOUT (argent, XP, stats, ET quantités d'objets, y compris arme/relique). Le
+    multiplicateur est résolu par le rôle réel (Booster/VIP) OU le VIP virtuel slot 2/3 — ce qui remplace
+    l'ancien test is_vip_active (le coffre vip_15j octroie justement ce rôle, donc jamais de double compte)."""
+    from cogs.utils.rewards import multiplier_for_character
     entry = weighted_choice(_coffre_entries_for(character_id, rarete))
-    mult = DAILY_VIP_MULTIPLIER if db.is_vip_active(character_id) else 1
+    mult = multiplier_for_character(guild, character_id)
     t = entry["type"]
 
     # Convention de retour : {"texte": libellé de base, "n": quantité} (agrégé au récap, §9).
@@ -461,10 +463,11 @@ async def roll_coffre_reward(character_id, guild, rarete) -> dict:
     if t in ("arme_maudite", "relique"):
         cat = "Arme maudite" if t == "arme_maudite" else "Relique"
         item = db.get_random_item_in_category_classe(cat, entry["classe"])
+        qty = 1 * mult  # règle universelle : la quantité double aussi pour VIP/Booster (1 -> 2)
         if item is not None:
-            db.inv_add_item(character_id, item["id"], 1)  # objet unique : jamais ×2
-            return {"texte": item["name"], "n": 1}
-        return {"texte": f"{cat} classe {entry['classe']} (introuvable)", "n": 1}
+            db.inv_add_item(character_id, item["id"], qty)
+            return {"texte": item["name"], "n": qty}
+        return {"texte": f"{cat} classe {entry['classe']} (introuvable)", "n": qty}
 
     if t.startswith("parchemin_"):
         nom = COFFRE_PARCHEMIN_NAMES.get(t)
@@ -803,13 +806,14 @@ class Daily(commands.Cog):
                              "Que veux-tu faire de ce Token ?"),
                 color=PHOENIX_COLOR), view=view)
             await view.wait()
+            from cogs.utils.rewards import apply_vip_booster_multiplier  # VIP/Booster -> ×2
             if view.result == "argent":
-                montant = random.randint(lo, hi)
+                montant = apply_vip_booster_multiplier(user, random.randint(lo, hi))
                 credit_compte_courant(character_id, montant, "Échange de Token", category="revenu")
                 db.inv_remove_item(character_id, item["id"], 1)
                 await channel.send(f"💰 Token échangé contre **{montant:,} ¥**.".replace(",", " "))
             elif view.result == "stats":
-                montant = random.randint(lo, hi)
+                montant = apply_vip_booster_multiplier(user, random.randint(lo, hi))
                 db.add_points_restants(character_id, montant)
                 db.inv_remove_item(character_id, item["id"], 1)
                 await channel.send(f"📊 Token échangé contre **{montant:,} points à répartir**.".replace(",", " "))
@@ -1590,23 +1594,27 @@ class Daily(commands.Cog):
 
     # ---------- §9 : fin + récompenses ----------
     async def _finish_combat(self, channel, user, character_id, classe, st, gains, sort_xp, issue):
+        # Règle universelle : VIP/Booster -> ×2 sur tous les gains (points de stats, bonus, XP).
+        from cogs.utils.rewards import apply_vip_booster_multiplier
         # §8 : points par action réussie selon la classe ET l'issue (victoire/défaite).
         pts = DAILY_REWARD_POINTS[classe]["victoire" if issue == "victoire" else "defaite"]
         applied = {}
         for key, count in gains.items():
             if count > 0:
-                db.add_stat_base_pts(character_id, key, count * pts)
-                applied[key] = count * pts
+                gain = apply_vip_booster_multiplier(user, count * pts)
+                db.add_stat_base_pts(character_id, key, gain)
+                applied[key] = gain
         # §2 : bonus UNIQUE de points à répartir librement (même barème que les points par action, mais
         # appliqué une seule fois — pas par action). Corrige l'absence de gain de points libres.
-        bonus_libre = pts
+        bonus_libre = apply_vip_booster_multiplier(user, pts)
         db.add_points_restants(character_id, bonus_libre)
         # XP de Maîtrise Sort = somme des dégâts infligés par chaque sort (par principal concerné).
         for principal_id, xp in sort_xp.items():
             if xp > 0:
                 await db.grant_sort_xp(principal_id, xp)
         # §7 : XP de personnage gagnée dans tous les cas (victoire OU défaite).
-        xp_gagnee = DAILY_XP_REWARD[classe]["victoire" if issue == "victoire" else "defaite"]
+        xp_gagnee = apply_vip_booster_multiplier(
+            user, DAILY_XP_REWARD[classe]["victoire" if issue == "victoire" else "defaite"])
         await db.grant_character_xp(character_id, xp_gagnee)
 
         # PV/EO réels appliqués. §8 : le PV joueur affiché/enregistré est clampé à 100 minimum.
@@ -1682,10 +1690,13 @@ class Daily(commands.Cog):
             reward = await roll_coffre_reward(character_id, channel.guild, rarete)
             await channel.send(embed=daily_coffre_summary_embed(1, rarete, [reward]))
         else:
+            from cogs.utils.rewards import apply_vip_booster_multiplier
             item = db.get_coffre_item_by_rarete(rarete)
+            qty = apply_vip_booster_multiplier(user, 1)  # VIP/Booster : 1 coffre stocké -> 2
             if item is not None:
-                db.inv_add_item(character_id, item["id"], 1)
-            await channel.send("✅ Le coffre a été ajouté à ton inventaire.")
+                db.inv_add_item(character_id, item["id"], qty)
+            suffix = f" (×{qty} grâce à ton statut VIP/Booster)" if qty > 1 else ""
+            await channel.send(f"✅ Le coffre a été ajouté à ton inventaire{suffix}.")
 
 
 def daily_coffre_summary_embed(nombre, rarete, rewards):

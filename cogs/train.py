@@ -217,20 +217,25 @@ class TrainGameView(discord.ui.View):
         self.finished = True
         for item in self.children:
             item.disabled = True
+        # Règle universelle : VIP/Booster -> ×2 sur points, XP et quantité de coffre bonus.
+        from cogs.utils.rewards import apply_vip_booster_multiplier
         reward = TRAIN_REWARDS[self.classe]
-        db.add_stat_base_pts(self.character_id, TRAIN_STAT_DB_COL[self.stat_key], reward["points"])
-        await db.grant_character_xp(self.character_id, reward["xp"])
+        points = apply_vip_booster_multiplier(interaction.user, reward["points"])
+        xp = apply_vip_booster_multiplier(interaction.user, reward["xp"])
+        db.add_stat_base_pts(self.character_id, TRAIN_STAT_DB_COL[self.stat_key], points)
+        await db.grant_character_xp(self.character_id, xp)
         stat_name = TRAIN_STAT_LABELS[self.stat_key]
         desc = (f"Code trouvé en **{len(self.rows)}/{self._attempts_max()}** tentatives !\n"
-                f"**+{reward['points']}** points de {stat_name}\n"
-                f"**+{reward['xp']}** XP")
+                f"**+{points}** points de {stat_name}\n"
+                f"**+{xp}** XP")
         # §1 : bonus de coffre pour une victoire rapide (1re ou 2e tentative).
         if len(self.rows) <= TRAIN_FAST_WIN_MAX_ROWS:
             rarete = weighted_pick(TRAIN_FAST_WIN_CHEST_WEIGHTS)
             item = db.get_coffre_item_by_rarete(rarete)
             if item is not None:
-                db.inv_add_item(self.character_id, item["id"], 1)
-                desc += (f"\n\n🎁 **Bonus de rapidité !** Tu as obtenu un "
+                qty = apply_vip_booster_multiplier(interaction.user, 1)  # 1 coffre -> 2 pour VIP/Booster
+                db.inv_add_item(self.character_id, item["id"], qty)
+                desc += (f"\n\n🎁 **Bonus de rapidité !** Tu as obtenu {qty}x "
                          f"{DAILY_COFFRE_LABELS.get(rarete, rarete)} "
                          f"(trouvé en seulement {len(self.rows)} tentative(s)).")
         db.update_profile(self.character_id, last_train_at=datetime.utcnow().isoformat())

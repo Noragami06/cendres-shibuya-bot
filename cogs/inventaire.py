@@ -906,7 +906,8 @@ class Inventaire(commands.Cog):
                 await channel.send("❌ Cette Relique n'est plus dans ton inventaire. Rien n'a été avalé.")
                 return
 
-            bonus = db.RELIQUE_STAT_BONUS[classe]
+            from cogs.utils.rewards import apply_vip_booster_multiplier  # VIP/Booster -> ×2
+            bonus = apply_vip_booster_multiplier(interaction.user, db.RELIQUE_STAT_BONUS[classe])
             # Stats TOUJOURS boostées.
             for stat in ("force", "vitesse", "endurance", "sorts"):
                 db.add_stat_base_pts(character_id, stat, bonus)
@@ -987,16 +988,19 @@ class Inventaire(commands.Cog):
                 await channel.send("❌ Ce Token n'est plus dans ton inventaire.")
                 return
 
+            from cogs.utils.rewards import apply_vip_booster_multiplier  # VIP/Booster -> ×2
             stat_key, mode = _TOKEN_STATS_TYPES[ttype]
             if mode == "points":
-                points = db.TOKEN_STATS_POINTS_DIRECTS[classe]
+                points = apply_vip_booster_multiplier(interaction.user, db.TOKEN_STATS_POINTS_DIRECTS[classe])
                 db.add_stat_base_pts(character_id, stat_key, points)
                 msg = f"✅ +{points} points directement en {ttype} !"
             else:
                 cap = {"energie_occulte": MASTERY_EO_MAX_LEVEL, "territoire": MASTERY_TERRITOIRE_MAX_LEVEL,
                        "sorts": MASTERY_SORT_MAX_LEVEL, "armes_maudites": MASTERY_ARME_MAX_LEVEL}[stat_key]
-                niveaux = (db.TOKEN_STATS_NIVEAUX_EO_TERRITOIRE[classe] if mode == "eo_terr"
-                           else db.TOKEN_STATS_NIVEAUX_SORT_ARME[classe])
+                niveaux = apply_vip_booster_multiplier(
+                    interaction.user,
+                    db.TOKEN_STATS_NIVEAUX_EO_TERRITOIRE[classe] if mode == "eo_terr"
+                    else db.TOKEN_STATS_NIVEAUX_SORT_ARME[classe])
 
                 def _points_for_level(lvl):
                     # Division PLAFOND (ceil) : garantit assez de points pour ATTEINDRE le niveau visé

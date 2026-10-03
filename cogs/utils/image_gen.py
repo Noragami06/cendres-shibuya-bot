@@ -2974,3 +2974,147 @@ def generate_entrainement_image(stat_name: str, rows: list, attempts_max: int, o
     img = big.resize((W, H), Image.LANCZOS)
     img.save(out_path)
     return out_path
+
+
+# =====================================================================
+# /giveaway — pillow de tirage au sort
+# =====================================================================
+# Polices : on tente d'abord les fichiers du projet (assets/fonts/), sinon on retombe sur des polices
+# système élégantes équivalentes — Cambria pour le titre (à la place d'Italiana), Georgia pour le corps
+# (à la place de CrimsonPro, qui a bien ses variantes regular/bold/italic).
+_GIVEAWAY_TITLE_PATHS = [
+    "assets/fonts/Italiana-Regular.ttf",
+    "C:/Windows/Fonts/cambria.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+]
+_GIVEAWAY_BODY_PATHS = {
+    "regular": ["assets/fonts/CrimsonPro-Regular.ttf", "C:/Windows/Fonts/georgia.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"],
+    "bold": ["assets/fonts/CrimsonPro-Bold.ttf", "C:/Windows/Fonts/georgiab.ttf",
+             "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"],
+    "italic": ["assets/fonts/CrimsonPro-Italic.ttf", "C:/Windows/Fonts/georgiai.ttf",
+               "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf"],
+}
+
+
+def _giveaway_truetype(paths, size):
+    for p in paths:
+        try:
+            return ImageFont.truetype(p, size)
+        except (OSError, IOError):
+            continue
+    return ImageFont.load_default()
+
+
+def _giveaway_font_title(size):
+    return _giveaway_truetype(_GIVEAWAY_TITLE_PATHS, size)
+
+
+def _giveaway_font_body(size, bold=False, italic=False):
+    key = "bold" if bold else ("italic" if italic else "regular")
+    return _giveaway_truetype(_GIVEAWAY_BODY_PATHS[key], size)
+
+
+def _giveaway_urgence_color(pct_restant):
+    """pct_restant : 0.0 (terminé) à 1.0 (vient de commencer). Dégradé vert -> orange -> rouge."""
+    if pct_restant > 0.5:
+        return (90, 210, 130, 255)
+    elif pct_restant > 0.15:
+        return (235, 165, 60, 255)
+    else:
+        return (235, 70, 70, 255)
+
+
+def generate_giveaway_image(titre: str, rewards: list, participants_normaux: int, participants_boost: int,
+                            nb_gagnants: int, organisateur: str, temps_restant_str: str, pct_temps_restant: float,
+                            historique_num: int, out_path: str, W=1600, H=1000):
+    """
+    titre : nom du giveaway, PARAMÉTRABLE par le staff à la création (jamais une valeur fixe)
+    rewards : liste de tuples (nom_recompense, quantite_str) — ex: [("Coffre Légendaire", "x2"), ("1 000 000 ¥", "")]
+    participants_normaux / participants_boost : nombres de participants, Booster/VIP comptés séparément (entrée doublée visuellement)
+    pct_temps_restant : 0.0 à 1.0, fraction du temps total restant (pilote la couleur du cercle)
+    historique_num : le Nème giveaway du serveur (compteur simple)
+    """
+    SS = 3
+    bg = (10, 6, 18, 255)
+    accent = (180, 140, 230, 255)
+    panel_fill = (18, 12, 28, 235)
+    panel_outline = (150, 110, 210, 255)
+    text_main = (228, 220, 240, 255)
+    text_sub = (150, 140, 175, 255)
+
+    def draw(img, ss):
+        d = ImageDraw.Draw(img)
+        d.text((60*ss, 50*ss), titre, font=_giveaway_font_title(54*ss), fill=accent)
+        d.line((60*ss, 115*ss, img.size[0]-60*ss, 115*ss), fill=accent[:3]+(150,), width=2*ss)
+
+        xL = 60*ss
+        box_w = 780*ss
+        y = 150*ss
+        line_h = 50*ss
+        pad = 24*ss
+        header_h = 66*ss
+
+        def draw_box(title, lines):
+            nonlocal y
+            content_h = len(lines)*line_h
+            box_h = header_h + content_h + pad*2
+            d.rounded_rectangle((xL, y, xL+box_w, y+box_h), radius=14*ss, fill=panel_fill, outline=panel_outline, width=3*ss)
+            d.text((xL+28*ss, y+14*ss), title, font=_giveaway_font_body(36*ss, bold=True), fill=accent)
+            d.line((xL+28*ss, y+header_h+4*ss, xL+box_w-28*ss, y+header_h+4*ss), fill=panel_outline[:3]+(120,), width=1*ss)
+            yy = y + header_h + pad
+            for l in lines:
+                d.text((xL+28*ss, yy), l, font=_giveaway_font_body(33*ss), fill=text_main)
+                yy += line_h
+            y += box_h + 26*ss
+
+        reward_lines = [f"• {n} {q}".strip() for n, q in rewards]
+        draw_box("RÉCOMPENSES", reward_lines)
+
+        total_part = participants_normaux + participants_boost
+        part_lines = [
+            f"{participants_normaux} participant(s) normaux",
+            f"{participants_boost} Booster(s)/VIP (entrée doublée)",
+            f"Chances actuelles : 1/{total_part} par ticket",
+        ]
+        draw_box("PARTICIPANTS", part_lines)
+
+        info_lines = [
+            f"{nb_gagnants} gagnant(s) seront tirés au sort",
+            f"Organisé par {organisateur}",
+            f"{historique_num}ème giveaway du serveur",
+        ]
+        draw_box("INFOS", info_lines)
+
+        xR = 860 * ss
+        panelR = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        pdr = ImageDraw.Draw(panelR)
+        pdr.rounded_rectangle((xR, 150*ss, img.size[0]-60*ss, img.size[1]-60*ss), radius=16*ss, fill=panel_fill, outline=panel_outline, width=3*ss)
+        img.alpha_composite(panelR)
+        d = ImageDraw.Draw(img)
+
+        cx, cy, r = (xR + img.size[0]-60*ss)/2, 500*ss, 230*ss
+        ucol = _giveaway_urgence_color(pct_temps_restant)
+        d.ellipse((cx-r, cy-r+40*ss, cx+r, cy+r+40*ss), outline=panel_outline[:3]+(100,), width=6*ss)
+        end_angle = -90 + 360 * pct_temps_restant
+        d.arc((cx-r, cy-r+40*ss, cx+r, cy+r+40*ss), start=-90, end=end_angle, fill=ucol, width=10*ss)
+
+        lbl = "TEMPS RESTANT"
+        lbl_size = 66*ss
+        lbl_font = _giveaway_font_body(lbl_size, bold=True)
+        lw = text_w(d, lbl, lbl_font)
+        max_lbl_w = r * 1.6
+        while lw > max_lbl_w and lbl_size > 18*ss:
+            lbl_size -= 2*ss
+            lbl_font = _giveaway_font_body(lbl_size, bold=True)
+            lw = text_w(d, lbl, lbl_font)
+        d.text((cx-lw/2, cy+40*ss-150*ss), lbl, font=lbl_font, fill=text_sub)
+
+        tfont = _giveaway_font_body(42*ss, bold=True)
+        tw2 = text_w(d, temps_restant_str, tfont)
+        d.text((cx-tw2/2, cy+40*ss-15*ss), temps_restant_str, font=tfont, fill=ucol)
+
+    big = Image.new("RGBA", (W*SS, H*SS), bg)
+    draw(big, SS)
+    big.resize((W, H), Image.LANCZOS).save(out_path)
+    return out_path

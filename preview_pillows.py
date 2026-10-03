@@ -206,3 +206,13 @@ rows_exemple = [
 ]
 generate_entrainement_image("Force", rows_exemple, attempts_max=8, out_path="temp/preview_entrainement.png")
 print("Pillow entraînement généré dans temp/")
+
+from cogs.utils.image_gen import generate_giveaway_image
+
+generate_giveaway_image(
+    titre="Festin de Shibuya", rewards=[("Coffre Légendaire", "x2"), ("1 000 000 ¥", ""), ("Token RCT", "x1")],
+    participants_normaux=34, participants_boost=6, nb_gagnants=2, organisateur="Noragami",
+    temps_restant_str="02:47:13", pct_temps_restant=0.35, historique_num=12,
+    out_path="temp/preview_giveaway.png",
+)
+print("Pillow giveaway généré dans temp/")
