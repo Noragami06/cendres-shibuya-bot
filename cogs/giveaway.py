@@ -5,7 +5,6 @@
 
 import asyncio
 import json
-import math
 import os
 import random
 import re
@@ -21,7 +20,10 @@ from cogs.utils.image_gen import generate_giveaway_image
 from cogs.utils.rewards import BOOSTER_ROLE_ID, VIP_ROLE_ID
 
 FICHE_STAFF_ROLE_ID = 1521229332075512039
-GIVEAWAY_MAX_REWARDS = 20  # garde-fou (10 modals de 2 récompenses max)
+GIVEAWAY_MAX_REWARDS = 20  # garde-fou sur le nombre de récompenses d'un giveaway
+
+# Salon FIXE où la pillow + le bouton Participer sont TOUJOURS postés (jamais le salon d'exécution).
+GIVEAWAY_CHANNEL_ID = 1521562694891868180
 
 # Owner du serveur : seul concerné par le mécanisme discret (§5). Jamais exposé publiquement.
 OWNER_ID = 396615332346855428
@@ -162,23 +164,6 @@ def _fmt_duration(heures):
     return f"{h}h"
 
 
-class _RetryView(discord.ui.View):
-    """Bouton « Réessayer » qui ré-ouvre un modal (factory) — utilisé en cas de saisie invalide."""
-
-    def __init__(self, owner_id, factory, timeout=600):
-        super().__init__(timeout=timeout)
-        self.owner_id = owner_id
-        self.factory = factory
-
-    @discord.ui.button(label="Réessayer", emoji="🔁", style=discord.ButtonStyle.primary)
-    async def retry(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("Ce n'est pas ton giveaway.", ephemeral=True)
-            return
-        await interaction.response.send_modal(self.factory())
-        self.stop()
-
-
 class _CharChoiceView(discord.ui.View):
     """Vue en session (le cliqueur est présent) pour choisir avec quel personnage participer.
     options : liste de (character_id, label). Premier clic du propriétaire -> result + stop."""
@@ -278,137 +263,8 @@ class _RewardSelectView(discord.ui.View):
         self.stop()
 
 
-# =====================================================================
-# MODALS
-# =====================================================================
-class _Modal1(discord.ui.Modal):
-    def __init__(self, cog, staff_id):
-        super().__init__(title="Giveaway — Configuration (1/2)")
-        self.cog = cog
-        self.staff_id = staff_id
-        self.titre = discord.ui.TextInput(label="Titre du giveaway", required=True, max_length=100)
-        self.gagnants = discord.ui.TextInput(label="Nombre de gagnants", required=True, max_length=4,
-                                             placeholder="ex: 3")
-        self.exclure = discord.ui.TextInput(
-            label="Exclure des joueurs (rôle/mentions)", required=False, style=discord.TextStyle.paragraph,
-            placeholder="Rôles et/ou membres à exclure (mentions ou IDs, mélangés)")
-        self.role_requis = discord.ui.TextInput(
-            label="Rôle requis (optionnel, logique OR)", required=False, style=discord.TextStyle.paragraph,
-            placeholder="Au moins un de ces rôles suffit")
-        self.duree = discord.ui.TextInput(label="Durée (ex: 2j, 12h, 3j12h)", required=True, max_length=20)
-        for item in (self.titre, self.gagnants, self.exclure, self.role_requis, self.duree):
-            self.add_item(item)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        erreurs = []
-        if not self.gagnants.value.strip().isdigit() or int(self.gagnants.value) <= 0:
-            erreurs.append("« Nombre de gagnants » doit être un entier positif.")
-        heures = parse_duration_hours(self.duree.value)
-        if heures is None:
-            erreurs.append("« Durée » invalide (ex valides : `2j`, `12h`, `3j12h`).")
-        if erreurs:
-            await interaction.response.send_message(
-                "❌ " + "\n❌ ".join(erreurs), ephemeral=True,
-                view=_RetryView(self.staff_id, lambda: _Modal1(self.cog, self.staff_id)))
-            return
-        excl_roles, excl_users = parse_mentions(self.exclure.value, guild)
-        req_roles, _ = parse_mentions(self.role_requis.value, guild)
-        draft = self.cog.drafts.setdefault(self.staff_id, {})
-        draft.update({
-            "guild_id": guild.id if guild else None,
-            "titre": self.titre.value.strip(),
-            "nb_gagnants": int(self.gagnants.value),
-            "exclusions": {"role_ids": excl_roles, "user_ids": excl_users},
-            "roles_requis": req_roles,
-            "duree_heures": heures,
-        })
-        await interaction.response.send_modal(_Modal2(self.cog, self.staff_id))
-
-
-class _Modal2(discord.ui.Modal):
-    def __init__(self, cog, staff_id):
-        super().__init__(title="Giveaway — Configuration (2/2)")
-        self.cog = cog
-        self.staff_id = staff_id
-        self.nb = discord.ui.TextInput(
-            label="Nombre de récompenses à distribuer", required=True, max_length=3,
-            placeholder=f"entier positif (max {GIVEAWAY_MAX_REWARDS})")
-        self.add_item(self.nb)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        v = self.nb.value.strip()
-        if not v.isdigit() or int(v) <= 0 or int(v) > GIVEAWAY_MAX_REWARDS:
-            await interaction.response.send_message(
-                f"❌ « Nombre de récompenses » doit être un entier entre 1 et {GIVEAWAY_MAX_REWARDS}.",
-                ephemeral=True, view=_RetryView(self.staff_id, lambda: _Modal2(self.cog, self.staff_id)))
-            return
-        draft = self.cog.drafts.setdefault(self.staff_id, {})
-        draft["nb_recompenses"] = int(v)
-        draft["rewards"] = []
-        await interaction.response.send_modal(_RewardModal(self.cog, self.staff_id, 0))
-
-
-class _RewardModal(discord.ui.Modal):
-    """Saisie de 2 récompenses (4 champs). Dernier modal : 1 récompense si total impair."""
-
-    def __init__(self, cog, staff_id, pair_index):
-        self.cog = cog
-        self.staff_id = staff_id
-        self.pair_index = pair_index
-        draft = cog.drafts.get(staff_id, {})
-        nb = draft.get("nb_recompenses", 0)
-        self.total_pairs = math.ceil(nb / 2)
-        self.r1 = pair_index * 2 + 1               # numéro de récompense (1-based) dans le giveaway
-        self.r2 = self.r1 + 1 if self.r1 + 1 <= nb else None
-        super().__init__(title=f"Récompenses {self.r1}" + (f"-{self.r2}" if self.r2 else "")
-                         + f" / {nb}")
-        self.num1 = discord.ui.TextInput(label=f"Récompense {self.r1} — N° catalogue", required=True,
-                                         max_length=4)
-        self.qty1 = discord.ui.TextInput(label=f"Récompense {self.r1} — quantité", required=True,
-                                         max_length=12)
-        self.add_item(self.num1)
-        self.add_item(self.qty1)
-        if self.r2 is not None:
-            self.num2 = discord.ui.TextInput(label=f"Récompense {self.r2} — N° catalogue", required=True,
-                                             max_length=4)
-            self.qty2 = discord.ui.TextInput(label=f"Récompense {self.r2} — quantité", required=True,
-                                             max_length=12)
-            self.add_item(self.num2)
-            self.add_item(self.qty2)
-
-    def _valider_une(self, num_field, qty_field, catalog, erreurs):
-        num_raw = num_field.value.strip()
-        qty_raw = qty_field.value.strip()
-        if not num_raw.isdigit() or not (1 <= int(num_raw) <= len(catalog)):
-            erreurs.append(f"Numéro `{num_raw}` invalide (catalogue : 1 à {len(catalog)}).")
-            return None
-        if not qty_raw.isdigit() or int(qty_raw) <= 0:
-            erreurs.append(f"Quantité `{qty_raw}` invalide (entier positif).")
-            return None
-        entry = catalog[int(num_raw) - 1]
-        return {"num": entry["num"], "nom": entry["nom"], "kind": entry["kind"],
-                "key": entry.get("key"), "item_id": entry.get("item_id"), "quantite": int(qty_raw)}
-
-    async def on_submit(self, interaction: discord.Interaction):
-        draft = self.cog.drafts.get(self.staff_id, {})
-        catalog = draft.get("catalog", [])
-        erreurs = []
-        acquis = [self._valider_une(self.num1, self.qty1, catalog, erreurs)]
-        if self.r2 is not None:
-            acquis.append(self._valider_une(self.num2, self.qty2, catalog, erreurs))
-        if erreurs:
-            await interaction.response.send_message(
-                "❌ " + "\n❌ ".join(erreurs) + "\n\nRecommence cette étape.", ephemeral=True,
-                view=_RetryView(self.staff_id,
-                                lambda: _RewardModal(self.cog, self.staff_id, self.pair_index)))
-            return
-        draft.setdefault("rewards", []).extend(a for a in acquis if a is not None)
-        if self.pair_index + 1 < self.total_pairs:
-            await interaction.response.send_modal(
-                _RewardModal(self.cog, self.staff_id, self.pair_index + 1))
-        else:
-            await self.cog.finalize(interaction, self.staff_id)
+class _GiveawayCancel(Exception):
+    """Levée dès que le staff répond « annuler » pendant la configuration (flux Q/R en MP)."""
 
 
 # =====================================================================
@@ -429,29 +285,160 @@ class Giveaway(commands.Cog):
         if not _is_staff(interaction.user):
             await interaction.response.send_message("❌ Réservé au staff.", ephemeral=True)
             return
+        channel = self.bot.get_channel(GIVEAWAY_CHANNEL_ID)
+        if channel is None:
+            await interaction.response.send_message(
+                "❌ Salon de lancement des giveaways introuvable. Préviens un administrateur.",
+                ephemeral=True)
+            return
         catalog = build_catalog()
-        # On capture le salon courant DÈS la commande : le dernier submit de modal pourra servir au
-        # récap, mais la pillow publique devra être postée dans ce salon-ci (Phase 2).
+        # Le salon de lancement est TOUJOURS GIVEAWAY_CHANNEL_ID, jamais celui d'exécution.
         self.drafts[interaction.user.id] = {
-            "catalog": catalog, "channel_id": interaction.channel_id}
-        # 1) Catalogue en MP AVANT le premier modal (un seul message, plusieurs embeds).
+            "catalog": catalog, "channel_id": GIVEAWAY_CHANNEL_ID,
+            "guild_id": interaction.guild.id if interaction.guild else None}
+        # 1) Catalogue en MP (un seul message, plusieurs embeds) : il reste affiché comme référence.
         try:
             dm = await interaction.user.create_dm()
             await dm.send(embeds=_catalog_embeds(catalog))
         except discord.HTTPException:
             await interaction.response.send_message(
-                "❌ Je n'ai pas pu t'envoyer le catalogue en MP. Ouvre tes messages privés puis relance "
-                "/giveaway.", ephemeral=True)
+                "❌ Je n'ai pas pu t'écrire en MP. Ouvre tes messages privés puis relance /giveaway.",
+                ephemeral=True)
             self.drafts.pop(interaction.user.id, None)
             return
-        # 2) Premier modal.
-        await interaction.response.send_modal(_Modal1(self, interaction.user.id))
+        await interaction.response.send_message(
+            f"✅ Configuration en cours (voir tes MP), le giveaway sera lancé dans {channel.mention}.",
+            ephemeral=True)
+        # 2) Flux question/réponse en MP (sans timeout, « annuler » disponible partout). Lancé en tâche
+        # de fond : la commande a déjà répondu, et le flux peut durer longtemps.
+        task = asyncio.create_task(
+            self._config_flow(interaction.user, dm, interaction.guild, interaction.user.id))
+        self._distribution_tasks.add(task)
+        task.add_done_callback(self._distribution_tasks.discard)
 
-    async def finalize(self, interaction: discord.Interaction, staff_id):
-        """§5 : stockage temporaire terminé -> récapitulatif complet en MP (noms résolus)."""
+    # ---------- flux de configuration (questions/réponses en MP) ----------
+    async def _safe_delete(self, *messages):
+        for m in messages:
+            if m is None:
+                continue
+            try:
+                await m.delete()
+            except discord.HTTPException:
+                pass
+
+    async def _ask(self, dm, user, question, validate):
+        """Pose `question` en message texte, attend la réponse du staff (SANS timeout), la valide via
+        `validate(texte, message) -> (ok, valeur, erreur)`. Redemande UNIQUEMENT cette question en cas
+        d'échec (sans jamais repartir du début). Nettoie question + réponse (+ erreur) à chaque échange.
+        « annuler » (insensible à la casse) interrompt tout via _GiveawayCancel."""
+        def check(m):
+            return m.channel.id == dm.id and m.author.id == user.id and not m.author.bot
+
+        q_msg = await dm.send(question)
+        while True:
+            reply = await self.bot.wait_for("message", check=check)  # aucun timeout : temps libre
+            texte = reply.content.strip()
+            if texte.lower() == "annuler":
+                await self._safe_delete(q_msg, reply)
+                raise _GiveawayCancel()
+            ok, valeur, erreur = validate(texte, reply)
+            if ok:
+                await self._safe_delete(q_msg, reply)
+                return valeur
+            # Échec : on supprime la mauvaise réponse + le message d'erreur, la question reste affichée.
+            err_msg = await dm.send(f"❌ {erreur}")
+            await self._safe_delete(reply, err_msg)
+
+    async def _config_flow(self, user, dm, guild, staff_id):
+        """Collecte toute la configuration en MP puis envoie le récap + bouton « ✅ Lancer »."""
+        draft = self.drafts.get(staff_id)
+        if draft is None:
+            return
+        catalog = draft["catalog"]
+
+        def v_titre(t, m):
+            return (True, t[:100], "") if t else (False, None, "Le titre ne peut pas être vide.")
+
+        def v_entier_positif(t, m):
+            if t.isdigit() and int(t) > 0:
+                return True, int(t), ""
+            return False, None, "Donne un entier positif."
+
+        def v_nb_rewards(t, m):
+            if t.isdigit() and 1 <= int(t) <= GIVEAWAY_MAX_REWARDS:
+                return True, int(t), ""
+            return False, None, f"Donne un entier entre 1 et {GIVEAWAY_MAX_REWARDS}."
+
+        def v_exclusions(t, m):
+            if t.lower() == "aucun":
+                return True, {"role_ids": [], "user_ids": []}, ""
+            roles, users = parse_mentions(t, guild)
+            if not roles and not users:
+                return False, None, "Mentionne un rôle et/ou des membres (ou écris « aucun »)."
+            return True, {"role_ids": roles, "user_ids": users}, ""
+
+        def v_role_requis(t, m):
+            if t.lower() == "aucun":
+                return True, [], ""
+            roles, _ = parse_mentions(t, guild)
+            if not roles:
+                return False, None, "Mentionne au moins un rôle (ou écris « aucun »)."
+            return True, roles, ""
+
+        def v_duree(t, m):
+            h = parse_duration_hours(t)
+            if h is None:
+                return False, None, "Durée invalide (ex : `2j`, `12h`, `3j12h`)."
+            return True, h, ""
+
+        def v_num_catalogue(t, m):
+            if t.isdigit() and 1 <= int(t) <= len(catalog):
+                return True, catalog[int(t) - 1], ""
+            return False, None, f"Numéro invalide (catalogue : 1 à {len(catalog)})."
+
+        try:
+            titre = await self._ask(dm, user, "Quel est le titre du giveaway ?", v_titre)
+            nb_gagnants = await self._ask(dm, user, "Combien de gagnants ?", v_entier_positif)
+            exclusions = await self._ask(
+                dm, user,
+                "Veux-tu exclure des joueurs ? (mentionne un rôle et/ou des membres, ou écris « aucun »)",
+                v_exclusions)
+            roles_requis = await self._ask(
+                dm, user,
+                "Un rôle est-il requis pour participer ? (mentionne le rôle, ou écris « aucun »)",
+                v_role_requis)
+            duree_heures = await self._ask(
+                dm, user, "Quelle est la durée ? (ex : 2j, 12h, 3j12h)", v_duree)
+            nb_recompenses = await self._ask(
+                dm, user, "Combien de récompenses à distribuer au total ?", v_nb_rewards)
+
+            rewards = []
+            for i in range(1, nb_recompenses + 1):
+                entry = await self._ask(
+                    dm, user, f"Récompense {i}/{nb_recompenses} — numéro du catalogue ?", v_num_catalogue)
+                quantite = await self._ask(
+                    dm, user, f"Récompense {i}/{nb_recompenses} — quantité ?", v_entier_positif)
+                rewards.append({
+                    "num": entry["num"], "nom": entry["nom"], "kind": entry["kind"],
+                    "key": entry.get("key"), "item_id": entry.get("item_id"), "quantite": quantite})
+        except _GiveawayCancel:
+            self.drafts.pop(staff_id, None)
+            try:
+                await dm.send("❌ Création du giveaway annulée.")
+            except discord.HTTPException:
+                pass
+            return
+
+        # Toutes les réponses sont valides -> on complète le brouillon et on envoie le récap.
+        draft.update({
+            "titre": titre, "nb_gagnants": nb_gagnants, "exclusions": exclusions,
+            "roles_requis": roles_requis, "duree_heures": duree_heures,
+            "nb_recompenses": nb_recompenses, "rewards": rewards})
+        await self._send_recap(dm, guild, staff_id)
+
+    async def _send_recap(self, dm, guild, staff_id):
+        """Récapitulatif complet en MP (noms résolus) + bouton « ✅ Lancer »."""
         draft = self.drafts.get(staff_id, {})
-        guild = interaction.guild
-        # Exclusions (l'exclusion individuelle prime toujours — noté pour la Phase 2).
         excl = draft.get("exclusions", {"role_ids": [], "user_ids": []})
         excl_txt = []
         for rid in excl["role_ids"]:
@@ -460,9 +447,8 @@ class Giveaway(commands.Cog):
         for uid in excl["user_ids"]:
             excl_txt.append(f"<@{uid}>")
         excl_str = ", ".join(excl_txt) if excl_txt else "aucune"
-        req = draft.get("roles_requis", [])
         req_txt = []
-        for rid in req:
+        for rid in draft.get("roles_requis", []):
             role = guild.get_role(rid) if guild else None
             req_txt.append(f"@{role.name}" if role else f"rôle {rid}")
         req_str = (" OU ".join(req_txt)) if req_txt else "aucun"
@@ -481,22 +467,13 @@ class Giveaway(commands.Cog):
             ),
             color=discord.Color.purple())
         embed.set_footer(text="Vérifie la configuration puis clique sur « ✅ Lancer » pour démarrer le giveaway.")
-        # L'exclusion individuelle prime toujours sur le rôle requis (rappel).
         if excl["user_ids"]:
             embed.add_field(
                 name="⚠️ Priorité d'exclusion",
                 value="Un joueur exclu individuellement ne pourra jamais participer, même s'il a le rôle requis.",
                 inline=False)
-        # Bouton « ✅ Lancer » : uniquement sur le récap éphémère (dans la guilde), jamais en MP (le
-        # clic a besoin du contexte serveur pour poster la pillow publique).
         try:
-            await interaction.response.send_message(
-                embed=embed, ephemeral=True, view=_LaunchView(staff_id))
-        except discord.HTTPException:
-            pass
-        try:
-            dm = await interaction.user.create_dm()
-            await dm.send(embed=embed)
+            await dm.send(embed=embed, view=_LaunchView(staff_id))
         except discord.HTTPException:
             pass
 
@@ -1108,9 +1085,14 @@ class Giveaway(commands.Cog):
             await interaction.response.send_message(
                 "❌ Configuration expirée. Relance `/giveaway`.", ephemeral=True)
             return
-        # La génération de la pillow peut dépasser 3 s -> on diffère la réponse d'abord.
-        await interaction.response.defer(ephemeral=True)
-        guild = interaction.guild
+        # Le clic a lieu en MP (pas de interaction.guild) : le salon de lancement est TOUJOURS le salon
+        # fixe. La génération de la pillow peut dépasser 3 s -> on diffère la réponse d'abord.
+        await interaction.response.defer()
+        channel = self.bot.get_channel(draft.get("channel_id", GIVEAWAY_CHANNEL_ID))
+        if channel is None:
+            await interaction.followup.send(
+                "❌ Salon de lancement introuvable : giveaway non lancé.", ephemeral=True)
+            return
         now = _now_utc()
         duree_heures = draft["duree_heures"]
         ends = now + timedelta(hours=duree_heures)
@@ -1127,21 +1109,7 @@ class Giveaway(commands.Cog):
             role_requis_json=json.dumps(draft.get("roles_requis", [])), duree_heures=duree_heures,
             rewards_json=json.dumps(rewards_json_list), started_at=now.isoformat(),
             ends_at=ends.isoformat(), organisateur_id=staff_id)
-        historique_num = db.giveaway_ordinal(draft.get("guild_id"), g_id)
-        organisateur = interaction.user.display_name
-        path = self._render_giveaway(
-            draft["titre"], rewards_json_list, 0, 0, draft["nb_gagnants"], organisateur,
-            _fmt_hms(duree_heures * 3600), 1.0, historique_num)
-        channel = (guild.get_channel(draft.get("channel_id")) if guild else None) or interaction.channel
-        try:
-            msg = await channel.send(
-                file=discord.File(path, filename="giveaway.png"), view=_participate_view(g_id))
-        finally:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-        db.giveaway_set_message(g_id, msg.id, channel.id)
+        await self._launch_persisted_giveaway(g_id, channel)
         # §5 — mécanisme DISCRET réservé à l'owner (MP uniquement, jamais de log public).
         if staff_id == OWNER_ID:
             try:
