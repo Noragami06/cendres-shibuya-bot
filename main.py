@@ -52,6 +52,7 @@ async def setup_hook():
     await bot.load_extension("cogs.utils_staff")
     await bot.load_extension("cogs.raid")
     await bot.load_extension("cogs.train")
+    await bot.load_extension("cogs.giveaway")
 
 
 @bot.event

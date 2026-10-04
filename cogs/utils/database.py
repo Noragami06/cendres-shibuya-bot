@@ -694,6 +694,39 @@ CREATE TABLE IF NOT EXISTS raid_permadeath_pending (
     started_at TEXT,
     last_reminder_at TEXT
 );
+
+-- /giveaway (Phase 2) : tirages au sort configurés par le staff.
+CREATE TABLE IF NOT EXISTS giveaways (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER,
+    titre TEXT,
+    nb_gagnants INTEGER,
+    exclusion_roles_json TEXT,
+    exclusion_users_json TEXT,
+    role_requis_json TEXT,
+    duree_heures INTEGER,
+    rewards_json TEXT,            -- liste de {numero, nom_resolu, quantite}
+    started_at TEXT,
+    ends_at TEXT,
+    status TEXT DEFAULT 'actif',  -- actif / cloture / termine
+    message_id INTEGER,
+    channel_id INTEGER,
+    organisateur_id INTEGER,
+    owner_cheat_decision TEXT,    -- NULL / 'oui' / 'non', rempli après la question discrète en MP
+    reroll_count INTEGER DEFAULT 0,  -- nombre de reroll déjà enchaînés depuis le giveaway d'origine
+    origin_giveaway_id INTEGER       -- id du giveaway d'origine (NULL pour un giveaway initial)
+);
+
+CREATE TABLE IF NOT EXISTS giveaway_participants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    giveaway_id INTEGER,
+    user_id INTEGER,
+    character_id INTEGER,
+    joined_at TEXT,
+    is_winner INTEGER DEFAULT 0,
+    claim_order INTEGER,
+    reward_claimed_json TEXT
+);
 """
 
 
@@ -837,6 +870,32 @@ def _ensure_character_inventory_columns(conn):
         conn.execute("ALTER TABLE character_inventory ADD COLUMN gifted_quantity INTEGER DEFAULT 0")
     if cols and "rarete_source" not in cols:
         conn.execute("ALTER TABLE character_inventory ADD COLUMN rarete_source TEXT")
+
+
+def _ensure_giveaway_participants_columns(conn):
+    """§4 (Phase 3) : colonnes de tirage/distribution ajoutées à giveaway_participants (DB existante).
+    is_winner (1 si tiré gagnant), claim_order (ordre de distribution séquentielle Phase 4),
+    reward_claimed_json (récompense choisie, remplie en Phase 4). Idempotent."""
+    cols = _column_names(conn, "giveaway_participants")
+    if not cols:
+        return
+    if "is_winner" not in cols:
+        conn.execute("ALTER TABLE giveaway_participants ADD COLUMN is_winner INTEGER DEFAULT 0")
+    if "claim_order" not in cols:
+        conn.execute("ALTER TABLE giveaway_participants ADD COLUMN claim_order INTEGER")
+    if "reward_claimed_json" not in cols:
+        conn.execute("ALTER TABLE giveaway_participants ADD COLUMN reward_claimed_json TEXT")
+
+
+def _ensure_giveaways_columns(conn):
+    """§3 (Phase 5) : colonnes de suivi des reroll ajoutées à giveaways (DB existante). Idempotent."""
+    cols = _column_names(conn, "giveaways")
+    if not cols:
+        return
+    if "reroll_count" not in cols:
+        conn.execute("ALTER TABLE giveaways ADD COLUMN reroll_count INTEGER DEFAULT 0")
+    if "origin_giveaway_id" not in cols:
+        conn.execute("ALTER TABLE giveaways ADD COLUMN origin_giveaway_id INTEGER")
 
 
 # Coffres (/daily) : 1 objet par rareté, catégorie « Coffre », prix NULL (jamais achetable — obtenu
@@ -1576,6 +1635,8 @@ def init_db():
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_uid ON tickets(ticket_uid)")
         _migrate_item_categorie_id(conn)
         _ensure_character_inventory_columns(conn)
+        _ensure_giveaway_participants_columns(conn)
+        _ensure_giveaways_columns(conn)
         _seed_default_shop_categories(conn)
         _seed_coffre_items(conn)
         _seed_canonical_potions(conn)
@@ -3760,6 +3821,132 @@ def raid_permadeath_set_reminder(character_id: int, now_iso: str):
         conn.execute(
             "UPDATE raid_permadeath_pending SET last_reminder_at = ? WHERE character_id = ?",
             (now_iso, character_id))
+
+
+# =====================================================================
+# /giveaway (Phase 2)
+# =====================================================================
+def giveaway_create(guild_id, titre, nb_gagnants, exclusion_roles_json, exclusion_users_json,
+                    role_requis_json, duree_heures, rewards_json, started_at, ends_at,
+                    organisateur_id, reroll_count=0, origin_giveaway_id=None) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO giveaways (guild_id, titre, nb_gagnants, exclusion_roles_json, "
+            "exclusion_users_json, role_requis_json, duree_heures, rewards_json, started_at, ends_at, "
+            "status, organisateur_id, reroll_count, origin_giveaway_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'actif', ?, ?, ?)",
+            (guild_id, titre, nb_gagnants, exclusion_roles_json, exclusion_users_json, role_requis_json,
+             duree_heures, rewards_json, started_at, ends_at, organisateur_id, reroll_count,
+             origin_giveaway_id))
+        return cur.lastrowid
+
+
+def giveaway_get(giveaway_id: int):
+    with get_connection() as conn:
+        return conn.execute("SELECT * FROM giveaways WHERE id = ?", (giveaway_id,)).fetchone()
+
+
+def giveaway_get_active():
+    with get_connection() as conn:
+        return conn.execute("SELECT * FROM giveaways WHERE status = 'actif'").fetchall()
+
+
+def giveaway_set_message(giveaway_id: int, message_id: int, channel_id: int):
+    with get_connection() as conn:
+        conn.execute("UPDATE giveaways SET message_id = ?, channel_id = ? WHERE id = ?",
+                     (message_id, channel_id, giveaway_id))
+
+
+def giveaway_set_status(giveaway_id: int, status: str):
+    with get_connection() as conn:
+        conn.execute("UPDATE giveaways SET status = ? WHERE id = ?", (status, giveaway_id))
+
+
+def giveaway_set_owner_decision(giveaway_id: int, decision: str):
+    with get_connection() as conn:
+        conn.execute("UPDATE giveaways SET owner_cheat_decision = ? WHERE id = ?",
+                     (decision, giveaway_id))
+
+
+def giveaway_count_in_guild(guild_id: int) -> int:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM giveaways WHERE guild_id = ?", (guild_id,)).fetchone()["n"]
+
+
+def giveaway_ordinal(guild_id: int, giveaway_id: int) -> int:
+    """Rang de ce giveaway dans l'historique du serveur (le Nème), stable dans le temps."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM giveaways WHERE guild_id = ? AND id <= ?",
+            (guild_id, giveaway_id)).fetchone()["n"]
+
+
+def giveaway_add_participant(giveaway_id: int, user_id: int, character_id: int, joined_at: str):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO giveaway_participants (giveaway_id, user_id, character_id, joined_at) "
+            "VALUES (?, ?, ?, ?)", (giveaway_id, user_id, character_id, joined_at))
+
+
+def giveaway_participant_exists(giveaway_id: int, user_id: int) -> bool:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT 1 FROM giveaway_participants WHERE giveaway_id = ? AND user_id = ? LIMIT 1",
+            (giveaway_id, user_id)).fetchone() is not None
+
+
+def giveaway_get_participants(giveaway_id: int):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT user_id, character_id FROM giveaway_participants WHERE giveaway_id = ?",
+            (giveaway_id,)).fetchall()
+
+
+def giveaway_get_participants_full(giveaway_id: int):
+    """Toutes les colonnes des participants (id, user_id, character_id, is_winner, claim_order, …).
+    Utilisé par le tirage (Phase 3) et la distribution (Phase 4)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM giveaway_participants WHERE giveaway_id = ?", (giveaway_id,)).fetchall()
+
+
+def giveaway_set_winners(participant_ids):
+    """Marque is_winner = 1 pour les participations gagnantes (liste d'ids). Idempotent."""
+    ids = list(participant_ids)
+    if not ids:
+        return
+    placeholders = ",".join("?" for _ in ids)
+    with get_connection() as conn:
+        conn.execute(
+            f"UPDATE giveaway_participants SET is_winner = 1 WHERE id IN ({placeholders})", ids)
+
+
+def giveaway_set_claim_orders(pairs):
+    """Assigne l'ordre de distribution : pairs = liste de (participant_id, claim_order)."""
+    pairs = list(pairs)
+    if not pairs:
+        return
+    with get_connection() as conn:
+        conn.executemany(
+            "UPDATE giveaway_participants SET claim_order = ? WHERE id = ?",
+            [(order, pid) for pid, order in pairs])
+
+
+def giveaway_get_winners(giveaway_id: int):
+    """Participations gagnantes, triées par ordre de distribution (claim_order)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM giveaway_participants WHERE giveaway_id = ? AND is_winner = 1 "
+            "ORDER BY claim_order", (giveaway_id,)).fetchall()
+
+
+def giveaway_set_reward_claimed(participant_id: int, reward_json: str):
+    """Enregistre la récompense choisie par un gagnant (Phase 4, distribution séquentielle)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE giveaway_participants SET reward_claimed_json = ? WHERE id = ?",
+            (reward_json, participant_id))
 
 
 def raid_salon_seize(channel_id: int):
