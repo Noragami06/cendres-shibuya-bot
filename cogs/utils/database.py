@@ -725,7 +725,15 @@ CREATE TABLE IF NOT EXISTS giveaway_participants (
     joined_at TEXT,
     is_winner INTEGER DEFAULT 0,
     claim_order INTEGER,
-    reward_claimed_json TEXT
+    reward_claimed_json TEXT,
+    reward_applied INTEGER DEFAULT 0   -- 1 une fois la récompense réellement attribuée (anti double-don)
+);
+
+-- Joueurs retirés d'un giveaway par le staff : ne peuvent plus jamais s'y réinscrire.
+CREATE TABLE IF NOT EXISTS giveaway_removed (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    giveaway_id INTEGER,
+    user_id INTEGER
 );
 """
 
@@ -885,6 +893,8 @@ def _ensure_giveaway_participants_columns(conn):
         conn.execute("ALTER TABLE giveaway_participants ADD COLUMN claim_order INTEGER")
     if "reward_claimed_json" not in cols:
         conn.execute("ALTER TABLE giveaway_participants ADD COLUMN reward_claimed_json TEXT")
+    if "reward_applied" not in cols:
+        conn.execute("ALTER TABLE giveaway_participants ADD COLUMN reward_applied INTEGER DEFAULT 0")
 
 
 def _ensure_giveaways_columns(conn):
@@ -2813,36 +2823,97 @@ def insert_secondary_sort(sort_id: int, slot_index: int, name: str, classe: str,
         )
 
 
-async def grant_character_xp(character_id: int, xp_gained: int) -> int:
-    """Accorde de l'XP au NIVEAU GLOBAL du personnage. Chaque montée de niveau octroie +250 points de
-    stats à répartir ET +500 PV (max ET actuel, du même montant : pas de soin complet, juste le nouveau
-    palier de vie ajouté tel quel). Retourne le nombre de montées de niveau.
-    # Aucune source d'XP n'existe encore dans le bot (combat, quêtes...). Cette fonction est prête à
-    # être appelée dès qu'un système de gain d'XP sera construit."""
+# Récompenses par niveau du NIVEAU GÉNÉRAL du personnage (inchangées : décision de garder +250 points).
+CHARACTER_POINTS_PER_LEVEL = 250   # points de stats à répartir, gagnés/retirés par niveau
+CHARACTER_PV_PER_LEVEL = 500       # PV max gagnés/retirés par niveau (et PV actuel au gain)
+
+
+def _adjust_points_with_debt(conn, character_id: int, delta: int):
+    """Ajuste points_restants de `delta` (signé) EN RÉUTILISANT la mécanique de dette existante (retrait
+    de rôle) : un gain éponge d'abord une dette, un retrait qui dépasse les points libres crée une dette
+    (points_debt) reprise sur les prochains gains. Même connexion => atomique avec la cascade."""
+    conn.execute("INSERT OR IGNORE INTO character_stats (character_id) VALUES (?)", (character_id,))
+    if delta > 0:
+        row = conn.execute(
+            "SELECT points_debt FROM character_stats WHERE character_id = ?", (character_id,)).fetchone()
+        debt = (row["points_debt"] if row and row["points_debt"] else 0)
+        offset = min(debt, delta)                 # la dette éponge d'abord le gain
+        conn.execute(
+            "UPDATE character_stats SET points_restants = points_restants + ?, points_debt = ? "
+            "WHERE character_id = ?", (delta - offset, debt - offset, character_id))
+    elif delta < 0:
+        reclaim = -delta
+        row = conn.execute(
+            "SELECT points_restants FROM character_stats WHERE character_id = ?", (character_id,)).fetchone()
+        current = (row["points_restants"] if row and row["points_restants"] else 0)
+        if current >= reclaim:
+            conn.execute(
+                "UPDATE character_stats SET points_restants = points_restants - ? WHERE character_id = ?",
+                (reclaim, character_id))
+        else:
+            conn.execute(
+                "UPDATE character_stats SET points_restants = 0, points_debt = points_debt + ? "
+                "WHERE character_id = ?", (reclaim - current, character_id))
+
+
+def apply_xp_cascade(character_id: int, delta: int, max_level: int = None) -> dict:
+    """Applique un gain OU un retrait d'XP (delta signé) au NIVEAU GÉNÉRAL, en cascade montante ET
+    descendante. Par niveau gagné : +CHARACTER_POINTS_PER_LEVEL points à répartir et +CHARACTER_PV_PER_LEVEL
+    PV (max ET actuel). Par niveau perdu : l'inverse (points via la mécanique de dette ; pv_actuel ramené
+    au nouveau pv_max). N'applique JAMAIS de multiplicateur VIP/Booster (les appelants le font avant, et
+    /xp ne double jamais). Retourne un récap avant/après. `max_level` : plafond global optionnel."""
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT level, xp_actuel FROM character_profiles WHERE character_id = ?", (character_id,)
-        ).fetchone()
+            "SELECT level, xp_actuel, pv_max, pv_actuel FROM character_profiles WHERE character_id = ?",
+            (character_id,)).fetchone()
         if row is None:
-            return 0
-        new_level, new_xp, level_ups = apply_xp_gain(row["level"], row["xp_actuel"], xp_gained)
-        if level_ups > 0:
-            conn.execute("INSERT OR IGNORE INTO character_stats (character_id) VALUES (?)", (character_id,))
-            conn.execute(
-                "UPDATE character_stats SET points_restants = points_restants + ? WHERE character_id = ?",
-                (250 * level_ups, character_id),
-            )
-            # +500 PV par niveau, sur le max ET l'actuel (le nouveau palier s'ajoute à la vie courante).
-            conn.execute(
-                "UPDATE character_profiles SET pv_max = pv_max + ?, pv_actuel = pv_actuel + ? "
-                "WHERE character_id = ?",
-                (500 * level_ups, 500 * level_ups, character_id),
-            )
+            return {"found": False}
+        level_before, xp_before = row["level"], row["xp_actuel"]
+        level = level_before
+        xp = xp_before + delta
+        gained = lost = 0
+        # Montée : tant que l'XP du niveau atteint le requis (hors plafond éventuel).
+        while xp >= xp_required_for_level(level):
+            if max_level is not None and level >= max_level:
+                break  # plafond atteint : l'XP restante est conservée, pas de montée supplémentaire
+            xp -= xp_required_for_level(level)
+            level += 1
+            gained += 1
+        # Descente : XP négative -> on redescend d'un niveau en réabsorbant son coût.
+        while xp < 0 and level > 1:
+            level -= 1
+            xp += xp_required_for_level(level)
+            lost += 1
+        if level == 1 and xp < 0:
+            xp = 0  # jamais sous le niveau 1
+        net = gained - lost
+        points_delta = CHARACTER_POINTS_PER_LEVEL * net
+        pv_delta = CHARACTER_PV_PER_LEVEL * net
+        if points_delta != 0:
+            _adjust_points_with_debt(conn, character_id, points_delta)
+        new_pv_max = max(1, row["pv_max"] + pv_delta)
+        if pv_delta >= 0:
+            new_pv_actuel = row["pv_actuel"] + pv_delta            # le nouveau palier s'ajoute à la vie
+        else:
+            new_pv_actuel = min(row["pv_actuel"], new_pv_max)      # pv_max plus bas -> on ramène l'actuel
         conn.execute(
-            "UPDATE character_profiles SET level = ?, xp_actuel = ?, xp_max = ? WHERE character_id = ?",
-            (new_level, new_xp, xp_required_for_level(new_level), character_id),
-        )
-    return level_ups
+            "UPDATE character_profiles SET level = ?, xp_actuel = ?, xp_max = ?, pv_max = ?, pv_actuel = ? "
+            "WHERE character_id = ?",
+            (level, xp, xp_required_for_level(level), new_pv_max, new_pv_actuel, character_id))
+        return {
+            "found": True, "level_before": level_before, "xp_before": xp_before,
+            "xp_max_before": xp_required_for_level(level_before), "level_after": level,
+            "xp_after": xp, "xp_max_after": xp_required_for_level(level),
+            "levels_gained": gained, "levels_lost": lost,
+            "points_delta": points_delta, "pv_delta": pv_delta}
+
+
+async def grant_character_xp(character_id: int, xp_gained: int) -> int:
+    """Accorde de l'XP au NIVEAU GLOBAL du personnage (signature conservée : tous les appelants de
+    gameplay restent inchangés). Délègue à apply_xp_cascade (gère la cascade, les récompenses, et la
+    descente si delta négatif). Retourne le nombre de niveaux gagnés."""
+    res = apply_xp_cascade(character_id, xp_gained)
+    return res.get("levels_gained", 0) if res.get("found") else 0
 
 
 async def grant_sort_xp(sort_id: int, xp_gained: int) -> int:
@@ -3947,6 +4018,69 @@ def giveaway_set_reward_claimed(participant_id: int, reward_json: str):
         conn.execute(
             "UPDATE giveaway_participants SET reward_claimed_json = ? WHERE id = ?",
             (reward_json, participant_id))
+
+
+def giveaway_try_mark_applied(participant_id: int) -> bool:
+    """Marque reward_applied = 1 de façon ATOMIQUE, uniquement si ce n'était pas déjà le cas.
+    Retourne True si c'est CE réclamant qui a gagné la course (donc qui doit appliquer la récompense),
+    False si elle était déjà appliquée (double clic / filet de sécurité) : empêche tout double-don."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE giveaway_participants SET reward_applied = 1 "
+            "WHERE id = ? AND reward_applied = 0", (participant_id,))
+        return cur.rowcount == 1
+
+
+def giveaway_set_reward_applied(participant_id: int, value: int):
+    """Force reward_applied (0/1). Sert à relâcher le verrou en cas d'échec d'attribution."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE giveaway_participants SET reward_applied = ? WHERE id = ?",
+            (int(value), participant_id))
+
+
+def giveaway_get_participant(participant_id: int):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM giveaway_participants WHERE id = ?", (participant_id,)).fetchone()
+
+
+def giveaway_remove_participants(giveaway_id: int, user_ids):
+    """Retire définitivement des joueurs d'un giveaway : supprime leurs participations ET les inscrit
+    dans giveaway_removed (réinscription impossible). Idempotent."""
+    uids = list(dict.fromkeys(user_ids))
+    if not uids:
+        return
+    with get_connection() as conn:
+        for uid in uids:
+            conn.execute(
+                "DELETE FROM giveaway_participants WHERE giveaway_id = ? AND user_id = ?",
+                (giveaway_id, uid))
+            # Évite les doublons dans giveaway_removed.
+            exists = conn.execute(
+                "SELECT 1 FROM giveaway_removed WHERE giveaway_id = ? AND user_id = ? LIMIT 1",
+                (giveaway_id, uid)).fetchone()
+            if exists is None:
+                conn.execute(
+                    "INSERT INTO giveaway_removed (giveaway_id, user_id) VALUES (?, ?)",
+                    (giveaway_id, uid))
+
+
+def giveaway_is_removed(giveaway_id: int, user_id: int) -> bool:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT 1 FROM giveaway_removed WHERE giveaway_id = ? AND user_id = ? LIMIT 1",
+            (giveaway_id, user_id)).fetchone() is not None
+
+
+def giveaway_character_brief(character_id: int):
+    """(character_name, slot_number) d'un personnage, pour la liste des participants. None si absent."""
+    if character_id is None:
+        return None
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT character_name, slot_number FROM validated_characters WHERE id = ?",
+            (character_id,)).fetchone()
 
 
 def raid_salon_seize(channel_id: int):

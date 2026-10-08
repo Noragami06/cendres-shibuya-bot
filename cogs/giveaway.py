@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import commands
 
 from cogs.utils import database as db
 from cogs.utils.image_gen import generate_giveaway_image
@@ -35,6 +35,13 @@ GIVEAWAY_IMG_DIR = os.path.join(os.path.dirname(__file__), "..", "temp", "giveaw
 def _giveaway_tmp_path() -> str:
     os.makedirs(GIVEAWAY_IMG_DIR, exist_ok=True)
     return os.path.join(GIVEAWAY_IMG_DIR, f"giveaway_{uuid.uuid4().hex}.png")
+
+
+def _giveaway_file_path(giveaway_id: int) -> str:
+    """Fichier temporaire DÉDIÉ à un giveaway (temp/giveaway_{id}.png) : évite les collisions entre
+    rafraîchissements simultanés de plusieurs giveaways."""
+    os.makedirs(GIVEAWAY_IMG_DIR, exist_ok=True)
+    return os.path.join(GIVEAWAY_IMG_DIR, f"giveaway_{giveaway_id}.png")
 
 
 def _now_utc() -> datetime:
@@ -204,11 +211,23 @@ class _LaunchView(discord.ui.View):
 
 
 def _participate_view(giveaway_id: int) -> discord.ui.View:
-    """Vue persistante du message public : bouton « 🎉 Participer » (custom_id porteur de l'id)."""
+    """Vue persistante du message public : « 🎉 Participer » + « 👥 Voir les participants » (staff)."""
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(
         label="Participer", emoji="🎉", style=discord.ButtonStyle.success,
         custom_id=f"giveaway_join:{giveaway_id}"))
+    view.add_item(discord.ui.Button(
+        label="Voir les participants", emoji="👥", style=discord.ButtonStyle.secondary,
+        custom_id=f"giveaway_view:{giveaway_id}"))
+    return view
+
+
+def _remove_members_view(giveaway_id: int) -> discord.ui.View:
+    """Vue MP (staff) sous la liste des participants : bouton « 🗑️ Retirer des membres »."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(
+        label="Retirer des membres", emoji="🗑️", style=discord.ButtonStyle.danger,
+        custom_id=f"giveaway_remove:{giveaway_id}"))
     return view
 
 
@@ -234,13 +253,17 @@ def _reroll_view(giveaway_id: int) -> discord.ui.View:
 
 
 class _RewardSelectView(discord.ui.View):
-    """Menu déroulant de choix de récompense envoyé en MP à un gagnant (Phase 4). La résolution passe
-    par un Future attendu avec asyncio.wait_for (plafond de 30 min côté appelant). timeout=None : c'est
-    l'appelant qui borne l'attente, le callback arrête la vue dès qu'un choix est fait."""
+    """Menu déroulant de choix de récompense en MP (Phase 4). Dès le clic, la ligne choisie est
+    enregistrée PUIS appliquée immédiatement (le gagnant reçoit à l'instant), et le MP confirme ce qu'il
+    a reçu. Le Future débloque l'appelant qui enchaîne le gagnant suivant. timeout=None : l'appelant
+    borne l'attente à 30 min."""
 
-    def __init__(self, options, owner_id):
+    def __init__(self, cog, participant, remaining, options):
         super().__init__(timeout=None)
-        self.owner_id = owner_id
+        self.cog = cog
+        self.participant = participant
+        self.owner_id = participant["user_id"]
+        self.remaining = remaining            # {numero: reward}
         self.future = asyncio.get_running_loop().create_future()
         self.select = discord.ui.Select(
             placeholder="Choisis ta récompense (30 minutes pour répondre)",
@@ -252,12 +275,21 @@ class _RewardSelectView(discord.ui.View):
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message("Ce choix ne t'appartient pas.", ephemeral=True)
             return
-        valeur = self.select.values[0]
+        num = int(self.select.values[0])
+        reward = dict(self.remaining.get(num) or {})
+        # 1) Enregistre le choix (quantité ENTIÈRE conservée : « Coffre ×2 » = 2 coffres).
+        db.giveaway_set_reward_claimed(self.participant["id"], json.dumps(reward))
+        # 2) Applique IMMÉDIATEMENT (anti double-don géré par reward_applied).
+        montant = await self.cog._apply_giveaway_reward(self.participant, reward)
+        nom = reward.get("nom_resolu", "?")
+        if montant is not None:
+            texte = f"✅ Tu as reçu : **{nom} × {montant}** !"
+        else:
+            texte = f"✅ Choix enregistré : **{nom}** (attribution en cours)."
         if not self.future.done():
-            self.future.set_result(valeur)
+            self.future.set_result(num)
         try:
-            await interaction.response.edit_message(
-                content="✅ Choix enregistré.", view=None)
+            await interaction.response.edit_message(content=texte, view=None)
         except discord.HTTPException:
             pass
         self.stop()
@@ -279,6 +311,8 @@ class Giveaway(commands.Cog):
         # Tâches de distribution (Phase 4) en cours : on garde une référence forte pour qu'elles ne
         # soient pas ramassées par le GC tant qu'elles tournent.
         self._distribution_tasks = set()
+        # Tâche de la boucle de rafraîchissement du pillow (Point 3).
+        self._update_task = None
 
     @app_commands.command(name="giveaway", description="Lance un giveaway (staff uniquement)")
     async def giveaway(self, interaction: discord.Interaction):
@@ -481,11 +515,13 @@ class Giveaway(commands.Cog):
     # PHASE 2 — cycle de vie (boucle 5 min) + dispatch des boutons
     # =================================================================
     async def cog_load(self):
-        if not self.giveaway_update_loop.is_running():
-            self.giveaway_update_loop.start()
+        if self._update_task is None or self._update_task.done():
+            self._update_task = asyncio.create_task(self.giveaway_update_loop())
 
     async def cog_unload(self):
-        self.giveaway_update_loop.cancel()
+        if self._update_task is not None:
+            self._update_task.cancel()
+            self._update_task = None
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
@@ -500,6 +536,10 @@ class Giveaway(commands.Cog):
             await self._handle_owner(interaction, cid)
         elif cid.startswith("giveaway_reroll:"):
             await self._handle_reroll(interaction, cid)
+        elif cid.startswith("giveaway_view:"):
+            await self._handle_view_participants(interaction, cid)
+        elif cid.startswith("giveaway_remove:"):
+            await self._handle_remove_members(interaction, cid)
 
     # ---------- rendu pillow ----------
     @staticmethod
@@ -507,12 +547,15 @@ class Giveaway(commands.Cog):
         """Convertit les récompenses stockées -> liste de tuples (nom, quantité) pour la pillow."""
         return [(r.get("nom_resolu", "?"), f"x{r.get('quantite', '')}") for r in rewards_list]
 
-    def _render_giveaway(self, titre, rewards_list, participants_normaux, participants_boost,
-                         nb_gagnants, organisateur, temps_restant_str, pct, historique_num) -> str:
-        path = _giveaway_tmp_path()
-        generate_giveaway_image(
-            titre, self._pillow_rewards(rewards_list), participants_normaux, participants_boost,
-            nb_gagnants, organisateur, temps_restant_str, pct, historique_num, path)
+    async def _render_giveaway(self, titre, rewards_list, participants_normaux, participants_boost,
+                               nb_gagnants, organisateur, temps_restant_str, pct, historique_num,
+                               out_path=None) -> str:
+        path = out_path or _giveaway_tmp_path()
+        # Génération dans un thread : la pillow ne bloque jamais la boucle d'événements du bot.
+        await asyncio.to_thread(
+            generate_giveaway_image, titre, self._pillow_rewards(rewards_list),
+            participants_normaux, participants_boost, nb_gagnants, organisateur,
+            temps_restant_str, pct, historique_num, path)
         return path
 
     def _count_participants(self, giveaway_id, guild):
@@ -538,31 +581,19 @@ class Giveaway(commands.Cog):
     # PHASE 4 — distribution séquentielle (1 gagnant à la fois, 30 min, 2 tours)
     # =================================================================
     def _rewards_remaining(self, g):
-        """Récompenses ENCORE disponibles, recalculées EN TEMPS RÉEL à partir des choix déjà faits.
-        Retourne un dict ordonné {numero: (reward_dict, quantite_restante)}. Une ligne reste présente
-        tant qu'il en reste ≥ 1 ; chaque choix d'un gagnant en consomme 1 unité."""
+        """Récompenses ENCORE disponibles, recalculées EN TEMPS RÉEL. Modèle 1 ligne = 1 prix : chaque
+        ligne (objet OU valeur) est réclamable UNE seule fois, avec sa quantité ENTIÈRE (« Coffre ×2 »
+        donne 2 coffres), puis disparaît du menu des gagnants suivants. Retourne {numero: reward}."""
         rewards = json.loads(g["rewards_json"] or "[]")
-        pris = {}
+        pris = set()
         for p in db.giveaway_get_participants_full(g["id"]):
             if not p["reward_claimed_json"]:
                 continue
             try:
-                rc = json.loads(p["reward_claimed_json"])
+                pris.add(json.loads(p["reward_claimed_json"]).get("numero"))
             except (ValueError, TypeError):
                 continue
-            num = rc.get("numero")
-            pris[num] = pris.get(num, 0) + 1
-        remaining = {}
-        for r in rewards:
-            num = r.get("numero")
-            # Objet : lot de N exemplaires, réclamable par N gagnants (1 chacun). Récompense « valeur »
-            # (xp/argent/stats/maîtrise) : un seul prix dont la quantité est le montant attribué à UN
-            # gagnant -> réclamable une seule fois (dupliquer la ligne pour plusieurs gagnants).
-            lot = (r.get("quantite", 0) or 0) if r.get("kind") == "item" else 1
-            reste = lot - pris.get(num, 0)
-            if reste >= 1:
-                remaining[num] = (r, reste)
-        return remaining
+        return {r.get("numero"): r for r in rewards if r.get("numero") not in pris}
 
     async def _start_reward_distribution(self, giveaway_id, tour=1):
         """Lance (ou relance au tour 2) la distribution séquentielle. S'arrête dès qu'il n'y a plus
@@ -605,46 +636,38 @@ class Giveaway(commands.Cog):
             # Plus rien à distribuer : inutile de solliciter qui que ce soit.
             await self._finalize_giveaway_rewards(giveaway_id)
             return
-        chosen_num = await self._prompt_claimant(g, gagnant, remaining)
-        if chosen_num is not None:
-            reward = dict(remaining[chosen_num][0])
-            # Objet : 1 seul exemplaire attribué même si le lot en comptait plusieurs (le ×2 VIP/Booster
-            # agira à l'application). Récompense « valeur » : on conserve le montant/points/niveaux plein.
-            if reward.get("kind") == "item":
-                reward["quantite"] = 1
-            db.giveaway_set_reward_claimed(gagnant["id"], json.dumps(reward))
+        # L'enregistrement ET l'attribution se font dans le callback du menu (réception immédiate).
+        await self._prompt_claimant(g, gagnant, remaining)
         await self._process_next_claimant(giveaway_id, tour, index + 1)
 
     async def _prompt_claimant(self, g, gagnant, remaining):
-        """Envoie le MP + menu déroulant au gagnant et attend son choix (max 30 min). Retourne le
-        numéro de la récompense choisie, ou None (MP impossible / délai dépassé)."""
+        """Envoie le MP + menu déroulant au gagnant et attend son choix (max 30 min). Le choix est
+        enregistré ET appliqué dans le callback du menu. Retourne le numéro choisi, ou None (MP
+        impossible / délai dépassé)."""
         try:
             user = self.bot.get_user(gagnant["user_id"]) or await self.bot.fetch_user(gagnant["user_id"])
         except discord.HTTPException:
             user = None
         if user is None:
             return None
-        options = []
-        for num, (r, reste) in remaining.items():
-            if r.get("kind") == "item":
-                desc = f"Exemplaire(s) restant(s) : {reste}"
-            else:
-                desc = f"Quantité : {r.get('quantite', '')}"
-            options.append(discord.SelectOption(
-                label=(r.get("nom_resolu") or "?")[:100], value=str(num), description=desc[:100]))
+        options = [
+            discord.SelectOption(
+                label=(r.get("nom_resolu") or "?")[:100], value=str(num),
+                description=f"Quantité : {r.get('quantite', '')}"[:100])
+            for num, r in remaining.items()]
         embed = discord.Embed(
             title="🎉 Félicitations ! Tu as gagné ce giveaway !",
             description=(f"**{g['titre']}**\n\nChoisis ta récompense dans le menu ci-dessous.\n"
                          "⏱️ Tu as **30 minutes** pour répondre."),
             color=discord.Color.gold())
-        view = _RewardSelectView(options, gagnant["user_id"])
+        view = _RewardSelectView(self, gagnant, remaining, options)
         try:
             dm = await user.create_dm()
             msg = await dm.send(embed=embed, view=view)
         except discord.HTTPException:
             return None
         try:
-            valeur = await asyncio.wait_for(view.future, timeout=1800)  # 30 minutes
+            num = await asyncio.wait_for(view.future, timeout=1800)  # 30 minutes
         except asyncio.TimeoutError:
             view.stop()
             try:
@@ -653,13 +676,6 @@ class Giveaway(commands.Cog):
             except discord.HTTPException:
                 pass
             return None
-        num = int(valeur)
-        reward = remaining.get(num)
-        nom = reward[0].get("nom_resolu") if reward else "?"
-        try:
-            await dm.send(f"✅ Tu as choisi : **{nom}** !")
-        except discord.HTTPException:
-            pass
         return num
 
     # =================================================================
@@ -713,23 +729,24 @@ class Giveaway(commands.Cog):
                                  _points_for_level(target) - _points_for_level(level))
 
     async def _apply_one_reward(self, guild, character_id, user_id, reward):
-        """Applique UNE récompense choisie dans le bon emplacement, après le ×2 VIP/Booster universel."""
+        """Applique UNE récompense dans le bon emplacement, après le ×2 VIP/Booster universel. Retourne
+        le montant réellement attribué (après multiplicateur), ou 0 si rien n'a pu l'être."""
         if character_id is None:
-            return
+            return 0
         from cogs.utils.rewards import apply_vip_booster_multiplier
         member = guild.get_member(user_id) if guild else None
         montant = apply_vip_booster_multiplier(member, reward.get("quantite", 0) or 0)
         if montant <= 0:
-            return
+            return 0
         if reward.get("kind") == "item":
             item_id = reward.get("item_id")
             if item_id is not None:
                 from cogs.shop import inv_give  # reçu gratuitement (gifted_quantity)
                 inv_give(character_id, item_id, montant)
-            return
+            return montant
         key = reward.get("key")
         if key == "xp":
-            await db.grant_character_xp(character_id, montant)
+            await db.grant_character_xp(character_id, montant)  # XP : inchangé, comme demandé
         elif key == "points":
             db.add_points_restants(character_id, montant)
         elif key == "argent":
@@ -741,6 +758,25 @@ class Giveaway(commands.Cog):
             db.add_stat_base_pts(character_id, stat_key, montant)
         elif key in ("mastery_arme", "mastery_rct", "mastery_territoire", "mastery_sort", "mastery_eo"):
             await self._apply_mastery_levels(guild, character_id, key, montant)
+        return montant
+
+    async def _apply_giveaway_reward(self, participant, reward):
+        """Applique la récompense d'UN gagnant, une seule fois (verrou atomique reward_applied).
+        Retourne le montant attribué (après ×2), ou None si déjà appliqué / échec. En cas d'échec, le
+        verrou est relâché pour que le filet de sécurité (_finalize) puisse réessayer."""
+        if not reward:
+            return None
+        # Verrou atomique : seul le premier à le prendre applique (anti double-clic / double-don).
+        if not db.giveaway_try_mark_applied(participant["id"]):
+            return None
+        g = db.giveaway_get(participant["giveaway_id"])
+        guild = self.bot.get_guild(g["guild_id"]) if g and g["guild_id"] else None
+        try:
+            return await self._apply_one_reward(
+                guild, participant["character_id"], participant["user_id"], reward)
+        except Exception:
+            db.giveaway_set_reward_applied(participant["id"], 0)  # échec -> réessai possible plus tard
+            return None
 
     async def _finalize_giveaway_rewards(self, giveaway_id):
         """Applique réellement toutes les récompenses choisies, puis envoie le récap + la décision de
@@ -748,19 +784,17 @@ class Giveaway(commands.Cog):
         g = db.giveaway_get(giveaway_id)
         if g is None or g["status"] == "termine":
             return
-        guild = self.bot.get_guild(g["guild_id"]) if g["guild_id"] else None
+        # Filet de sécurité : les récompenses sont normalement attribuées dès le choix (callback du menu).
+        # Ici on ne traite QUE les lignes choisies mais pas encore appliquées (reward_applied = 0), et
+        # jamais celles déjà données. _apply_giveaway_reward gère son propre verrou et ses erreurs.
         for p in db.giveaway_get_winners(giveaway_id):
-            if not p["reward_claimed_json"]:
+            if not p["reward_claimed_json"] or p["reward_applied"]:
                 continue
             try:
                 reward = json.loads(p["reward_claimed_json"])
             except (ValueError, TypeError):
                 continue
-            try:
-                await self._apply_one_reward(guild, p["character_id"], p["user_id"], reward)
-            except Exception:
-                # Une récompense qui échoue ne doit pas bloquer l'attribution des autres.
-                continue
+            await self._apply_giveaway_reward(p, reward)
         db.giveaway_set_status(giveaway_id, "termine")
         await self._reward_recap_and_reroll(g)
 
@@ -818,9 +852,10 @@ class Giveaway(commands.Cog):
                 organisateur = m.display_name
         historique_num = db.giveaway_ordinal(g["guild_id"], giveaway_id)
         rewards_list = json.loads(g["rewards_json"] or "[]")
-        path = self._render_giveaway(
+        path = await self._render_giveaway(
             g["titre"], rewards_list, 0, 0, g["nb_gagnants"], organisateur,
-            _fmt_hms((g["duree_heures"] or 0) * 3600), 1.0, historique_num)
+            _fmt_hms((g["duree_heures"] or 0) * 3600), 1.0, historique_num,
+            out_path=_giveaway_file_path(giveaway_id))
         try:
             msg = await channel.send(
                 file=discord.File(path, filename="giveaway.png"), view=_participate_view(giveaway_id))
@@ -980,9 +1015,9 @@ class Giveaway(commands.Cog):
             if m:
                 organisateur = m.display_name
         historique_num = db.giveaway_ordinal(g["guild_id"], g["id"])
-        path = self._render_giveaway(
+        path = await self._render_giveaway(
             g["titre"], rewards_list, normaux, boost, g["nb_gagnants"], organisateur,
-            "00:00:00", 0.0, historique_num)
+            "00:00:00", 0.0, historique_num, out_path=_giveaway_file_path(g["id"]))
         try:
             msg = await channel.fetch_message(g["message_id"])
             # view=None : le bouton Participer disparaît une fois le giveaway clôturé.
@@ -1022,23 +1057,23 @@ class Giveaway(commands.Cog):
             pass
 
     # ---------- boucle de rafraîchissement ----------
-    @tasks.loop(minutes=5)
     async def giveaway_update_loop(self):
-        for g in db.giveaway_get_active():
-            try:
-                now = _now_utc()
-                ends = _parse_iso(g["ends_at"])
-                if now >= ends:
-                    await self._close_giveaway(g["id"])
-                    continue
-                await self._refresh_message(g, now, ends)
-            except Exception:
-                # Une erreur sur un giveaway ne doit jamais interrompre la boucle globale.
-                continue
-
-    @giveaway_update_loop.before_loop
-    async def _before_giveaway_loop(self):
+        """Boucle de rafraîchissement : cadence aléatoire 5/10/15/20 s (retirée à chaque tour). Clôture
+        les giveaways expirés, sinon régénère et édite leur pillow. Une erreur par giveaway n'arrête
+        jamais la boucle."""
         await self.bot.wait_until_ready()
+        while not self.bot.is_closed():
+            for g in db.giveaway_get_active():
+                try:
+                    now = _now_utc()
+                    ends = _parse_iso(g["ends_at"])
+                    if now >= ends:
+                        await self._close_giveaway(g["id"])
+                    else:
+                        await self._refresh_message(g, now, ends)
+                except Exception:
+                    continue
+            await asyncio.sleep(random.choice([5, 10, 15, 20]))  # nouveau tirage à chaque tour
 
     async def _refresh_message(self, g, now, ends):
         """Régénère la pillow et ÉDITE le message existant (jamais de nouveau message)."""
@@ -1059,9 +1094,9 @@ class Giveaway(commands.Cog):
             if m:
                 organisateur = m.display_name
         historique_num = db.giveaway_ordinal(g["guild_id"], g["id"])
-        path = self._render_giveaway(
+        path = await self._render_giveaway(
             g["titre"], rewards_list, normaux, boost, g["nb_gagnants"], organisateur,
-            _fmt_hms(remaining), pct, historique_num)
+            _fmt_hms(remaining), pct, historique_num, out_path=_giveaway_file_path(g["id"]))
         try:
             msg = await channel.fetch_message(g["message_id"])
             await msg.edit(attachments=[discord.File(path, filename="giveaway.png")],
@@ -1160,6 +1195,11 @@ class Giveaway(commands.Cog):
         excl_users = set(json.loads(g["exclusion_users_json"] or "[]"))
         excl_roles = set(json.loads(g["exclusion_roles_json"] or "[]"))
         req_roles = set(json.loads(g["role_requis_json"] or "[]"))
+        # Joueur retiré par le staff : blocage absolu, jamais de réinscription.
+        if db.giveaway_is_removed(g_id, user.id):
+            await interaction.followup.send(
+                "❌ Tu ne peux pas participer à ce giveaway.", ephemeral=True)
+            return
         if user.id in excl_users:
             await interaction.followup.send(
                 "❌ Tu ne peux pas participer à ce giveaway.", ephemeral=True)
@@ -1179,6 +1219,137 @@ class Giveaway(commands.Cog):
         # 4) Enregistrement + 5) confirmation.
         db.giveaway_add_participant(g_id, user.id, character_id, _now_utc().isoformat())
         await interaction.followup.send("✅ Tu participes au giveaway !", ephemeral=True)
+
+    # ---------- staff : voir / retirer des participants ----------
+    def _staff_member(self, interaction, g):
+        """Résout le Member staff que le clic vienne du salon public (déjà un Member) ou d'un MP
+        (on le retrouve via la guilde du giveaway)."""
+        user = interaction.user
+        if isinstance(user, discord.Member):
+            return user
+        guild = self.bot.get_guild(g["guild_id"]) if g and g["guild_id"] else None
+        return guild.get_member(user.id) if guild else None
+
+    def _build_participant_embeds(self, g, guild):
+        """Embeds listant tous les participants (numéro, mention, personnage, slot, tag Booster/VIP).
+        Paginé par blocs de 20 lignes."""
+        parts = db.giveaway_get_participants_full(g["id"])
+        titre = f"👥 Participants — {g['titre']} ({len(parts)})"
+        lignes = []
+        for i, p in enumerate(parts, 1):
+            brief = db.giveaway_character_brief(p["character_id"])
+            perso = (brief["character_name"] if brief and brief["character_name"] else "?")
+            slot = brief["slot_number"] if brief else "?"
+            member = guild.get_member(p["user_id"]) if guild else None
+            rids = {r.id for r in getattr(member, "roles", [])}
+            tag = " — ⭐ Booster/VIP" if (BOOSTER_ROLE_ID in rids or VIP_ROLE_ID in rids) else ""
+            lignes.append(f"`{i:>2}` <@{p['user_id']}> — *{perso}* (slot {slot}){tag}")
+        if not lignes:
+            return [discord.Embed(title=titre, description="Aucun participant pour l'instant.",
+                                  color=discord.Color.blurple())]
+        embeds = []
+        for k in range(0, len(lignes), 20):
+            suffixe = f" [{k // 20 + 1}]" if len(lignes) > 20 else ""
+            embeds.append(discord.Embed(title=titre + suffixe, description="\n".join(lignes[k:k + 20]),
+                                        color=discord.Color.blurple()))
+        return embeds
+
+    async def _send_participant_list(self, dm, g, guild):
+        """Envoie la liste (paginée) en MP ; le bouton « Retirer » est sous le dernier message."""
+        embeds = self._build_participant_embeds(g, guild)
+        for idx in range(0, len(embeds), 10):  # Discord : max 10 embeds par message
+            group = embeds[idx:idx + 10]
+            is_last = idx + 10 >= len(embeds)
+            await dm.send(embeds=group, view=_remove_members_view(g["id"]) if is_last else None)
+
+    async def _handle_view_participants(self, interaction: discord.Interaction, cid):
+        g_id = int(cid.split(":")[1])
+        g = db.giveaway_get(g_id)
+        if g is None or g["status"] != "actif":
+            await interaction.response.send_message("❌ Ce giveaway n'est plus actif.", ephemeral=True)
+            return
+        member = self._staff_member(interaction, g)
+        if member is None or not _is_staff(member):
+            await interaction.response.send_message("Réservé au staff.", ephemeral=True)
+            return
+        guild = self.bot.get_guild(g["guild_id"]) if g["guild_id"] else getattr(interaction, "guild", None)
+        try:
+            dm = await interaction.user.create_dm()
+            await self._send_participant_list(dm, g, guild)
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                "❌ Je n'ai pas pu t'écrire en MP. Ouvre tes messages privés.", ephemeral=True)
+            return
+        await interaction.response.send_message("📩 Liste des participants envoyée en MP.", ephemeral=True)
+
+    async def _handle_remove_members(self, interaction: discord.Interaction, cid):
+        g_id = int(cid.split(":")[1])
+        g = db.giveaway_get(g_id)
+        if g is None or g["status"] != "actif":
+            await interaction.response.send_message("❌ Ce giveaway n'est plus actif.", ephemeral=True)
+            return
+        member = self._staff_member(interaction, g)
+        if member is None or not _is_staff(member):
+            await interaction.response.send_message("Réservé au staff.", ephemeral=True)
+            return
+        await interaction.response.defer()  # clic en MP : on enchaîne le flux par messages
+        guild = self.bot.get_guild(g["guild_id"]) if g["guild_id"] else None
+        dm = interaction.channel or await interaction.user.create_dm()
+        task = asyncio.create_task(self._remove_flow(interaction.user, dm, guild, g_id))
+        self._distribution_tasks.add(task)
+        task.add_done_callback(self._distribution_tasks.discard)
+
+    async def _remove_flow(self, user, dm, guild, g_id):
+        """Flux Q/R (nettoyage, « annuler », sans timeout, reprise sur erreur) pour retirer des membres."""
+        def v_count(t, m):
+            n_part = len(db.giveaway_get_participants_full(g_id))
+            if n_part == 0:
+                return False, None, "Il n'y a aucun participant à retirer."
+            if t.isdigit() and 1 <= int(t) <= n_part:
+                return True, int(t), ""
+            return False, None, f"Donne un entier entre 1 et {n_part} (participants actuels)."
+
+        try:
+            n = await self._ask(dm, user, "Combien de membres veux-tu retirer ?", v_count)
+
+            def v_members(t, m):
+                _, users = parse_mentions(t, guild)
+                uniq = list(dict.fromkeys(users))
+                if len(uniq) != n:
+                    return False, None, f"Donne exactement {n} joueur(s) (mentions ou IDs) en un message."
+                current = {p["user_id"] for p in db.giveaway_get_participants_full(g_id)}
+                if any(u not in current for u in uniq):
+                    return False, None, "Tous doivent être des participants actuels du giveaway."
+                return True, uniq, ""
+
+            targets = await self._ask(
+                dm, user,
+                f"Mentionne ou donne l'ID de ces {n} joueur(s) (un seul message).", v_members)
+        except _GiveawayCancel:
+            try:
+                await dm.send("❌ Retrait annulé.")
+            except discord.HTTPException:
+                pass
+            return
+
+        db.giveaway_remove_participants(g_id, targets)  # DELETE + inscription dans giveaway_removed
+        try:
+            await dm.send(f"✅ {len(targets)} membre(s) retiré(s). Ils ne pourront plus se réinscrire.")
+            g = db.giveaway_get(g_id)
+            await self._send_participant_list(dm, g, guild)  # liste à jour
+        except discord.HTTPException:
+            pass
+        await self._refresh_now(g_id)  # pillow mis à jour immédiatement
+
+    async def _refresh_now(self, g_id):
+        """Régénère et édite le pillow immédiatement (hors cadence de la boucle)."""
+        g = db.giveaway_get(g_id)
+        if g is None or g["status"] != "actif":
+            return
+        try:
+            await self._refresh_message(g, _now_utc(), _parse_iso(g["ends_at"]))
+        except Exception:
+            pass
 
     # ---------- mécanisme discret owner (Oui / Non) ----------
     async def _handle_owner(self, interaction: discord.Interaction, cid):

@@ -4281,8 +4281,19 @@ class Profil(commands.Cog):
             db.update_profile(character_id, **{param: v})
             return True, f"✅ {param} = {v}."
 
-        # --- Niveau GÉNÉRAL du profil (character_profiles) ---
-        if param in ("level", "xp_max", "xp_actuel"):
+        # --- XP du niveau GÉNÉRAL : la valeur saisie remplace l'XP du niveau courant PUIS cascade ---
+        # (plus aucun plafonnement à xp_max : le niveau monte/descend réellement).
+        if param == "xp_actuel":
+            v = _parse_int(raw, minimum=0)
+            if v is None:
+                return False, "❌ Valeur invalide (entier positif attendu)."
+            res = db.apply_xp_cascade(character_id, v - p["xp_actuel"])
+            if not res.get("found"):
+                return False, "❌ Profil introuvable."
+            return True, f"✅ Niveau {res['level_after']} — {res['xp_after']}/{res['xp_max_after']} XP."
+
+        # --- Niveau / xp_max fixés directement par le staff (comportement inchangé) ---
+        if param in ("level", "xp_max"):
             v = _parse_int(raw, minimum=(1 if param == "level" else 0))
             if v is None:
                 return False, "❌ Valeur invalide (entier positif attendu)."
