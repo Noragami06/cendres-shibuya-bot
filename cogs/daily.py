@@ -449,7 +449,9 @@ async def roll_coffre_reward(character_id, guild, rarete) -> dict:
     if t in COFFRE_STAT_DIRECT:
         stat_key, label = COFFRE_STAT_DIRECT[t]
         montant = random.randint(entry["min"], entry["max"]) * mult
-        db.add_stat_base_pts(character_id, stat_key, montant)
+        got = db.add_stat_base_pts(character_id, stat_key, montant)  # 0 si verrouillée
+        if got == 0 and montant > 0:
+            return {"texte": f"{label} verrouillée : gain ignoré", "n": 1}
         return {"texte": f"{montant:,} points directement en {label}".replace(",", " "), "n": 1}
 
     if t == "potion":
@@ -1602,8 +1604,10 @@ class Daily(commands.Cog):
         for key, count in gains.items():
             if count > 0:
                 gain = apply_vip_booster_multiplier(user, count * pts)
-                db.add_stat_base_pts(character_id, key, gain)
-                applied[key] = gain
+                # add_stat_base_pts renvoie 0 si la stat est verrouillée : gain ignoré, non affiché.
+                got = db.add_stat_base_pts(character_id, key, gain)
+                if got > 0:
+                    applied[key] = got
         # §2 : bonus UNIQUE de points à répartir librement (même barème que les points par action, mais
         # appliqué une seule fois — pas par action). Corrige l'absence de gain de points libres.
         bonus_libre = apply_vip_booster_multiplier(user, pts)

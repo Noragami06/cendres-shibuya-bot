@@ -990,6 +990,13 @@ class Inventaire(commands.Cog):
 
             from cogs.utils.rewards import apply_vip_booster_multiplier  # VIP/Booster -> ×2
             stat_key, mode = _TOKEN_STATS_TYPES[ttype]
+            # Verrou staff : refus AVANT toute consommation -> le Token reste dans l'inventaire.
+            if db.stat_is_locked(character_id, stat_key):
+                from cogs.profil import STAT_DISPLAY_NAMES
+                await channel.send(
+                    f"🔒 Ta stat {STAT_DISPLAY_NAMES.get(stat_key, stat_key)} est verrouillée par le "
+                    "staff. Le Token n'a pas été consommé.")
+                return
             if mode == "points":
                 points = apply_vip_booster_multiplier(interaction.user, db.TOKEN_STATS_POINTS_DIRECTS[classe])
                 db.add_stat_base_pts(character_id, stat_key, points)

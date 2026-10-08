@@ -3091,6 +3091,10 @@ def delete_character_cascade(character_id):
         )
         # Histoire du personnage (/histoire : lien Google Doc vérifié).
         conn.execute("DELETE FROM character_history WHERE character_id = ?", (character_id,))
+        # /récompense-add : trace du don de départ (le personnage recréé pourra de nouveau y prétendre).
+        conn.execute("DELETE FROM reward_start_grants WHERE character_id = ?", (character_id,))
+        # Verrous de stat (ex: Endurance figée par le staff) propres au personnage.
+        conn.execute("DELETE FROM character_stat_locks WHERE character_id = ?", (character_id,))
         # Réservations d'apparence (/réserv-appa) : découplées de character_id, on nettoie par le triplet
         # (user_id, guild_id, slot_number) résolu ci-dessus. Ainsi le joueur devra refaire valider une
         # apparence s'il recrée un personnage sur ce slot.

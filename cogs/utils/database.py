@@ -735,6 +735,25 @@ CREATE TABLE IF NOT EXISTS giveaway_removed (
     giveaway_id INTEGER,
     user_id INTEGER
 );
+
+-- /récompense-add : qui a reçu (ou non) sa récompense de départ, pour ne jamais la redonner.
+CREATE TABLE IF NOT EXISTS reward_start_grants (
+    character_id INTEGER PRIMARY KEY,
+    granted_at TEXT,
+    granted_by INTEGER,
+    reward_label TEXT,
+    status TEXT   -- 'donnee' / 'ignoree_reroll' / 'sans_recompense' / 'deja_applique' (argent)
+);
+
+-- Verrou de stat par personnage : la stat visée ne peut plus jamais être modifiée (ni gain ni retrait).
+CREATE TABLE IF NOT EXISTS character_stat_locks (
+    character_id INTEGER,
+    stat TEXT,              -- ex: 'endurance'
+    locked_value INTEGER,
+    locked_at TEXT,
+    locked_by INTEGER,
+    PRIMARY KEY (character_id, stat)
+);
 """
 
 
@@ -3074,14 +3093,51 @@ def get_stat_base_pts(character_id: int, stat_key: str) -> int:
     return row["v"] if row else 0
 
 
-def set_stat_base_pts(character_id: int, stat_key: str, value: int):
-    """Écriture ABSOLUE de la base d'une stat (remplacement, pas additif)."""
+# =====================================================================
+# VERROUS DE STAT (une stat figée par le staff : ni gain ni retrait possible)
+# =====================================================================
+def get_stat_lock(character_id: int, stat: str):
+    """Ligne de verrou (locked_value, locked_at, locked_by) pour (character_id, stat), ou None."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT character_id, stat, locked_value, locked_at, locked_by "
+            "FROM character_stat_locks WHERE character_id = ? AND stat = ?",
+            (character_id, stat)).fetchone()
+
+
+def stat_is_locked(character_id: int, stat_key: str) -> bool:
+    return get_stat_lock(character_id, stat_key) is not None
+
+
+def set_stat_lock(character_id: int, stat: str, locked_value: int, locked_at: str, locked_by: int):
+    """Pose (ou remplace) le verrou. N'écrit PAS la valeur de la stat elle-même (fais-le avant)."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO character_stat_locks "
+            "(character_id, stat, locked_value, locked_at, locked_by) VALUES (?, ?, ?, ?, ?)",
+            (character_id, stat, locked_value, locked_at, locked_by))
+
+
+def remove_stat_lock(character_id: int, stat: str):
+    """Déverrouillage : supprime la ligne de verrou (la stat redevient modifiable)."""
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM character_stat_locks WHERE character_id = ? AND stat = ?",
+            (character_id, stat))
+
+
+def set_stat_base_pts(character_id: int, stat_key: str, value: int) -> bool:
+    """Écriture ABSOLUE de la base d'une stat (remplacement, pas additif). Retourne False SANS rien
+    écrire si la stat est verrouillée (personne ne peut la changer, staff compris)."""
+    if stat_is_locked(character_id, stat_key):
+        return False
     col = _stat_col(stat_key)
     with get_connection() as conn:
         conn.execute("INSERT OR IGNORE INTO character_stats (character_id) VALUES (?)", (character_id,))
         conn.execute(
             f"UPDATE character_stats SET {col} = ? WHERE character_id = ?", (int(value), character_id)
         )
+    return True
 
 
 # =====================================================================
@@ -3115,14 +3171,19 @@ def add_relique_avalee(character_id: int, classe: str, avale_at: str):
             (character_id, classe, avale_at))
 
 
-def add_stat_base_pts(character_id: int, stat_key: str, n: int):
-    """Ajout ADDITIF direct à la base d'une stat (ex: gains de /daily), sans passer par points_restants."""
+def add_stat_base_pts(character_id: int, stat_key: str, n: int) -> int:
+    """Ajout ADDITIF direct à la base d'une stat (gains /daily, /train, giveaway, token, relique...).
+    Retourne le montant RÉELLEMENT appliqué : 0 si la stat est verrouillée (gain ignoré, aucune
+    conversion vers une autre stat). Permet aux appelants d'afficher « gain ignoré »."""
+    if stat_is_locked(character_id, stat_key):
+        return 0
     col = _stat_col(stat_key)
     with get_connection() as conn:
         conn.execute("INSERT OR IGNORE INTO character_stats (character_id) VALUES (?)", (character_id,))
         conn.execute(
             f"UPDATE character_stats SET {col} = {col} + ? WHERE character_id = ?", (int(n), character_id)
         )
+    return int(n)
 
 
 def get_daily_cooldown(character_id: int):
@@ -3145,7 +3206,10 @@ def set_daily_cooldown(character_id: int, iso_ts: str):
 
 def add_stat_points_from_pool(character_id: int, stat_key: str, n: int):
     """Répartition joueur : +n sur la stat et -n sur points_restants, ATOMIQUE. Retourne le nouveau
-    points_restants, ou None si le solde de points est insuffisant (aucune modification faite)."""
+    points_restants, None si le solde est insuffisant, ou la chaîne '__locked__' si la stat est
+    verrouillée (aucun point dépensé). L'appelant distingue les deux cas pour le bon message."""
+    if stat_is_locked(character_id, stat_key):
+        return "__locked__"
     col = _stat_col(stat_key)
     with get_connection() as conn:
         conn.execute("INSERT OR IGNORE INTO character_stats (character_id) VALUES (?)", (character_id,))
@@ -4081,6 +4145,50 @@ def giveaway_character_brief(character_id: int):
         return conn.execute(
             "SELECT character_name, slot_number FROM validated_characters WHERE id = ?",
             (character_id,)).fetchone()
+
+
+# =====================================================================
+# /récompense-add (récompense de départ)
+# =====================================================================
+def get_item_by_name(name: str):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT id, name FROM item_definitions WHERE name = ?", (name,)).fetchone()
+
+
+def get_item_by_category_classe(cat_name: str, classe: str):
+    """item_definition d'une catégorie (nom) et d'une classe données (ex: 'Relique','4'). 1:1 garanti
+    par le seed (une seule relique/arme par classe). None si introuvable."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT d.id, d.name FROM item_definitions d JOIN shop_categories s ON s.id = d.categorie_id "
+            "WHERE s.name = ? AND d.classe = ?", (cat_name, classe)).fetchone()
+
+
+def reward_start_granted_ids() -> set:
+    with get_connection() as conn:
+        return {r["character_id"]
+                for r in conn.execute("SELECT character_id FROM reward_start_grants").fetchall()}
+
+
+def reward_start_candidates():
+    """Personnages validés PAS encore traités par /récompense-add (absents de reward_start_grants)."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT v.id, v.user_id, v.guild_id, v.slot_number, v.character_name, "
+            "v.recompense_type, v.recompense_detail "
+            "FROM validated_characters v "
+            "LEFT JOIN reward_start_grants g ON g.character_id = v.id "
+            "WHERE g.character_id IS NULL ORDER BY v.user_id, v.slot_number").fetchall()
+
+
+def reward_start_insert(character_id, granted_at, granted_by, reward_label, status):
+    """Enregistre (ou remplace, idempotent sur la PK) le traitement d'un personnage."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO reward_start_grants "
+            "(character_id, granted_at, granted_by, reward_label, status) VALUES (?, ?, ?, ?, ?)",
+            (character_id, granted_at, granted_by, reward_label, status))
 
 
 def raid_salon_seize(channel_id: int):

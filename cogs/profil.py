@@ -3200,6 +3200,11 @@ class Profil(commands.Cog):
             if stat is None:
                 await channel.send("⏳ Répartition annulée.")
                 return
+            # Verrou staff : la stat ne peut plus être modifiée. Les points libres ne sont pas dépensés.
+            if db.stat_is_locked(character_id, stat):
+                await channel.send(
+                    f"🔒 Ta stat {STAT_DISPLAY_NAMES[stat]} est verrouillée par le staff.")
+                return
             new_rest = None
             while new_rest is None:
                 await channel.send("Combien de points veux tu y mettre ?")
@@ -4309,6 +4314,9 @@ class Profil(commands.Cog):
             if v is None:
                 return False, "❌ Valeur invalide (entier positif ou nul attendu)."
             key = STATS_PARAM_MAP[param]
+            # Verrou staff : personne ne peut la changer, staff compris.
+            if db.stat_is_locked(character_id, key):
+                return False, f"🔒 Ta stat {STAT_DISPLAY_NAMES[key]} est verrouillée par le staff."
             db.set_stat_base_pts(character_id, key, v)
             return True, f"✅ {STAT_DISPLAY_NAMES[key]} (base) = {v} pts."
         if param == "points_stats":
@@ -4325,6 +4333,9 @@ class Profil(commands.Cog):
                 v = _parse_int(raw, minimum=0)
                 if v is None:
                     return False, "❌ Valeur invalide (entier positif attendu)."
+                # Verrou staff : Défense = Endurance ; si verrouillée, aucune modification possible.
+                if db.stat_is_locked(character_id, stat_key):
+                    return False, f"🔒 Ta stat {STAT_DISPLAY_NAMES[stat_key]} est verrouillée par le staff."
                 field = "pct" if param.endswith("_pct") else param[len(legacy) + 1:]
                 buffs = db.sum_buff_points(character_id, stat_key)
                 total_now = db.get_stat_base_pts(character_id, stat_key) + buffs

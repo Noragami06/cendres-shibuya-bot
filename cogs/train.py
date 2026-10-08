@@ -222,11 +222,17 @@ class TrainGameView(discord.ui.View):
         reward = TRAIN_REWARDS[self.classe]
         points = apply_vip_booster_multiplier(interaction.user, reward["points"])
         xp = apply_vip_booster_multiplier(interaction.user, reward["xp"])
-        db.add_stat_base_pts(self.character_id, TRAIN_STAT_DB_COL[self.stat_key], points)
-        await db.grant_character_xp(self.character_id, xp)
+        stat_col = TRAIN_STAT_DB_COL[self.stat_key]
         stat_name = TRAIN_STAT_LABELS[self.stat_key]
+        # Verrou staff : la part de points destinée à cette stat est ignorée (l'XP est gagnée normalement).
+        applied_pts = db.add_stat_base_pts(self.character_id, stat_col, points)
+        await db.grant_character_xp(self.character_id, xp)
+        if applied_pts == 0 and points > 0:
+            ligne_pts = f"🔒 {stat_name} verrouillée : gain ignoré"
+        else:
+            ligne_pts = f"**+{points}** points de {stat_name}"
         desc = (f"Code trouvé en **{len(self.rows)}/{self._attempts_max()}** tentatives !\n"
-                f"**+{points}** points de {stat_name}\n"
+                f"{ligne_pts}\n"
                 f"**+{xp}** XP")
         # §1 : bonus de coffre pour une victoire rapide (1re ou 2e tentative).
         if len(self.rows) <= TRAIN_FAST_WIN_MAX_ROWS:
