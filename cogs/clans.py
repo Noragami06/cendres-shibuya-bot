@@ -77,10 +77,10 @@ def build_clans_report(guild) -> str:
 
         clan_data[member_clan][member_grade].append(member.display_name)
 
-    # SOURCE UNIQUE d'occupation (validated_characters, tous slots + cap courant), partagée avec l'embed
-    # d'étape de /depart : l'en-tête « occupés / cap » ne dépend PLUS des rôles Discord (qui ignorent les
-    # slots 2/3 virtuels) ni d'un cap codé en dur — plus aucun écart avec le message du bot.
-    occupancy = db.get_clan_occupancy(guild.id)
+    # SOURCE UNIQUE des disponibilités (depart.compute_places), partagée avec l'embed d'étape de
+    # /depart : l'en-tête « occupés / cap » ne dépend PLUS des rôles Discord ni d'un cap codé en dur.
+    from cogs.depart import compute_places  # import paresseux (évite tout cycle au chargement)
+    occupancy = {k: (v["occ"], v["cap"]) for k, v in compute_places(guild.id)["clans"].items()}
 
     lines = []
     for index, clan_name in enumerate(CLAN_ROLES):

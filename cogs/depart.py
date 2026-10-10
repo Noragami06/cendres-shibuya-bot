@@ -589,9 +589,10 @@ def build_clan_table_embed(guild: discord.Guild) -> discord.Embed:
     """Embed de l'étape 2 : tableau des clans avec pourcentages, occupation et sort héréditaire partiel."""
     data = load_clan_state()
     clans = data["clans"]
-    # SOURCE UNIQUE d'occupation (validated_characters, tous slots + cap courant), partagée avec le
-    # rapport terminal des clans (cogs/clans.py) -> plus aucun écart entre les deux affichages.
-    occupancy = db.get_clan_occupancy(guild.id if guild else None)
+    # SOURCE UNIQUE des disponibilités (compute_places), partagée avec le rapport terminal des clans
+    # (cogs/clans.py) -> jamais d'écart entre les deux affichages.
+    occupancy = {k: (v["occ"], v["cap"])
+                 for k, v in compute_places(guild.id if guild else None)["clans"].items()}
 
     embed = discord.Embed(
         title="🎲 Étape 2 — Tirage du clan et du sort",
@@ -1038,6 +1039,67 @@ def has_clan_from_progress(progress: dict) -> bool:
 # =====================================================================
 # BARÈME : points de stats liés aux rôles (camp / clan / grade)
 # =====================================================================
+def build_fiche_embed_for_char(guild, char, valide_par_display):
+    """Reconstruit l'embed de fiche à jour (dict compatible build_fiche_embed) : base = progression
+    existante (prénom/âge/histoire), surchargée par les valeurs AUTORITAIRES de la fiche validée.
+    Réutilisable hors interaction (synchronisation automatique) : prend guild + un libellé « validé par »."""
+    progress = get_progress(char["user_id"]) or {}
+    merged = dict(progress)
+    merged.update({
+        "guild_id": char["guild_id"], "slot_number": char["slot_number"],
+        "camp": char["camp"], "clan": char["clan"], "sort": char["sort"],
+        "eo_classe": char["eo_classe"], "eo_value": char["eo_value"], "nature": char["nature"],
+        "hybride_type": char["hybride_type"], "grade_choisi": char["grade"],
+        "sera_heritier": 1 if char["grade"] == "Héritier" else 0,
+        "rct": char["rct"], "recompense": char["recompense_detail"],
+        "portrait_path": char["portrait_path"],
+    })
+    for col in ("prenom", "nom", "age", "histoire"):
+        if char[col] is not None:
+            merged[col] = char[col]
+    member = guild.get_member(char["user_id"]) if guild else None
+    return build_fiche_embed(merged, guild, member, char["user_id"],
+                             statut_display="✅ Validée (corrigée)",
+                             valide_par_display=valide_par_display)
+
+
+async def refresh_fiche_message(client, guild, character_id, valide_par_display):
+    """Met l'embed de fiche à jour SANS jamais bloquer. Réutilisable hors interaction. Statuts :
+    'edited' / 'reposted' / 'no_channel' / 'error'."""
+    char = db.get_validated_character_by_id(character_id)
+    if char is None:
+        return "no_channel"
+    channel = client.get_channel(FICHE_VALIDATED_CHANNEL_ID)
+    if channel is None:
+        return "no_channel"
+    embed = build_fiche_embed_for_char(guild, char, valide_par_display)
+    msg_id = char["fiche_message_id"]
+    if msg_id:
+        try:
+            fiche_msg = await channel.fetch_message(msg_id)
+            await fiche_msg.edit(embed=embed)
+            return "edited"
+        except discord.NotFound:
+            pass
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+    member = guild.get_member(char["user_id"]) if guild else None
+    member_mention = member.mention if member else f"<@{char['user_id']}>"
+    content = f"Voici la fiche de {member_mention}"
+    portrait_path = char["portrait_path"]
+    try:
+        if portrait_path and os.path.exists(portrait_path):
+            file = discord.File(portrait_path, filename="portrait.png")
+            embed.set_image(url="attachment://portrait.png")
+            new_msg = await channel.send(content=content, embed=embed, file=file)
+        else:
+            new_msg = await channel.send(content=content, embed=embed)
+    except discord.HTTPException:
+        return "error"
+    db.set_fiche_message_id(character_id, new_msg.id)
+    return "reposted"
+
+
 def resolve_role_point_ids(camp, clan, grade):
     """Résout les role_id (camp, clan/sans-clan, grade) d'un personnage à partir de ses attributs de
     fiche (camp, clan, grade) — mêmes valeurs que celles attribuées en rôles réels/virtuels. Un clan
@@ -1116,6 +1178,308 @@ async def backfill_role_points(guild):
             continue  # traité lors de l'itération de son propre serveur
         await grant_initial_role_points(character_id, row["camp"], row["clan"], row["grade"])
         print(f"🔍 [barème] Points de rôle rattrapés pour le personnage {character_id}.")
+
+
+# =====================================================================
+# SYNCHRONISATION FICHES <- RÔLES (rôles = source de vérité)
+# =====================================================================
+FICHE_SYNC_MAX_CHANGES_PER_RUN = 25   # garde-fou : au-delà, on n'applique RIEN (réglable)
+FICHE_SYNC_OWNER_ID = SPECIAL_USER_ID  # destinataire du rapport MP (owner)
+
+# Rôles de stade RCT (n'importe lequel => RCT possédé). 'moyenne' == RCT_POSSEDE_ROLE_ID.
+RCT_STAGE_ROLE_IDS = {RCT_POSSEDE_ROLE_ID, 1522181335962091621, 1522181336834506894}
+_CAMP_ROLE_TO_KEY = {ROLE_EXORCISTE: "exorciste", ROLE_HYBRIDE: "hybride", ROLE_HUMAIN: "humain"}
+_GRADE_ROLE_TO_LABEL = {rid: name for name, rid in GRADE_ROLES}
+
+
+def _clan_role_to_key() -> dict:
+    """{role_id -> clan_key} des 7 clans + le rôle Sans clan. Lu depuis l'état des clans (source unique)."""
+    mapping = {SANS_CLAN_ROLE_ID: "sans_clan"}
+    for key, info in db.load_clan_state()["clans"].items():
+        if info.get("role_id"):
+            mapping[info["role_id"]] = key
+    return mapping
+
+
+def deduce_attrs_from_role_ids(role_ids) -> tuple:
+    """Déduit {camp, clan, grade, rct} d'un ENSEMBLE de role_ids (réels slot 1 / virtuels slot 2-3).
+    Ne met une clé QUE si un rôle la détermine positivement (jamais depuis une absence). Retourne
+    (attrs, conflits) ; les champs en conflit (2 clans, 2 grades, 2 camps…) ne sont PAS déduits."""
+    role_ids = set(role_ids)
+    attrs, conflits = {}, []
+
+    camps = [k for rid, k in _CAMP_ROLE_TO_KEY.items() if rid in role_ids]
+    if len(camps) > 1:
+        conflits.append(f"camps multiples ({', '.join(camps)})")
+    elif camps:
+        attrs["camp"] = camps[0]
+
+    clan_map = _clan_role_to_key()
+    clans = [clan_map[rid] for rid in role_ids if rid in clan_map]
+    reels = [c for c in clans if c != "sans_clan"]
+    if len(reels) > 1 or (reels and "sans_clan" in clans):
+        conflits.append(f"clans multiples ({', '.join(clans)})")
+    elif reels:
+        attrs["clan"] = reels[0]
+    elif "sans_clan" in clans:
+        attrs["clan"] = "sans_clan"
+
+    grades = [_GRADE_ROLE_TO_LABEL[rid] for rid in role_ids if rid in _GRADE_ROLE_TO_LABEL]
+    if len(grades) > 1:
+        conflits.append(f"grades multiples ({', '.join(grades)})")
+    elif grades:
+        attrs["grade"] = grades[0]
+
+    if role_ids & RCT_STAGE_ROLE_IDS:
+        attrs["rct"] = 1
+    elif RCT_NON_POSSEDE_ROLE_ID in role_ids:
+        attrs["rct"] = 0
+    # sinon : RCT inconnu -> non déduit (jamais forcé à 0 par absence)
+    return attrs, conflits
+
+
+async def _char_role_ids(guild, char):
+    """Ensemble des role_ids qui font foi pour ce personnage. Slot 1 : rôles réels (get_member, repli
+    fetch_member) — None si le membre est parti (à ignorer). Slots 2/3 : rôles virtuels (table)."""
+    if char["slot_number"] == 1:
+        member = guild.get_member(char["user_id"]) if guild else None
+        if member is None and guild is not None:
+            try:
+                member = await guild.fetch_member(char["user_id"])
+            except (discord.NotFound, discord.HTTPException):
+                member = None
+        if member is None:
+            return None  # membre introuvable (parti) : jamais corrigé
+        return {r.id for r in member.roles}
+    return set(db.get_virtual_roles(char["id"]))
+
+
+def _expected_heritier_sort(clan_key):
+    """Clé de sort héréditaire attendue pour un Héritier de ce clan (partiel/complet), ou None si le
+    clan n'a pas d'hérédité (sans_clan)."""
+    if not clan_key or clan_key == "sans_clan":
+        return None
+    info = db.load_clan_state()["clans"].get(clan_key)
+    if info is None:
+        return None
+    return "sort_heredit_partiel" if info.get("partial_heredit") else "sort_heredit"
+
+
+async def compute_fiche_corrections(guild):
+    """Calcule SANS RIEN ÉCRIRE toutes les corrections à partir des rôles. Retourne un dict :
+    examined (int), corrections [(char, champ, old, new)], conflicts [(char, texte)],
+    signals [(char, texte)], errors [(char, texte)]."""
+    with db.get_connection() as conn:
+        chars = conn.execute(
+            "SELECT id, user_id, guild_id, slot_number, character_name, camp, clan, grade, rct, sort "
+            "FROM validated_characters WHERE guild_id = ?", (guild.id,)).fetchall()
+    out = {"examined": 0, "corrections": [], "conflicts": [], "signals": [], "errors": []}
+    sort_heredit_keys = ("sort_heredit", "sort_heredit_partiel")
+    for char in chars:
+        try:
+            role_ids = await _char_role_ids(guild, char)
+        except Exception as e:  # lecture des rôles : jamais silencieuse
+            out["errors"].append((char, f"lecture des rôles impossible : {e!r}"))
+            continue
+        if role_ids is None:
+            continue  # membre parti (slot 1) : ignoré, jamais corrigé
+        out["examined"] += 1
+        attrs, confl = deduce_attrs_from_role_ids(role_ids)
+        for c in confl:
+            out["conflicts"].append((char, c))
+        # Champs simples : corriger uniquement si un rôle détermine une valeur DIFFÉRENTE.
+        for champ in ("camp", "clan", "grade", "rct"):
+            if champ in attrs and attrs[champ] != char[champ]:
+                out["corrections"].append((char, champ, char[champ], attrs[champ]))
+        # Règle Héritier <-> sort héréditaire (rôle = vérité).
+        eff_grade = attrs.get("grade", char["grade"])
+        eff_clan = attrs.get("clan", char["clan"])
+        if eff_grade == "Héritier":
+            expected = _expected_heritier_sort(eff_clan)
+            if expected is None:
+                out["signals"].append((char, "Héritier sans clan à hérédité : sort non modifié"))
+            elif db.count_character_sorts(char["id"]) > 0:
+                out["signals"].append((char, "techniques déjà créées : sort héréditaire non modifié"))
+            elif char["sort"] not in sort_heredit_keys:
+                out["corrections"].append((char, "sort", char["sort"], expected))
+        elif char["sort"] in sort_heredit_keys and eff_grade != "Héritier":
+            out["signals"].append(
+                (char, "sort héréditaire sans rôle Héritier (à vérifier manuellement)"))
+    return out
+
+
+_CHAMP_TO_POINT_CATEGORY = {"camp": "camp", "clan": "clan", "grade": "grade"}
+
+
+async def _apply_fiche_correction(bot, guild, char, champ, old, new):
+    """Applique UNE correction : UPDATE du champ + resynchro des points (camp/clan/grade) + journal.
+    Lève en cas d'échec (capté par l'appelant pour marquer le personnage en erreur)."""
+    db.update_validated_fields(char["id"], **{champ: new})
+    if champ in _CHAMP_TO_POINT_CATEGORY:
+        # Resynchronise le barème sur le NOUVEAU rôle (dette si points déjà dépensés) via la fonction
+        # existante. resolve_role_point_ids attend (camp, clan, grade) ; on ne passe que le champ changé.
+        kwargs = {"camp": None, "clan": None, "grade": None, champ: new}
+        camp_rid, clan_rid, grade_rid = resolve_role_point_ids(kwargs["camp"], kwargs["clan"], kwargs["grade"])
+        role_id = {"camp": camp_rid, "clan": clan_rid, "grade": grade_rid}[champ]
+        if role_id is not None:
+            await sync_role_points(char["id"], _CHAMP_TO_POINT_CATEGORY[champ], role_id, bot=bot)
+    db.fiche_sync_log_add(char["id"], champ, old, new, datetime.utcnow().isoformat())
+
+
+async def sync_fiches_from_roles(bot):
+    """Synchronise toutes les fiches validées sur leurs RÔLES (vérité), à chaque démarrage. Idempotente,
+    ne bloque jamais le bot (toute erreur est logguée). Garde-fou de volume + rapport terminal + MP owner."""
+    import asyncio
+    guild = bot.guilds[0] if bot.guilds else None
+    if guild is None:
+        print("[fiche-sync] Aucune guilde en cache : synchronisation ignorée ce démarrage.")
+        return
+    # Attendre que le cache des membres soit prêt (évite de lire des rôles sur un cache vide).
+    try:
+        if not guild.chunked:
+            await guild.chunk()
+    except Exception as e:
+        print(f"[fiche-sync] Impossible de charger les membres ({e!r}) : on continue avec le cache courant.")
+
+    places_avant = compute_places(guild.id)
+    data = await compute_fiche_corrections(guild)
+    corrections = data["corrections"]
+    conflicts, signals, errors = data["conflicts"], data["signals"], data["errors"]
+
+    # Garde-fou de volume : au-delà du seuil, on n'applique RIEN.
+    if len(corrections) > FICHE_SYNC_MAX_CHANGES_PER_RUN:
+        entete = (f"⛔ synchronisation bloquée : {len(corrections)} corrections "
+                  f"(seuil {FICHE_SYNC_MAX_CHANGES_PER_RUN})")
+        print(entete)
+        for (char, champ, old, new) in corrections:
+            print(f"   - {char['character_name']} (slot {char['slot_number']}) : "
+                  f"{champ} {old!r} -> {new!r}")
+        await _fiche_sync_owner_report(
+            bot, entete, corrections, conflicts, signals, errors, blocked=True)
+        return
+
+    # Application : une correction à la fois, erreur isolée par personnage.
+    applied, failed = [], []
+    touched_ids = set()
+    for (char, champ, old, new) in corrections:
+        try:
+            await _apply_fiche_correction(bot, guild, char, champ, old, new)
+            applied.append((char, champ, old, new))
+            touched_ids.add(char["id"])
+        except Exception as e:
+            failed.append((char, f"{champ} {old!r}->{new!r} : {e!r}"))
+
+    # Rafraîchissement des embeds (une fois par personnage modifié), avec pause anti rate-limit.
+    id_to_char = {c["id"]: c for (c, *_rest) in corrections}
+    for cid in touched_ids:
+        try:
+            await refresh_fiche_message(bot, guild, cid, "Synchronisation automatique")
+        except Exception as e:
+            failed.append((id_to_char.get(cid, {"character_name": f"#{cid}", "slot_number": "?",
+                                                 "user_id": 0}),
+                           f"rafraîchissement embed : {e!r}"))
+        await asyncio.sleep(1.0)
+
+    places_apres = compute_places(guild.id)
+    _fiche_sync_print_report(data["examined"], applied, conflicts, signals, failed,
+                             places_avant, places_apres)
+    if applied or conflicts or signals or failed:
+        await _fiche_sync_owner_report(bot, "🧾 Synchronisation des fiches",
+                                       applied, conflicts, signals, failed, blocked=False)
+
+
+def _fiche_sync_print_report(examined, applied, conflicts, signals, failed, avant, apres):
+    """Compte rendu terminal. Si rien : une seule ligne."""
+    if not applied and not conflicts and not signals and not failed:
+        print("✅ fiches synchronisées avec les rôles")
+        return
+    print("=" * 50)
+    print(f"🔄 Synchronisation fiches<-rôles : {examined} personnage(s) examiné(s)")
+    par_champ = {}
+    for (_char, champ, _o, _n) in applied:
+        par_champ[champ] = par_champ.get(champ, 0) + 1
+    if applied:
+        print("   Corrections appliquées : " + ", ".join(f"{k}={v}" for k, v in par_champ.items()))
+        for (char, champ, old, new) in applied:
+            print(f"     • {char['character_name']} (slot {char['slot_number']}) : "
+                  f"{champ} {old!r} -> {new!r}")
+    if conflicts:
+        print(f"   ⚠️ Conflits (non corrigés) : {len(conflicts)}")
+        for (char, txt) in conflicts:
+            print(f"     • {char['character_name']} (slot {char['slot_number']}) : {txt}")
+    if signals:
+        print(f"   ℹ️ Signalements : {len(signals)}")
+        for (char, txt) in signals:
+            print(f"     • {char['character_name']} (slot {char['slot_number']}) : {txt}")
+    if failed:
+        print(f"   ❌ Erreurs : {len(failed)}")
+        for (char, txt) in failed:
+            print(f"     • {char['character_name']} (slot {char['slot_number']}) : {txt}")
+    # Places de clan avant/après.
+    print("   Places de clan (libre/cap) avant -> après :")
+    for clan_key, info in apres["clans"].items():
+        av = avant["clans"].get(clan_key, {})
+        print(f"     • {clan_key}: {av.get('libre', '?')}/{av.get('cap', '?')} "
+              f"-> {info['libre']}/{info['cap']}")
+    print("=" * 50)
+
+
+async def _fiche_sync_owner_report(bot, entete, applied, conflicts, signals, failed, blocked):
+    """MP à l'owner UNIQUEMENT si quelque chose a changé / est en conflit / a échoué (ou si bloqué)."""
+    if not blocked and not applied and not conflicts and not signals and not failed:
+        return
+    lignes = [entete, ""]
+    if blocked:
+        lignes.append("Aucune correction appliquée (seuil dépassé). Relève "
+                      "FICHE_SYNC_MAX_CHANGES_PER_RUN en connaissance de cause.")
+        lignes.append("")
+
+    def _desc(char):
+        get = char.get if isinstance(char, dict) else (lambda k, d=None: char[k])
+        return f"<@{get('user_id', 0)}> — {get('character_name', '?')} (slot {get('slot_number', '?')})"
+
+    if applied:
+        lignes.append(f"**Corrections ({len(applied)})** :")
+        for item in applied:
+            char, champ, old, new = item
+            lignes.append(f"• {_desc(char)} : {champ} {old!r} → {new!r}")
+    if conflicts:
+        lignes.append(f"\n**Conflits non corrigés ({len(conflicts)})** :")
+        for (char, txt) in conflicts:
+            lignes.append(f"• {_desc(char)} : {txt}")
+    if signals:
+        lignes.append(f"\n**Signalements ({len(signals)})** :")
+        for (char, txt) in signals:
+            lignes.append(f"• {_desc(char)} : {txt}")
+    if failed:
+        lignes.append(f"\n**Erreurs ({len(failed)})** :")
+        for (char, txt) in failed:
+            lignes.append(f"• {_desc(char)} : {txt}")
+
+    texte = "\n".join(lignes)
+    try:
+        owner = bot.get_user(FICHE_SYNC_OWNER_ID) or await bot.fetch_user(FICHE_SYNC_OWNER_ID)
+    except discord.HTTPException:
+        owner = None
+    if owner is None:
+        return
+    try:
+        dm = await owner.create_dm()
+        for i in range(0, len(texte), 1900):
+            await dm.send(texte[i:i + 1900])
+    except discord.HTTPException:
+        pass
+
+
+def compute_places(guild_id: int) -> dict:
+    """SOURCE UNIQUE des disponibilités (recalcul complet à chaque appel) : places de clan ET de grade,
+    à partir de l'état réel des fiches (validated_characters). Utilisée par /depart ET le terminal."""
+    occ = db.get_clan_occupancy(guild_id)  # {clan_key: (occupés, cap)}
+    clans = {k: {"occ": o, "cap": c, "libre": max(0, c - o)} for k, (o, c) in occ.items()}
+    grades = {}
+    for clan_key in occ:
+        grades[clan_key] = [name for name, _rid in compute_vacant_grades(guild_id, clan_key)]
+    return {"clans": clans, "grades": grades}
 
 
 def get_fiche_steps(progress: dict) -> list:
@@ -3095,6 +3459,8 @@ def delete_character_cascade(character_id):
         conn.execute("DELETE FROM reward_start_grants WHERE character_id = ?", (character_id,))
         # Verrous de stat (ex: Endurance figée par le staff) propres au personnage.
         conn.execute("DELETE FROM character_stat_locks WHERE character_id = ?", (character_id,))
+        # Journal de synchronisation fiches<-rôles propre au personnage.
+        conn.execute("DELETE FROM fiche_sync_log WHERE character_id = ?", (character_id,))
         # Réservations d'apparence (/réserv-appa) : découplées de character_id, on nettoie par le triplet
         # (user_id, guild_id, slot_number) résolu ci-dessus. Ainsi le joueur devra refaire valider une
         # apparence s'il recrée un personnage sur ce slot.
@@ -4529,79 +4895,11 @@ class Depart(commands.Cog):
             color=discord.Color.green()))
 
     def _reroll_build_fiche_embed(self, interaction, char):
-        """Reconstruit l'embed de fiche à jour (dict compatible build_fiche_embed) : base = progression
-        existante (prénom/âge/histoire), surchargée par les valeurs AUTORITAIRES de la fiche validée."""
-        progress = get_progress(char["user_id"]) or {}
-        merged = dict(progress)
-        merged.update({
-            "guild_id": char["guild_id"], "slot_number": char["slot_number"],
-            "camp": char["camp"], "clan": char["clan"], "sort": char["sort"],
-            "eo_classe": char["eo_classe"], "eo_value": char["eo_value"], "nature": char["nature"],
-            "hybride_type": char["hybride_type"], "grade_choisi": char["grade"],
-            "sera_heritier": 1 if char["grade"] == "Héritier" else 0,
-            "rct": char["rct"], "recompense": char["recompense_detail"],
-            "portrait_path": char["portrait_path"],
-        })
-        # Champs d'identité : on privilégie les valeurs persistées sur la fiche validée (éditables via
-        # /modification) quand elles existent ; sinon on retombe sur la progression (fiches anciennes).
-        for col in ("prenom", "nom", "age", "histoire"):
-            if char[col] is not None:
-                merged[col] = char[col]
-        guild = interaction.guild
-        member = guild.get_member(char["user_id"]) if guild else None
-        return build_fiche_embed(merged, guild, member, char["user_id"],
-                                 statut_display="✅ Validée (corrigée)",
-                                 valide_par_display=interaction.user.mention)
+        return build_fiche_embed_for_char(interaction.guild, char, interaction.user.mention)
 
     async def _reroll_refresh_fiche_message(self, interaction, character_id):
-        """Met l'embed de fiche à jour SANS jamais bloquer. Retourne un statut :
-        - 'edited'    : l'ancien message a été retrouvé et réédité ;
-        - 'reposted'  : fiche_message_id NULL ou message supprimé -> nouvel embed posté + id mémorisé ;
-        - 'no_channel': salon introuvable (rien posté) ;
-        - 'error'     : échec d'envoi/édition inattendu."""
-        char = db.get_validated_character_by_id(character_id)
-        if char is None:
-            return "no_channel"
-        channel = interaction.client.get_channel(FICHE_VALIDATED_CHANNEL_ID)
-        if channel is None:
-            return "no_channel"
-
-        embed = self._reroll_build_fiche_embed(interaction, char)
-
-        # 1) Message existant retrouvable -> édition normale.
-        msg_id = char["fiche_message_id"]
-        if msg_id:
-            try:
-                fiche_msg = await channel.fetch_message(msg_id)
-                await fiche_msg.edit(embed=embed)
-                return "edited"
-            except discord.NotFound:
-                pass  # supprimé entre-temps : on reposte ci-dessous
-            except (discord.Forbidden, discord.HTTPException):
-                # Édition impossible (permission, message trop ancien, panne API…) : on ne renonce PAS
-                # silencieusement — on tente un repost complet ci-dessous (comme pour NotFound). L'embed
-                # est ainsi corrigé automatiquement dans la quasi-totalité des cas ; le statut 'error'
-                # (et l'avertissement côté /modification) ne sert plus qu'aux échecs vraiment exceptionnels.
-                pass
-
-        # 2) NULL ou supprimé -> NOUVEAU message + mémorisation de son id (pour les futurs rerolls).
-        member = interaction.guild.get_member(char["user_id"]) if interaction.guild else None
-        member_mention = member.mention if member else f"<@{char['user_id']}>"
-        content = f"Voici la fiche de {member_mention}"
-        portrait_path = char["portrait_path"]
-        try:
-            if portrait_path and os.path.exists(portrait_path):
-                # set_image AVANT l'envoi, avec un attachment:// dont le nom correspond EXACTEMENT au
-                # filename de discord.File -> l'image est intégrée DANS l'embed (jamais détachée au-dessus).
-                file = discord.File(portrait_path, filename="portrait.png")
-                embed.set_image(url="attachment://portrait.png")
-                new_msg = await channel.send(content=content, embed=embed, file=file)
-            else:
-                new_msg = await channel.send(content=content, embed=embed)
-        except discord.HTTPException:
-            return "error"
-        db.set_fiche_message_id(character_id, new_msg.id)
-        return "reposted"
+        return await refresh_fiche_message(
+            interaction.client, interaction.guild, character_id, interaction.user.mention)
 
     @app_commands.command(name="reroll",
                           description="Corrige un ou plusieurs éléments de la fiche d'un personnage déjà validé")
@@ -5189,6 +5487,9 @@ class Depart(commands.Cog):
         name="sync-roles",
         description="Vérifie et corrige les rôles Discord de tous les personnages (Slot 1) par rapport à la base")
     async def sync_roles(self, interaction: discord.Interaction):
+        """Synchronise les FICHES sur les RÔLES (rôles = source de vérité). Même moteur que la synchro
+        automatique de démarrage, déclenché manuellement par le staff."""
+        import asyncio
         if not _is_fiche_staff(interaction.user):
             await interaction.response.send_message(
                 "❌ Seul le staff peut utiliser cette commande.", ephemeral=True)
@@ -5198,100 +5499,69 @@ class Depart(commands.Cog):
             await interaction.response.send_message(
                 "Cette commande s'utilise sur le serveur.", ephemeral=True)
             return
-
-        # Peut être long (fetch_member pour chaque joueur absent du cache) : on diffère tout de suite.
         await interaction.response.defer(thinking=True)
+        try:
+            if not guild.chunked:
+                await guild.chunk()
+        except Exception as e:
+            print(f"[sync-roles] chargement des membres impossible ({e!r}) : on continue.")
 
-        # Univers de TOUS les rôles gérés par le bot : sert à détecter les rôles à RETIRER, y compris
-        # ceux qui ne sont pas attendus pour ce personnage (ancien clan, ancien grade, mauvais camp…).
-        from cogs.clans import CLAN_ROLES  # import paresseux (aucun cycle : clans n'importe pas depart)
-        managed_role_ids = set(CAMP_ROLES)
-        managed_role_ids.update(CLAN_ROLES.values())
-        managed_role_ids.add(SANS_CLAN_ROLE_ID)
-        managed_role_ids.add(CLAN_MEMBER_ROLE_ID)
-        managed_role_ids.update(rid for _name, rid in GRADE_ROLES)
-        managed_role_ids.add(RCT_POSSEDE_ROLE_ID)
-        managed_role_ids.add(RCT_NON_POSSEDE_ROLE_ID)
+        data = await compute_fiche_corrections(guild)
+        corrections = data["corrections"]
+        conflicts, signals, errors = data["conflicts"], data["signals"], data["errors"]
 
-        with db.get_connection() as conn:
-            characters = conn.execute(
-                "SELECT id, user_id, character_name, camp, clan, grade, rct "
-                "FROM validated_characters WHERE guild_id = ? AND slot_number = 1",
-                (guild.id,),
-            ).fetchall()
+        if len(corrections) > FICHE_SYNC_MAX_CHANGES_PER_RUN:
+            await interaction.followup.send(
+                f"⛔ Synchronisation bloquée : {len(corrections)} corrections (seuil "
+                f"{FICHE_SYNC_MAX_CHANGES_PER_RUN}). Rien n'a été appliqué.")
+            await _fiche_sync_owner_report(
+                interaction.client, "⛔ /sync-roles bloquée (seuil dépassé)",
+                corrections, conflicts, signals, errors, blocked=True)
+            return
 
-        corrections = []  # personnages effectivement corrigés
-        erreurs = []      # corrections tentées mais échouées (permission, erreur Discord)
-
-        for char in characters:
-            # 1) Membre, avec repli fetch_member (jamais de bascule silencieuse).
-            member = guild.get_member(char["user_id"])
-            if member is None:
-                try:
-                    member = await guild.fetch_member(char["user_id"])
-                except (discord.NotFound, discord.HTTPException):
-                    member = None
-            # 2) Joueur parti du serveur (cas normal) : on ignore, ni correction ni erreur.
-            if member is None:
-                continue
-
-            # 3) Rôles ATTENDUS d'après la base (mêmes dictionnaires que la validation / le retour).
-            camp_rid, clan_rid, grade_rid = resolve_role_point_ids(char["camp"], char["clan"], char["grade"])
-            expected = set()
-            if camp_rid:
-                expected.add(camp_rid)
-            if clan_rid:  # rôle de clan réel OU rôle « Sans clan »
-                expected.add(clan_rid)
-            if char["clan"] and char["clan"] != "sans_clan":
-                expected.add(CLAN_MEMBER_ROLE_ID)  # marqueur « membre de clan »
-            if grade_rid:  # pas de grade pour un Humain / sans-clan
-                expected.add(grade_rid)
-            expected.add(RCT_POSSEDE_ROLE_ID if char["rct"] else RCT_NON_POSSEDE_ROLE_ID)
-
-            # 4) Comparaison aux rôles réellement présents, restreinte aux rôles gérés par le bot.
-            member_role_ids = {r.id for r in member.roles}
-            to_remove_ids = (member_role_ids & managed_role_ids) - expected
-            to_add_ids = expected - member_role_ids
-            to_remove = [r for r in (guild.get_role(rid) for rid in to_remove_ids) if r is not None]
-            to_add = [r for r in (guild.get_role(rid) for rid in to_add_ids) if r is not None]
-
-            # 5) Rien à faire : déjà correct.
-            if not to_remove and not to_add:
-                continue
-
-            # 6) Application, avec remontée explicite des échecs.
+        applied, failed, touched = [], [], set()
+        for (char, champ, old, new) in corrections:
             try:
-                if to_remove:
-                    await member.remove_roles(*to_remove, reason="Synchronisation /sync-roles")
-                if to_add:
-                    await member.add_roles(*to_add, reason="Synchronisation /sync-roles")
-                corrections.append(
-                    f"**{char['character_name']}** : "
-                    f"−[{', '.join(r.name for r in to_remove) or '—'}] "
-                    f"+[{', '.join(r.name for r in to_add) or '—'}]")
-            except discord.Forbidden:
-                erreurs.append(
-                    f"**{char['character_name']}** : permission refusée "
-                    "(le bot n'a pas « Gérer les rôles », ou son rôle est sous les rôles à modifier)")
-            except discord.HTTPException as e:
-                erreurs.append(f"**{char['character_name']}** : erreur Discord ({e})")
+                await _apply_fiche_correction(interaction.client, guild, char, champ, old, new)
+                applied.append((char, champ, old, new))
+                touched.add(char["id"])
+            except Exception as e:
+                failed.append((char, f"{champ} {old!r}->{new!r} : {e!r}"))
 
-        # --- Récapitulatif (découpé si nécessaire pour la limite de 4096 caractères par description) ---
-        corr_txt = "\n".join(f"• {c}" for c in corrections) if corrections else "Aucune — tout était déjà correct."
-        err_txt = "\n".join(f"• {e}" for e in erreurs) if erreurs else "Aucune."
-        full = (
-            f"**{len(corrections)} personnage(s) corrigé(s), {len(erreurs)} erreur(s).**\n\n"
-            f"**Corrections :**\n{corr_txt}\n\n"
-            f"**Erreurs :**\n{err_txt}")
+        id_to_char = {c["id"]: c for (c, *_r) in corrections}
+        for cid in touched:
+            try:
+                await refresh_fiche_message(interaction.client, guild, cid, interaction.user.mention)
+            except Exception as e:
+                failed.append((id_to_char.get(cid, {"character_name": f"#{cid}", "slot_number": "?",
+                                                    "user_id": 0}),
+                               f"rafraîchissement embed : {e!r}"))
+            await asyncio.sleep(1.0)
 
-        color = discord.Color.orange() if erreurs else discord.Color.green()
-        chunks = self._split_for_embed(full, limit=4000)
-        for i, chunk in enumerate(chunks):
-            emb = discord.Embed(
-                title="✅ Synchronisation terminée" if i == 0 else "✅ Synchronisation (suite)",
-                description=chunk,
-                color=color)
-            await interaction.followup.send(embed=emb)
+        if applied or conflicts or signals or failed:
+            await _fiche_sync_owner_report(interaction.client, "🧾 /sync-roles",
+                                           applied, conflicts, signals, failed, blocked=False)
+
+        par_champ = {}
+        for (_c, champ, _o, _n) in applied:
+            par_champ[champ] = par_champ.get(champ, 0) + 1
+        if applied or conflicts or signals or failed:
+            lignes = [
+                f"**{len(applied)}** correction(s)"
+                + ((" : " + ", ".join(f"{k}={v}" for k, v in par_champ.items())) if applied else ""),
+                f"**{len(conflicts)}** conflit(s) · **{len(signals)}** signalement(s) · "
+                f"**{len(failed)}** erreur(s)."]
+            for (char, champ, old, new) in applied[:40]:
+                lignes.append(f"• {char['character_name']} (slot {char['slot_number']}) : "
+                              f"{champ} {old!r} → {new!r}")
+            full = "\n".join(lignes)
+        else:
+            full = "✅ Fiches déjà synchronisées avec les rôles."
+        color = discord.Color.orange() if (failed or conflicts) else discord.Color.green()
+        for i, chunk in enumerate(self._split_for_embed(full, limit=4000)):
+            await interaction.followup.send(embed=discord.Embed(
+                title="🔄 Synchronisation fiches←rôles" if i == 0 else "🔄 (suite)",
+                description=chunk, color=color))
 
     @app_commands.command(name="départ", description="Démarre la création de ton personnage")
     async def depart(self, interaction: discord.Interaction):

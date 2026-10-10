@@ -6,7 +6,7 @@ import os
 from cogs.clans import build_clans_report
 from cogs.depart import (
     retroactive_departure_check, backfill_role_points, backfill_fiche_message_ids,
-    fix_detached_fiche_images, backfill_nom_frozen_to_clan,
+    fix_detached_fiche_images, backfill_nom_frozen_to_clan, sync_fiches_from_roles,
 )
 from cogs.utils.database import get_bot_state, set_bot_state
 from cogs.profil import (
@@ -29,6 +29,8 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # Garde : les rattrapages profil (PV / sorts) ne doivent tourner qu'une fois par process.
 _profil_backfills_done = False
+# Garde : la synchronisation fiches<-rôles ne tourne qu'une fois par process (on_ready peut se répéter).
+_fiche_sync_done = False
 
 
 @bot.event
@@ -101,6 +103,19 @@ async def on_ready():
     # les objets déjà créés en Potion / Arme maudite / Relique. Sa clé bot_state 'shop_price_rerange_done'
     # garantit l'unicité ; ne touche jamais un objet volontairement mis à l'infini (prix NULL).
     await backfill_shop_prices_new_ranges()
+    # Synchronisation des fiches sur les RÔLES (vérité), APRÈS les autres backfills (elle dépend de
+    # backfill_role_points et backfill_fiche_message_ids). Tourne à CHAQUE démarrage (pas de bot_state),
+    # protégée par un drapeau en mémoire contre les on_ready multiples (reconnexions), et ne doit jamais
+    # empêcher le bot de démarrer.
+    global _fiche_sync_done
+    if not _fiche_sync_done:
+        _fiche_sync_done = True
+        try:
+            await sync_fiches_from_roles(bot)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[fiche-sync] Erreur non bloquante : {e!r}")
     if not status_loop.is_running():
         status_loop.start()
 

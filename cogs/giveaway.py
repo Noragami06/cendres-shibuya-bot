@@ -28,6 +28,25 @@ GIVEAWAY_CHANNEL_ID = 1521562694891868180
 # Owner du serveur : seul concerné par le mécanisme discret (§5). Jamais exposé publiquement.
 OWNER_ID = 396615332346855428
 
+# Délai de choix d'une récompense (claim), unique et réglable. 5400 s = 1h30.
+GIVEAWAY_CLAIM_TIMEOUT_SECONDS = 5400
+# Exclusion des participants du giveaway d'origine lors d'un reroll : "none" | "winners" | "all".
+GIVEAWAY_REROLL_EXCLUSION_MODE = "none"
+# Clé bot_state du heartbeat (date UTC écrite régulièrement tant que le bot tourne) : sert à GELER le
+# chrono des claims pendant un arrêt du bot.
+GIVEAWAY_HEARTBEAT_KEY = "giveaway_heartbeat"
+
+
+def _fmt_claim_delay() -> str:
+    """Délai de claim formaté façon « 1h30 » / « 45min » / « 2h » depuis la constante."""
+    total_min = GIVEAWAY_CLAIM_TIMEOUT_SECONDS // 60
+    h, m = divmod(total_min, 60)
+    if h and m:
+        return f"{h}h{m:02d}"
+    if h:
+        return f"{h}h"
+    return f"{m}min"
+
 # Dossier temporaire des images de giveaway (généré à la volée, nettoyé après envoi).
 GIVEAWAY_IMG_DIR = os.path.join(os.path.dirname(__file__), "..", "temp", "giveaway_images")
 
@@ -252,47 +271,16 @@ def _reroll_view(giveaway_id: int) -> discord.ui.View:
     return view
 
 
-class _RewardSelectView(discord.ui.View):
-    """Menu déroulant de choix de récompense en MP (Phase 4). Dès le clic, la ligne choisie est
-    enregistrée PUIS appliquée immédiatement (le gagnant reçoit à l'instant), et le MP confirme ce qu'il
-    a reçu. Le Future débloque l'appelant qui enchaîne le gagnant suivant. timeout=None : l'appelant
-    borne l'attente à 30 min."""
-
-    def __init__(self, cog, participant, remaining, options):
-        super().__init__(timeout=None)
-        self.cog = cog
-        self.participant = participant
-        self.owner_id = participant["user_id"]
-        self.remaining = remaining            # {numero: reward}
-        self.future = asyncio.get_running_loop().create_future()
-        self.select = discord.ui.Select(
-            placeholder="Choisis ta récompense (30 minutes pour répondre)",
-            options=options, min_values=1, max_values=1)
-        self.select.callback = self._on_select
-        self.add_item(self.select)
-
-    async def _on_select(self, interaction: discord.Interaction):
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("Ce choix ne t'appartient pas.", ephemeral=True)
-            return
-        num = int(self.select.values[0])
-        reward = dict(self.remaining.get(num) or {})
-        # 1) Enregistre le choix (quantité ENTIÈRE conservée : « Coffre ×2 » = 2 coffres).
-        db.giveaway_set_reward_claimed(self.participant["id"], json.dumps(reward))
-        # 2) Applique IMMÉDIATEMENT (anti double-don géré par reward_applied).
-        montant = await self.cog._apply_giveaway_reward(self.participant, reward)
-        nom = reward.get("nom_resolu", "?")
-        if montant is not None:
-            texte = f"✅ Tu as reçu : **{nom} × {montant}** !"
-        else:
-            texte = f"✅ Choix enregistré : **{nom}** (attribution en cours)."
-        if not self.future.done():
-            self.future.set_result(num)
-        try:
-            await interaction.response.edit_message(content=texte, view=None)
-        except discord.HTTPException:
-            pass
-        self.stop()
+def _relaunch_claims_view(giveaway_id: int) -> discord.ui.View:
+    """Vue MP owner (§2 cas C/D) : reroll + relancer les claims (custom_id persistants)."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(
+        label="Lancer le reroll", emoji="🔁", style=discord.ButtonStyle.primary,
+        custom_id=f"giveaway_reroll:{giveaway_id}"))
+    view.add_item(discord.ui.Button(
+        label="Relancer les claims", emoji="🔄", style=discord.ButtonStyle.secondary,
+        custom_id=f"giveaway_claimrelaunch:{giveaway_id}"))
+    return view
 
 
 class _GiveawayCancel(Exception):
@@ -313,6 +301,10 @@ class Giveaway(commands.Cog):
         self._distribution_tasks = set()
         # Tâche de la boucle de rafraîchissement du pillow (Point 3).
         self._update_task = None
+        # §5 : tâches de distribution persistante (reprise au boot, heartbeat, boucle d'échéances).
+        self._claim_boot_task = None
+        self._heartbeat_task = None
+        self._deadline_task = None
 
     @app_commands.command(name="giveaway", description="Lance un giveaway (staff uniquement)")
     async def giveaway(self, interaction: discord.Interaction):
@@ -517,11 +509,144 @@ class Giveaway(commands.Cog):
     async def cog_load(self):
         if self._update_task is None or self._update_task.done():
             self._update_task = asyncio.create_task(self.giveaway_update_loop())
+        if self._claim_boot_task is None or self._claim_boot_task.done():
+            self._claim_boot_task = asyncio.create_task(self._distribution_boot())
 
     async def cog_unload(self):
-        if self._update_task is not None:
-            self._update_task.cancel()
-            self._update_task = None
+        for t in (self._update_task, self._claim_boot_task, self._heartbeat_task, self._deadline_task):
+            if t is not None:
+                t.cancel()
+        self._update_task = self._claim_boot_task = self._heartbeat_task = self._deadline_task = None
+
+    # ---------- §5 : boot (reprise), heartbeat, boucle d'échéances ----------
+    async def _distribution_boot(self):
+        """Au démarrage : attend que le bot soit prêt, GÈLE le chrono (décalage = temps hors-ligne),
+        ré-enregistre les vues persistantes, relance les MP de claim perdus, puis démarre les boucles."""
+        await self.bot.wait_until_ready()
+        try:
+            await self._resume_distributions()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[giveaway] Reprise des distributions : erreur non bloquante : {e!r}")
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        if self._deadline_task is None or self._deadline_task.done():
+            self._deadline_task = asyncio.create_task(self._claim_deadline_loop())
+
+    async def _heartbeat_loop(self):
+        """Écrit la date UTC courante dans bot_state toutes les 15 s (sert à geler le chrono hors-ligne)."""
+        while not self.bot.is_closed():
+            try:
+                db.set_bot_state(GIVEAWAY_HEARTBEAT_KEY, _now_utc().isoformat())
+            except Exception:
+                pass
+            await asyncio.sleep(15)
+
+    async def _claim_deadline_loop(self):
+        """Toutes les 10 s : fait avancer tout claim dont l'échéance est dépassée (gagnant sans réponse)."""
+        while not self.bot.is_closed():
+            try:
+                for state in db.giveaway_claim_state_all():
+                    dl = state["claim_deadline_at"]
+                    if dl and _now_utc() >= _parse_iso(dl):
+                        await self._advance_claim(state["giveaway_id"])
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            await asyncio.sleep(10)
+
+    async def _resume_distributions(self):
+        """Gel du chrono + ré-enregistrement des vues + relance des MP manquants (voir §5)."""
+        # 1) Décalage = temps écoulé hors-ligne (jamais négatif, 0 si pas de heartbeat).
+        hb = db.get_bot_state(GIVEAWAY_HEARTBEAT_KEY)
+        downtime = 0.0
+        if hb:
+            try:
+                downtime = max(0.0, (_now_utc() - _parse_iso(hb)).total_seconds())
+            except (ValueError, TypeError):
+                downtime = 0.0
+        states = db.giveaway_claim_state_all()
+        # 2) Repousse chaque échéance du temps hors-ligne (chrono gelé pendant l'arrêt).
+        for state in states:
+            if state["claim_deadline_at"]:
+                try:
+                    new_dl = (_parse_iso(state["claim_deadline_at"])
+                              + timedelta(seconds=downtime)).isoformat()
+                    db.giveaway_claim_state_set_deadline(state["giveaway_id"], new_dl)
+                except (ValueError, TypeError):
+                    pass
+        # 3) Ré-enregistre les vues persistantes (menus de claim + boutons owner + Participer/Voir).
+        self._register_persistent_views()
+        # 4) MP de claim introuvable -> on renvoie un nouveau MP SANS toucher à l'échéance.
+        for state in states:
+            await self._resend_claim_dm_if_missing(state)
+        if states:
+            print(f"🎁 [giveaway] {len(states)} distribution(s) reprise(s), "
+                  f"décalage de {int(downtime // 60)} min (chrono gelé hors-ligne).")
+
+    def _register_persistent_views(self):
+        """bot.add_view pour tout ce qui est persistant : menus de claim en cours + boutons owner, et
+        les vues publiques Participer/Voir (ré-enregistrées par giveaway_id des giveaways actifs)."""
+        try:
+            for state in db.giveaway_claim_state_all():
+                g = db.giveaway_get(state["giveaway_id"])
+                if g is None:
+                    continue
+                remaining = self._rewards_remaining(g)
+                self.bot.add_view(self._claim_view(g["id"], state["current_participant_id"], remaining))
+                self.bot.add_view(_relaunch_claims_view(g["id"]))
+            for g in db.giveaway_get_active():
+                self.bot.add_view(_participate_view(g["id"]))
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    async def _resend_claim_dm_if_missing(self, state):
+        """Si le MP du claim courant est introuvable, renvoie un nouveau MP (échéance INCHANGÉE).
+        Relit l'état FRAIS en base (échéance déjà gelée) pour ne jamais ré-écraser le décalage."""
+        giveaway_id = state["giveaway_id"]
+        fresh = db.giveaway_claim_state_get(giveaway_id)  # échéance À JOUR (après gel)
+        if fresh is None:
+            return
+        pid = fresh["current_participant_id"]
+        g = db.giveaway_get(giveaway_id)
+        participant = db.giveaway_get_participant(pid)
+        if g is None or participant is None:
+            return
+        try:
+            user = self.bot.get_user(participant["user_id"]) or await self.bot.fetch_user(participant["user_id"])
+        except discord.HTTPException:
+            user = None
+        if user is None:
+            return
+        try:
+            dm = await user.create_dm()
+        except discord.HTTPException:
+            return
+        # Le MP existe-t-il encore ? (on interroge le salon MP du joueur, jamais get_channel qui ne
+        # connaît pas les DM.)
+        if fresh["dm_message_id"]:
+            try:
+                await dm.fetch_message(fresh["dm_message_id"])
+                return  # toujours présent : rien à faire
+            except discord.HTTPException:
+                pass
+        remaining = self._rewards_remaining(g)
+        reste_s = (max(0, int((_parse_iso(fresh["claim_deadline_at"]) - _now_utc()).total_seconds()))
+                   if fresh["claim_deadline_at"] else GIVEAWAY_CLAIM_TIMEOUT_SECONDS)
+        embed = discord.Embed(
+            title="🎉 Félicitations ! Tu as gagné ce giveaway !",
+            description=(f"**{g['titre']}**\n\nChoisis ta récompense dans le menu ci-dessous.\n"
+                         f"⏱️ Il te reste environ **{max(1, reste_s // 60)} min**."),
+            color=discord.Color.gold())
+        try:
+            msg = await dm.send(embed=embed, view=self._claim_view(g["id"], pid, remaining))
+            db.giveaway_claim_state_set(
+                giveaway_id, fresh["session"], fresh["current_index"], pid,
+                fresh["claim_deadline_at"], dm.id, msg.id)  # échéance gelée INCHANGÉE
+        except discord.HTTPException:
+            pass
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
@@ -540,6 +665,10 @@ class Giveaway(commands.Cog):
             await self._handle_view_participants(interaction, cid)
         elif cid.startswith("giveaway_remove:"):
             await self._handle_remove_members(interaction, cid)
+        elif cid.startswith("giveaway_claim:"):
+            await self._handle_claim_select(interaction, cid)
+        elif cid.startswith("giveaway_claimrelaunch:"):
+            await self._handle_claim_relaunch(interaction, cid)
 
     # ---------- rendu pillow ----------
     @staticmethod
@@ -578,7 +707,7 @@ class Giveaway(commands.Cog):
         return BOOSTER_ROLE_ID in rids or VIP_ROLE_ID in rids
 
     # =================================================================
-    # PHASE 4 — distribution séquentielle (1 gagnant à la fois, 30 min, 2 tours)
+    # PHASE 4 — distribution séquentielle persistante (1 gagnant à la fois, 1h30, 2 tours)
     # =================================================================
     def _rewards_remaining(self, g):
         """Récompenses ENCORE disponibles, recalculées EN TEMPS RÉEL. Modèle 1 ligne = 1 prix : chaque
@@ -595,88 +724,144 @@ class Giveaway(commands.Cog):
                 continue
         return {r.get("numero"): r for r in rewards if r.get("numero") not in pris}
 
-    async def _start_reward_distribution(self, giveaway_id, tour=1):
-        """Lance (ou relance au tour 2) la distribution séquentielle. S'arrête dès qu'il n'y a plus
-        rien à distribuer ou que tous les gagnants ont choisi."""
+    # ---------- distribution PERSISTANTE (état en base + échéances, chrono gelé hors-ligne) ----------
+    def _claim_options(self, remaining):
+        return [discord.SelectOption(
+                    label=(r.get("nom_resolu") or "?")[:100], value=str(num),
+                    description=f"Quantité : {r.get('quantite', '')}"[:100])
+                for num, r in remaining.items()]
+
+    def _claim_view(self, giveaway_id, participant_id, remaining):
+        """Vue PERSISTANTE du menu de claim : custom_id fixe -> dispatché par on_interaction, survit au
+        redémarrage (ré-enregistrée via bot.add_view au démarrage)."""
+        view = discord.ui.View(timeout=None)
+        select = discord.ui.Select(
+            placeholder=f"Choisis ta récompense ({_fmt_claim_delay()} pour répondre)",
+            options=self._claim_options(remaining) or [discord.SelectOption(label="—", value="0")],
+            custom_id=f"giveaway_claim:{giveaway_id}:{participant_id}")
+        view.add_item(select)
+        return view
+
+    async def _prompt_from(self, giveaway_id, session, start_index):
+        """Sollicite le PREMIER gagnant non servi à partir de start_index (ordre claim_order). Persiste
+        l'état et l'échéance, puis s'arrête (pas d'attente bloquante). Fin de session -> tour2 puis §2."""
         g = db.giveaway_get(giveaway_id)
         if g is None:
             return
-        gagnants = db.giveaway_get_winners(giveaway_id)
-        if not gagnants:
-            await self._finalize_giveaway_rewards(giveaway_id)
-            return
+        gagnants = db.giveaway_get_winners(giveaway_id)  # triés par claim_order
         remaining = self._rewards_remaining(g)
-        tous_ont_choisi = all(p["reward_claimed_json"] for p in gagnants)
-        if len(remaining) == 0 or tous_ont_choisi:
-            await self._finalize_giveaway_rewards(giveaway_id)
+        if not remaining:
+            await self._finalize_tour2(giveaway_id)
             return
-        db.giveaway_set_status(giveaway_id, f"distribution_tour{tour}")
-        await self._process_next_claimant(giveaway_id, tour, 0)
+        i = start_index
+        while i < len(gagnants):
+            w = gagnants[i]
+            if w["reward_claimed_json"]:
+                i += 1
+                continue
+            sent = await self._send_claim_dm(g, w, session, i)
+            if sent:
+                return  # on attend son choix ou l'échéance (géré par la boucle / le callback)
+            i += 1  # MP impossible : on passe au suivant
+        # Fin de session.
+        if session == "tour1":
+            await self._prompt_from(giveaway_id, "tour2", 0)
+        else:
+            await self._finalize_tour2(giveaway_id)
 
-    async def _process_next_claimant(self, giveaway_id, tour, index):
-        """Traite un gagnant à la fois (ordre claim_order). Passe au suivant immédiatement après un
-        choix, ou après l'expiration des 30 min. Enchaîne le tour 2 puis la Phase 5."""
-        g = db.giveaway_get(giveaway_id)
-        if g is None:
-            return
-        gagnants = db.giveaway_get_winners(giveaway_id)
-        if index >= len(gagnants):
-            if tour == 1:
-                await self._start_reward_distribution(giveaway_id, tour=2)
-            else:
-                await self._finalize_giveaway_rewards(giveaway_id)
-            return
-        gagnant = gagnants[index]
-        # Déjà servi (au tour 1 ou avant) : on ne le re-sollicite jamais.
-        if gagnant["reward_claimed_json"]:
-            await self._process_next_claimant(giveaway_id, tour, index + 1)
-            return
-        remaining = self._rewards_remaining(g)
-        if len(remaining) == 0:
-            # Plus rien à distribuer : inutile de solliciter qui que ce soit.
-            await self._finalize_giveaway_rewards(giveaway_id)
-            return
-        # L'enregistrement ET l'attribution se font dans le callback du menu (réception immédiate).
-        await self._prompt_claimant(g, gagnant, remaining)
-        await self._process_next_claimant(giveaway_id, tour, index + 1)
-
-    async def _prompt_claimant(self, g, gagnant, remaining):
-        """Envoie le MP + menu déroulant au gagnant et attend son choix (max 30 min). Le choix est
-        enregistré ET appliqué dans le callback du menu. Retourne le numéro choisi, ou None (MP
-        impossible / délai dépassé)."""
+    async def _send_claim_dm(self, g, w, session, index):
+        """Envoie le MP + menu persistant au gagnant `w`, écrit l'état (échéance = maintenant + délai).
+        Retourne True si le MP est parti, False sinon."""
         try:
-            user = self.bot.get_user(gagnant["user_id"]) or await self.bot.fetch_user(gagnant["user_id"])
+            user = self.bot.get_user(w["user_id"]) or await self.bot.fetch_user(w["user_id"])
         except discord.HTTPException:
             user = None
         if user is None:
-            return None
-        options = [
-            discord.SelectOption(
-                label=(r.get("nom_resolu") or "?")[:100], value=str(num),
-                description=f"Quantité : {r.get('quantite', '')}"[:100])
-            for num, r in remaining.items()]
+            return False
+        remaining = self._rewards_remaining(g)
         embed = discord.Embed(
             title="🎉 Félicitations ! Tu as gagné ce giveaway !",
             description=(f"**{g['titre']}**\n\nChoisis ta récompense dans le menu ci-dessous.\n"
-                         "⏱️ Tu as **30 minutes** pour répondre."),
+                         f"⏱️ Tu as **{_fmt_claim_delay()}** pour répondre."),
             color=discord.Color.gold())
-        view = _RewardSelectView(self, gagnant, remaining, options)
+        view = self._claim_view(g["id"], w["id"], remaining)
         try:
             dm = await user.create_dm()
             msg = await dm.send(embed=embed, view=view)
         except discord.HTTPException:
-            return None
+            return False
+        deadline = (_now_utc() + timedelta(seconds=GIVEAWAY_CLAIM_TIMEOUT_SECONDS)).isoformat()
+        db.giveaway_claim_state_set(g["id"], session, index, w["id"], deadline, dm.id, msg.id)
+        return True
+
+    async def _advance_claim(self, giveaway_id):
+        """Passe au gagnant suivant (après un choix OU une échéance dépassée)."""
+        state = db.giveaway_claim_state_get(giveaway_id)
+        if state is None:
+            return
+        await self._prompt_from(giveaway_id, state["session"], state["current_index"] + 1)
+
+    async def _handle_claim_select(self, interaction, cid):
+        """Callback persistant du menu de claim (custom_id giveaway_claim:gid:pid)."""
+        parts = cid.split(":")
+        giveaway_id, participant_id = int(parts[1]), int(parts[2])
+        state = db.giveaway_claim_state_get(giveaway_id)
+        # Ce n'est plus (ou pas) le tour de ce gagnant -> refus.
+        if state is None or state["current_participant_id"] != participant_id:
+            await interaction.response.edit_message(
+                content="⏱️ Ce n'est plus ton tour (temps écoulé).", embed=None, view=None)
+            return
+        if state["claim_deadline_at"] and _now_utc() > _parse_iso(state["claim_deadline_at"]):
+            await interaction.response.edit_message(
+                content="⏱️ Temps écoulé pour ce tour.", embed=None, view=None)
+            await self._advance_claim(giveaway_id)
+            return
+        values = (interaction.data or {}).get("values") or []
+        if not values:
+            await interaction.response.defer()
+            return
+        g = db.giveaway_get(giveaway_id)
+        remaining = self._rewards_remaining(g)
+        num = int(values[0])
+        reward = remaining.get(num)
+        if reward is None:
+            await interaction.response.edit_message(
+                content="Cette récompense vient d'être prise. Choisis-en une autre…", view=None)
+            # On re-sollicite le même gagnant avec le menu à jour.
+            await self._prompt_from(giveaway_id, state["session"], state["current_index"])
+            return
+        participant = db.giveaway_get_participant(participant_id)
+        db.giveaway_set_reward_claimed(participant_id, json.dumps(reward))
+        montant = await self._apply_giveaway_reward(participant, reward)
+        nom = reward.get("nom_resolu", "?")
+        txt = (f"✅ Tu as reçu : **{nom} × {montant}** !" if montant is not None
+               else f"✅ Choix enregistré : **{nom}** (attribution en cours).")
         try:
-            num = await asyncio.wait_for(view.future, timeout=1800)  # 30 minutes
-        except asyncio.TimeoutError:
-            view.stop()
-            try:
-                await msg.edit(content="⏱️ Délai écoulé — tu n'as pas choisi à temps pour ce tour.",
-                               embed=None, view=None)
-            except discord.HTTPException:
-                pass
-            return None
-        return num
+            await interaction.response.edit_message(content=txt, embed=None, view=None)
+        except discord.HTTPException:
+            pass
+        await self._advance_claim(giveaway_id)
+
+    async def _handle_claim_relaunch(self, interaction, cid):
+        """§3 — Bouton « 🔄 Relancer les claims » (owner). Aucun nouveau tirage : re-sollicite seulement
+        les gagnants sans réclamation, un tour1 puis tour2, avec le même mécanisme persistant."""
+        giveaway_id = int(cid.split(":")[1])
+        if interaction.user.id != OWNER_ID:
+            await interaction.response.send_message(
+                "Action réservée au lanceur du giveaway.", ephemeral=True)
+            return
+        g = db.giveaway_get(giveaway_id)
+        if g is None:
+            await interaction.response.edit_message(content="Ce giveaway n'existe plus.", view=None)
+            return
+        # Anti double-clic : les boutons disparaissent dès le premier clic.
+        try:
+            await interaction.response.edit_message(content="🔄 Relance des claims lancée.", view=None)
+        except discord.HTTPException:
+            pass
+        db.giveaway_increment_claim_relaunch(giveaway_id)
+        db.giveaway_set_status(giveaway_id, "en_distribution")
+        await self._prompt_from(giveaway_id, "tour1", 0)
 
     # =================================================================
     # PHASE 5 — application réelle, récapitulatif, reroll
@@ -778,63 +963,101 @@ class Giveaway(commands.Cog):
             db.giveaway_set_reward_applied(participant["id"], 0)  # échec -> réessai possible plus tard
             return None
 
-    async def _finalize_giveaway_rewards(self, giveaway_id):
-        """Applique réellement toutes les récompenses choisies, puis envoie le récap + la décision de
-        reroll à l'owner. Idempotent (ne ré-applique jamais un giveaway déjà terminé)."""
-        g = db.giveaway_get(giveaway_id)
-        if g is None or g["status"] == "termine":
-            return
-        # Filet de sécurité : les récompenses sont normalement attribuées dès le choix (callback du menu).
-        # Ici on ne traite QUE les lignes choisies mais pas encore appliquées (reward_applied = 0), et
-        # jamais celles déjà données. _apply_giveaway_reward gère son propre verrou et ses erreurs.
-        for p in db.giveaway_get_winners(giveaway_id):
-            if not p["reward_claimed_json"] or p["reward_applied"]:
-                continue
-            try:
-                reward = json.loads(p["reward_claimed_json"])
-            except (ValueError, TypeError):
-                continue
-            await self._apply_giveaway_reward(p, reward)
-        db.giveaway_set_status(giveaway_id, "termine")
-        await self._reward_recap_and_reroll(g)
-
-    async def _reward_recap_and_reroll(self, g):
-        """Récap FINAL en MP à l'OWNER (toujours, peu importe qui a lancé). Bouton reroll si des lignes
-        n'ont été prises par personne et que la limite de 3 reroll n'est pas atteinte."""
+    async def _owner_dm(self):
         try:
             owner = self.bot.get_user(OWNER_ID) or await self.bot.fetch_user(OWNER_ID)
         except discord.HTTPException:
-            owner = None
+            return None
         if owner is None:
-            return
-        titre = g["titre"]
-        non_reclamees = self._unclaimed_reward_lines(g)
+            return None
         try:
-            dm = await owner.create_dm()
+            return await owner.create_dm()
         except discord.HTTPException:
+            return None
+
+    async def _finalize_tour2(self, giveaway_id):
+        """Fin de la distribution (après le tour 2 ou dès l'épuisement des lignes). Applique §2 :
+        cas A (rien), B (exactement 1 -> don auto), C (≥2 -> reroll/relance), D (anomalie)."""
+        g = db.giveaway_get(giveaway_id)
+        if g is None:
             return
-        if not non_reclamees:
+        db.giveaway_claim_state_delete(giveaway_id)  # plus aucun claim en cours
+        # Filet de sécurité : applique les choix enregistrés mais pas encore appliqués.
+        for p in db.giveaway_get_winners(giveaway_id):
+            if p["reward_claimed_json"] and not p["reward_applied"]:
+                try:
+                    await self._apply_giveaway_reward(p, json.loads(p["reward_claimed_json"]))
+                except (ValueError, TypeError):
+                    pass
+
+        non_reclamees = self._unclaimed_reward_lines(g)
+        gagnants = db.giveaway_get_winners(giveaway_id)
+        sans = [p for p in gagnants if not p["reward_claimed_json"]]
+        titre = g["titre"]
+        dm = await self._owner_dm()
+
+        # Cas A : tout réclamé.
+        if len(non_reclamees) == 0:
+            db.giveaway_set_status(giveaway_id, "termine")
+            if dm:
+                try:
+                    await dm.send(f"✅ Giveaway « {titre} » terminé — toutes les récompenses ont été réclamées.")
+                except discord.HTTPException:
+                    pass
+            return
+
+        # Cas D : incohérence de comptage (récompenses restantes ≠ gagnants sans réclamation).
+        if len(non_reclamees) != len(sans):
+            await self._owner_unclaimed_buttons(
+                giveaway_id, g, non_reclamees, sans, dm, anomalie=True)
+            return
+
+        # Cas B : exactement 1 restante (et 1 gagnant sans réclamation) -> don automatique.
+        if len(non_reclamees) == 1:
+            reward = non_reclamees[0]
+            winner = sans[0]
+            db.giveaway_set_reward_claimed(winner["id"], json.dumps(reward))
+            montant = await self._apply_giveaway_reward(winner, reward)
+            db.giveaway_set_status(giveaway_id, "termine")
+            nom = reward.get("nom_resolu", "?")
+            qte = montant if montant is not None else reward.get("quantite", "")
             try:
-                await dm.send(f"✅ Giveaway « {titre} » terminé — toutes les récompenses ont été réclamées.")
+                wu = self.bot.get_user(winner["user_id"]) or await self.bot.fetch_user(winner["user_id"])
+                if wu is not None:
+                    wdm = await wu.create_dm()
+                    await wdm.send(
+                        f"🎁 Tu n'avais pas choisi de récompense pour « {titre} », voici la tienne : "
+                        f"**{nom} × {qte}**")
             except discord.HTTPException:
                 pass
+            if dm:
+                try:
+                    await dm.send(
+                        f"ℹ️ Giveaway « {titre} » : 1 récompense non réclamée attribuée automatiquement à "
+                        f"<@{winner['user_id']}> (**{nom} × {qte}**). Terminé, aucun reroll.")
+                except discord.HTTPException:
+                    pass
+            return
+
+        # Cas C : 2 récompenses non réclamées ou plus -> l'owner décide (reroll / relance).
+        await self._owner_unclaimed_buttons(giveaway_id, g, non_reclamees, sans, dm, anomalie=False)
+
+    async def _owner_unclaimed_buttons(self, giveaway_id, g, non_reclamees, sans, dm, anomalie):
+        """MP owner avec la liste des récompenses restantes + boutons reroll / relancer les claims."""
+        db.giveaway_set_status(giveaway_id, "attente_owner")
+        if dm is None:
             return
         lignes = "\n".join(f"• {r.get('nom_resolu', '?')} × {r.get('quantite', '')}" for r in non_reclamees)
-        gagnants = db.giveaway_get_winners(g["id"])
-        sans = [p for p in gagnants if not p["reward_claimed_json"]]
         mentions = ", ".join(f"<@{p['user_id']}>" for p in sans) if sans else "aucun"
-        texte = (f"⚠️ Giveaway « {titre} » terminé — récompenses non réclamées :\n{lignes}"
-                 f"\n\nJoueurs n'ayant rien réclamé : {mentions}")
+        texte = (f"⚠️ Giveaway « {g['titre']} » — {len(non_reclamees)} récompense(s) non réclamée(s) :\n"
+                 f"{lignes}\n\nGagnants sans réclamation : {mentions}")
+        if anomalie:
+            texte += ("\n\n❗ Anomalie de comptage : le nombre de récompenses restantes ne correspond pas "
+                      "au nombre de gagnants sans réclamation. Rien n'a été attribué automatiquement.")
         if (g["reroll_count"] or 0) >= 3:
-            texte += ("\n\n🗑️ 3 reroll déjà enchaînés : les récompenses restantes partent définitivement "
-                      "à la poubelle (plus assez de joueurs éligibles pour continuer).")
-            try:
-                await dm.send(texte)
-            except discord.HTTPException:
-                pass
-            return
+            texte += "\n\n🗑️ 3 reroll déjà enchaînés : le reroll ne rendra plus la main au-delà."
         try:
-            await dm.send(texte, view=_reroll_view(g["id"]))
+            await dm.send(texte, view=_relaunch_claims_view(giveaway_id))
         except discord.HTTPException:
             pass
 
@@ -900,10 +1123,14 @@ class Giveaway(commands.Cog):
             nr = dict(r)
             nr["numero"] = i
             new_rewards.append(nr)
-        # Exclusion cumulée : exclusions existantes + TOUS les participants du giveaway rerollé
-        # (l'accumulation le long de la chaîne exclut bien tout le monde depuis l'origine).
-        excl_users = set(json.loads(g["exclusion_users_json"] or "[]"))
-        excl_users |= {p["user_id"] for p in db.giveaway_get_participants(g_id)}
+        # §4 — exclusion des anciens participants selon GIVEAWAY_REROLL_EXCLUSION_MODE.
+        if GIVEAWAY_REROLL_EXCLUSION_MODE == "all":
+            excl_users = set(json.loads(g["exclusion_users_json"] or "[]"))
+            excl_users |= {p["user_id"] for p in db.giveaway_get_participants(g_id)}
+        elif GIVEAWAY_REROLL_EXCLUSION_MODE == "winners":
+            excl_users = {w["user_id"] for w in db.giveaway_get_winners(g_id)}
+        else:  # "none" (défaut) : aucun ancien participant exclu, un participant peut re-jouer.
+            excl_users = set()
         now = _now_utc()
         ends = now + timedelta(hours=12)
         origin_id = g["origin_giveaway_id"] or g["id"]
@@ -993,11 +1220,9 @@ class Giveaway(commands.Cog):
         await self._mark_message_closed(g, guild, banniere="🎉 Giveaway terminé !")
         await self._announce_winners(g, guild, channel, ordre_final)
         db.giveaway_set_status(giveaway_id, "en_distribution")
-        # Phase 4 : la distribution (jusqu'à 2 tours × N gagnants × 30 min) ne doit JAMAIS bloquer la
-        # boucle de clôture -> on la lance dans une tâche de fond dont on garde une référence.
-        task = asyncio.create_task(self._start_reward_distribution(giveaway_id))
-        self._distribution_tasks.add(task)
-        task.add_done_callback(self._distribution_tasks.discard)
+        # Distribution PERSISTANTE (état en base, échéances) : on amorce le tour 1 (envoi d'UN MP, pas
+        # d'attente bloquante). La boucle d'échéances et les callbacks de menu font avancer la suite.
+        await self._prompt_from(giveaway_id, "tour1", 0)
 
     async def _mark_message_closed(self, g, guild, banniere):
         """Régénère la pillow en état CLÔTURÉ (temps 00:00:00, jauge à 0) et édite le message existant,

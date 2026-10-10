@@ -426,76 +426,111 @@ async def roll_coffre_reward(character_id, guild, rarete) -> dict:
     multiplicateur est résolu par le rôle réel (Booster/VIP) OU le VIP virtuel slot 2/3 — ce qui remplace
     l'ancien test is_vip_active (le coffre vip_15j octroie justement ce rôle, donc jamais de double compte)."""
     from cogs.utils.rewards import multiplier_for_character
+    import json as _json
+    import traceback as _tb
     entry = weighted_choice(_coffre_entries_for(character_id, rarete))
     mult = multiplier_for_character(guild, character_id)
     t = entry["type"]
+    reward_json = {"type": t}
 
-    # Convention de retour : {"texte": libellé de base, "n": quantité} (agrégé au récap, §9).
-    if t == "argent":
-        montant = random.randint(entry["min"], entry["max"]) * mult
-        credit_compte_courant(character_id, montant, "Ouverture de coffre", category="revenu")
-        return {"texte": f"{montant:,} ¥".replace(",", " "), "n": 1}
+    def _log_and_return(ok, texte, n=1, error=None):
+        """Journalise l'ouverture et renvoie le dict de résultat. `ok` False => le coffre sera conservé."""
+        db.chest_open_log_add(
+            character_id, rarete,
+            _json.dumps({**reward_json, "texte": texte, "n": n}, ensure_ascii=False),
+            ok, error, datetime.utcnow().isoformat())
+        return {"texte": texte, "n": n, "ok": ok, "error": error}
 
-    if t == "xp":
-        montant = random.randint(entry["min"], entry["max"]) * mult
-        await db.grant_character_xp(character_id, montant)
-        return {"texte": f"{montant:,} XP".replace(",", " "), "n": 1}
+    try:
+        # Convention de retour : {"texte", "n", "ok", "error"}. "ok"=False -> coffre NON consommé.
+        if t == "argent":
+            montant = random.randint(entry["min"], entry["max"]) * mult
+            reward_json["montant"] = montant
+            # Argent sans compte bancaire : on NE crédite pas (sinon perte silencieuse) et on NE consomme
+            # pas le coffre. Le joueur ouvre un compte avec /banque puis réessaie.
+            from cogs.banque import get_account
+            if get_account(character_id) is None:
+                return _log_and_return(
+                    False, f"{montant:,} ¥".replace(",", " "), 1,
+                    error="Aucun compte bancaire : ouvre un compte avec /banque, puis réessaie.")
+            credit_compte_courant(character_id, montant, "Ouverture de coffre", category="revenu")
+            return _log_and_return(True, f"{montant:,} ¥".replace(",", " "))
 
-    if t == "stats_libre":
-        montant = random.randint(entry["min"], entry["max"]) * mult
-        db.add_points_restants(character_id, montant)
-        return {"texte": f"{montant:,} points à répartir".replace(",", " "), "n": 1}
+        if t == "xp":
+            montant = random.randint(entry["min"], entry["max"]) * mult
+            reward_json["montant"] = montant
+            await db.grant_character_xp(character_id, montant)
+            return _log_and_return(True, f"{montant:,} XP".replace(",", " "))
 
-    if t in COFFRE_STAT_DIRECT:
-        stat_key, label = COFFRE_STAT_DIRECT[t]
-        montant = random.randint(entry["min"], entry["max"]) * mult
-        got = db.add_stat_base_pts(character_id, stat_key, montant)  # 0 si verrouillée
-        if got == 0 and montant > 0:
-            return {"texte": f"{label} verrouillée : gain ignoré", "n": 1}
-        return {"texte": f"{montant:,} points directement en {label}".replace(",", " "), "n": 1}
+        if t == "stats_libre":
+            montant = random.randint(entry["min"], entry["max"]) * mult
+            reward_json["montant"] = montant
+            db.add_points_restants(character_id, montant)
+            return _log_and_return(True, f"{montant:,} points à répartir".replace(",", " "))
 
-    if t == "potion":
-        item = db.get_potion_item(entry["sous_type"], entry["classe"])
-        qty = entry.get("qty", 1) * mult
-        if item is not None:
+        if t in COFFRE_STAT_DIRECT:
+            stat_key, label = COFFRE_STAT_DIRECT[t]
+            montant = random.randint(entry["min"], entry["max"]) * mult
+            reward_json.update({"stat": stat_key, "montant": montant})
+            got = db.add_stat_base_pts(character_id, stat_key, montant)  # 0 si verrouillée
+            if got == 0 and montant > 0:
+                # Stat verrouillée : outcome LÉGITIME (coffre consommé), pas une erreur.
+                return _log_and_return(True, f"{label} verrouillée : gain ignoré")
+            return _log_and_return(True, f"{montant:,} points directement en {label}".replace(",", " "))
+
+        if t == "potion":
+            item = db.get_potion_item(entry["sous_type"], entry["classe"])
+            qty = entry.get("qty", 1) * mult
+            if item is None:
+                return _log_and_return(
+                    False, f"Potion {entry['sous_type']} classe {entry['classe']}", qty,
+                    error="Objet introuvable en base (potion).")
+            reward_json["item_id"] = item["id"]
             db.inv_add_item(character_id, item["id"], qty)
-            return {"texte": item["name"], "n": qty}
-        return {"texte": f"Potion {entry['sous_type']} classe {entry['classe']} (introuvable)", "n": qty}
+            return _log_and_return(True, item["name"], qty)
 
-    if t in ("arme_maudite", "relique"):
-        cat = "Arme maudite" if t == "arme_maudite" else "Relique"
-        item = db.get_random_item_in_category_classe(cat, entry["classe"])
-        qty = 1 * mult  # règle universelle : la quantité double aussi pour VIP/Booster (1 -> 2)
-        if item is not None:
+        if t in ("arme_maudite", "relique"):
+            cat = "Arme maudite" if t == "arme_maudite" else "Relique"
+            item = db.get_random_item_in_category_classe(cat, entry["classe"])
+            qty = 1 * mult  # règle universelle : la quantité double aussi pour VIP/Booster (1 -> 2)
+            if item is None:
+                return _log_and_return(False, f"{cat} classe {entry['classe']}", qty,
+                                       error=f"Objet introuvable en base ({cat}).")
+            reward_json["item_id"] = item["id"]
             db.inv_add_item(character_id, item["id"], qty)
-            return {"texte": item["name"], "n": qty}
-        return {"texte": f"{cat} classe {entry['classe']} (introuvable)", "n": qty}
+            return _log_and_return(True, item["name"], qty)
 
-    if t.startswith("parchemin_"):
-        nom = COFFRE_PARCHEMIN_NAMES.get(t)
-        item = db.get_item_by_name(nom) if nom else None
-        qty = entry.get("qty", 1) * mult
-        if item is not None:
+        if t.startswith("parchemin_"):
+            nom = COFFRE_PARCHEMIN_NAMES.get(t)
+            item = db.get_item_by_name(nom) if nom else None
+            qty = entry.get("qty", 1) * mult
+            if item is None:
+                return _log_and_return(False, nom or t, qty, error="Objet introuvable en base (parchemin).")
+            reward_json["item_id"] = item["id"]
             db.inv_add_item(character_id, item["id"], qty)
-            return {"texte": item["name"], "n": qty}
-        return {"texte": f"{nom or t} (introuvable)", "n": qty}
+            return _log_and_return(True, item["name"], qty)
 
-    if t.startswith("token_"):
-        nom = COFFRE_TOKEN_NAMES.get(t)
-        item = db.get_item_by_name(nom) if nom else None
-        qty = entry.get("qty", 1) * mult
-        if item is not None:
+        if t.startswith("token_"):
+            nom = COFFRE_TOKEN_NAMES.get(t)
+            item = db.get_item_by_name(nom) if nom else None
+            qty = entry.get("qty", 1) * mult
+            if item is None:
+                return _log_and_return(False, nom or t, qty, error="Objet introuvable en base (token).")
+            reward_json["item_id"] = item["id"]
             db.inv_add_item(character_id, item["id"], qty)
             # §2 : mémorise la rareté du coffre d'origine (dernier obtenu) pour le calcul d'échange.
             db.set_inventory_rarete_source(character_id, item["id"], rarete)
-            return {"texte": item["name"], "n": qty}
-        return {"texte": f"{nom or t} (introuvable)", "n": qty}
+            return _log_and_return(True, item["name"], qty)
 
-    if t == "vip_15j":
-        await grant_vip(character_id, guild)
-        return {"texte": "Accès VIP 15 jours", "n": 1}
+        if t == "vip_15j":
+            await grant_vip(character_id, guild)
+            return _log_and_return(True, "Accès VIP 15 jours")
 
-    return {"texte": "Récompense inconnue", "n": 1}
+        return _log_and_return(False, "Récompense inconnue", error=f"Type de récompense inconnu : {t}")
+    except Exception as e:
+        # Jamais silencieux : trace console + remontée au joueur (coffre conservé).
+        _tb.print_exc()
+        return _log_and_return(False, str(reward_json.get("type", "?")), error=f"Erreur interne : {e!r}")
 
 
 async def grant_vip(character_id, guild):
@@ -1692,7 +1727,16 @@ class Daily(commands.Cog):
         # Timeout -> on stocke par défaut (ne jamais perdre le coffre gagné).
         if view.result == "ouvrir":
             reward = await roll_coffre_reward(character_id, channel.guild, rarete)
-            await channel.send(embed=daily_coffre_summary_embed(1, rarete, [reward]))
+            if reward["ok"]:
+                await channel.send(embed=daily_coffre_summary_embed(1, rarete, [reward]))
+            else:
+                # Échec d'application : on CONSERVE le coffre dans l'inventaire (jamais perdu).
+                item = db.get_coffre_item_by_rarete(rarete)
+                if item is not None:
+                    db.inv_add_item(character_id, item["id"], 1)
+                await channel.send(
+                    f"⚠️ Impossible d'ouvrir ce coffre {label} : {reward['error']}\n"
+                    "Il a été **conservé dans ton inventaire**, réessaie plus tard.")
         else:
             from cogs.utils.rewards import apply_vip_booster_multiplier
             item = db.get_coffre_item_by_rarete(rarete)

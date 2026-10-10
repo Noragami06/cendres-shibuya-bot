@@ -714,7 +714,8 @@ CREATE TABLE IF NOT EXISTS giveaways (
     organisateur_id INTEGER,
     owner_cheat_decision TEXT,    -- NULL / 'oui' / 'non', rempli après la question discrète en MP
     reroll_count INTEGER DEFAULT 0,  -- nombre de reroll déjà enchaînés depuis le giveaway d'origine
-    origin_giveaway_id INTEGER       -- id du giveaway d'origine (NULL pour un giveaway initial)
+    origin_giveaway_id INTEGER,      -- id du giveaway d'origine (NULL pour un giveaway initial)
+    claim_relaunch_count INTEGER DEFAULT 0  -- nombre de relances de claims (§3)
 );
 
 CREATE TABLE IF NOT EXISTS giveaway_participants (
@@ -753,6 +754,38 @@ CREATE TABLE IF NOT EXISTS character_stat_locks (
     locked_at TEXT,
     locked_by INTEGER,
     PRIMARY KEY (character_id, stat)
+);
+
+-- Journal d'ouverture de coffre : trace de CE qui a été tiré et s'il a été réellement appliqué.
+CREATE TABLE IF NOT EXISTS chest_open_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id INTEGER,
+    rarete TEXT,
+    reward_json TEXT,
+    applied INTEGER,        -- 1 = récompense appliquée, 0 = échec (coffre conservé)
+    error TEXT,
+    opened_at TEXT
+);
+
+-- Synchronisation fiches<-rôles : journal des corrections appliquées (pour revenir en arrière).
+CREATE TABLE IF NOT EXISTS fiche_sync_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id INTEGER,
+    champ TEXT,
+    ancienne_valeur TEXT,
+    nouvelle_valeur TEXT,
+    date TEXT
+);
+
+-- Distribution de récompenses de giveaway PERSISTANTE (survit aux redémarrages, chrono gelé hors-ligne).
+CREATE TABLE IF NOT EXISTS giveaway_claim_state (
+    giveaway_id INTEGER PRIMARY KEY,
+    session TEXT,                 -- 'tour1' / 'tour2' / 'relance'
+    current_index INTEGER,
+    current_participant_id INTEGER,
+    claim_deadline_at TEXT,
+    dm_channel_id INTEGER,
+    dm_message_id INTEGER
 );
 """
 
@@ -925,6 +958,8 @@ def _ensure_giveaways_columns(conn):
         conn.execute("ALTER TABLE giveaways ADD COLUMN reroll_count INTEGER DEFAULT 0")
     if "origin_giveaway_id" not in cols:
         conn.execute("ALTER TABLE giveaways ADD COLUMN origin_giveaway_id INTEGER")
+    if "claim_relaunch_count" not in cols:
+        conn.execute("ALTER TABLE giveaways ADD COLUMN claim_relaunch_count INTEGER DEFAULT 0")
 
 
 # Coffres (/daily) : 1 objet par rareté, catégorie « Coffre », prix NULL (jamais achetable — obtenu
@@ -1295,6 +1330,25 @@ def get_owned_coffres(character_id: int):
             "ORDER BY item.id",
             (character_id,),
         ).fetchall()
+
+
+def fiche_sync_log_add(character_id: int, champ: str, ancienne, nouvelle, date: str):
+    """Journalise une correction de fiche (synchronisation fiches<-rôles), pour pouvoir revenir en arrière."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO fiche_sync_log (character_id, champ, ancienne_valeur, nouvelle_valeur, date) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (character_id, champ, None if ancienne is None else str(ancienne),
+             None if nouvelle is None else str(nouvelle), date))
+
+
+def chest_open_log_add(character_id: int, rarete, reward_json: str, applied, error, opened_at: str):
+    """Journalise une ouverture de coffre (ce qui a été tiré + succès/échec de l'application)."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO chest_open_log (character_id, rarete, reward_json, applied, error, opened_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (character_id, rarete, reward_json, 1 if applied else 0, error, opened_at))
 
 
 def inv_add_item(character_id: int, item_id: int, qty: int):
@@ -4093,6 +4147,47 @@ def giveaway_try_mark_applied(participant_id: int) -> bool:
             "UPDATE giveaway_participants SET reward_applied = 1 "
             "WHERE id = ? AND reward_applied = 0", (participant_id,))
         return cur.rowcount == 1
+
+
+def giveaway_claim_state_set(giveaway_id, session, current_index, current_participant_id,
+                             claim_deadline_at, dm_channel_id, dm_message_id):
+    """Pose/replace l'état de distribution courant d'un giveaway (persistant, survit au redémarrage)."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO giveaway_claim_state "
+            "(giveaway_id, session, current_index, current_participant_id, claim_deadline_at, "
+            " dm_channel_id, dm_message_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (giveaway_id, session, current_index, current_participant_id, claim_deadline_at,
+             dm_channel_id, dm_message_id))
+
+
+def giveaway_claim_state_get(giveaway_id):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM giveaway_claim_state WHERE giveaway_id = ?", (giveaway_id,)).fetchone()
+
+
+def giveaway_claim_state_all():
+    with get_connection() as conn:
+        return conn.execute("SELECT * FROM giveaway_claim_state").fetchall()
+
+
+def giveaway_claim_state_delete(giveaway_id):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM giveaway_claim_state WHERE giveaway_id = ?", (giveaway_id,))
+
+
+def giveaway_claim_state_set_deadline(giveaway_id, claim_deadline_at):
+    with get_connection() as conn:
+        conn.execute("UPDATE giveaway_claim_state SET claim_deadline_at = ? WHERE giveaway_id = ?",
+                     (claim_deadline_at, giveaway_id))
+
+
+def giveaway_increment_claim_relaunch(giveaway_id):
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE giveaways SET claim_relaunch_count = COALESCE(claim_relaunch_count, 0) + 1 "
+            "WHERE id = ?", (giveaway_id,))
 
 
 def giveaway_set_reward_applied(participant_id: int, value: int):

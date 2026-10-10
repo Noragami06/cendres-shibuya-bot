@@ -1141,14 +1141,27 @@ class Inventaire(commands.Cog):
                 await channel.send("⏳ Ouverture annulée.")
                 return
 
-            # 3-4. Ouvre chaque coffre (récompense cumulée), puis retire du stock.
-            rewards = []
+            # 3-4. Ouvre chaque coffre : on applique la récompense, on vérifie le résultat, et on ne
+            # consomme le coffre (−1) QU'EN CAS DE SUCCÈS. Un échec laisse le coffre en stock.
+            rewards_ok, failures = [], []
             for _ in range(nb):
-                rewards.append(await roll_coffre_reward(character_id, channel.guild, rarete))
-            db.inv_remove_item(character_id, coffre["item_id"], nb)
+                r = await roll_coffre_reward(character_id, channel.guild, rarete)
+                if r["ok"]:
+                    db.inv_remove_item(character_id, coffre["item_id"], 1)
+                    rewards_ok.append(r)
+                else:
+                    failures.append(r)
 
-            # 5. Récapitulatif agrégé.
-            await channel.send(embed=daily_coffre_summary_embed(nb, rarete, rewards))
+            # 5. Récapitulatif : uniquement ce qui a VRAIMENT été appliqué.
+            if rewards_ok:
+                await channel.send(embed=daily_coffre_summary_embed(len(rewards_ok), rarete, rewards_ok))
+            if failures:
+                raisons = "; ".join(sorted({f["error"] or "échec inconnu" for f in failures}))
+                await channel.send(
+                    f"⚠️ **{len(failures)}** coffre(s) {label} non ouvert(s) et **conservé(s)** dans ton "
+                    f"inventaire : {raisons}")
+            if not rewards_ok and not failures:
+                await channel.send("Aucun coffre ouvert.")
         finally:
             self._release(user_id)
 
