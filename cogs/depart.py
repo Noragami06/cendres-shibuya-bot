@@ -4973,7 +4973,7 @@ class Depart(commands.Cog):
     MODIF_MENU_TEXT = (
         "**1.** Prénom\n**2.** Nom\n**3.** Âge\n**4.** Histoire\n**5.** Camp\n**6.** Clan\n"
         "**7.** Sort\n**8.** Classe de l'EO\n**9.** Quantité de l'EO\n**10.** Nature\n"
-        "**11.** RCT\n**12.** Grade")
+        "**11.** RCT\n**12.** Grade\n**13.** Image du personnage")
 
     @staticmethod
     def _modif_camp_display(camp):
@@ -5336,10 +5336,105 @@ class Depart(commands.Cog):
                     await sync_role_points(cid, "grade", new_rid, bot=self.bot)
             return "Grade", old, effective_grade, apply
 
+        # --- 13. Image du personnage (portrait_path) ---
+        if element == 13:
+            slot = char["slot_number"] or 1
+            owner_id = char["user_id"]
+            new_path = None
+            while True:
+                msg = await self._modif_wait_message(
+                    channel, staff,
+                    "📷 Envoie la **nouvelle image** du personnage (pièce jointe **JPG/PNG**, pas de GIF), "
+                    "ou « annuler ».")
+                if msg is None:
+                    return None
+                att, err = self._modif_valid_image_attachment(msg)
+                if att is None:
+                    await channel.send(f"❌ {err} Réessaie.")
+                    continue
+                # On télécharge les OCTETS et on enregistre le fichier TOUT DE SUITE (avant toute
+                # suppression de message) : jamais d'URL conservée, uniquement le fichier local.
+                raw = await _download_image_bytes(att.url)
+                if raw is None:
+                    await channel.send("❌ Téléchargement impossible, réessaie avec un autre fichier.")
+                    continue
+                try:
+                    jpeg = compress_portrait(raw)
+                except Exception:
+                    await channel.send("❌ Image illisible ou corrompue, réessaie avec un autre fichier.")
+                    continue
+                os.makedirs(PORTRAIT_DIR, exist_ok=True)
+                # Nom UNIQUE : n'écrase JAMAIS l'ancien portrait (conservé pour un retour en arrière).
+                new_path = os.path.join(PORTRAIT_DIR, f"{owner_id}_{slot}_{uuid.uuid4().hex}.jpg")
+                with open(new_path, "wb") as f:
+                    f.write(jpeg)
+                break
+
+            old_path = char["portrait_path"]
+            compare = self._build_portrait_compare(old_path, new_path)
+            confirm_desc = (
+                f"**{char['character_name']}** (Slot {slot}) — <@{owner_id}>\n"
+                "Ancienne image (gauche) → nouvelle image (droite). Confirmer le changement ?")
+
+            async def apply():
+                # UPDATE simple ; en cas d'échec, l'ancien portrait reste et le nouveau fichier est
+                # supprimé (pas de try/except silencieux : l'erreur est relevée à l'appelant).
+                try:
+                    db.update_validated_fields(cid, portrait_path=new_path)
+                except Exception:
+                    if new_path and os.path.exists(new_path):
+                        os.remove(new_path)
+                    raise
+
+            # Tuple étendu : [5] = fichier à supprimer si NON confirmé (orphelin), [6] = image de
+            # comparaison (temporaire, attachée à l'embed de confirmation puis supprimée).
+            return ("Image du personnage", old_path or "—", new_path, apply, confirm_desc,
+                    new_path, compare)
+
         return None
 
-    async def _modif_log(self, guild, staff, char, element_label, old_display, new_display):
-        """Poste un embed de log par modification CONFIRMÉE dans le salon dédié (créé à la volée)."""
+    @staticmethod
+    def _modif_valid_image_attachment(msg):
+        """Retourne (attachment, None) si le message porte une image JPG/PNG valide, sinon (None, raison).
+        Mêmes règles que /depart : JPG/PNG acceptés, GIF refusé."""
+        for att in msg.attachments:
+            name = (att.filename or "").lower()
+            if name.endswith(".gif"):
+                return None, "Les GIF ne sont pas acceptés (JPG ou PNG uniquement)."
+            if name.endswith(IMAGE_EXT_OK):
+                return att, None
+        if msg.attachments:
+            return None, "Pièce jointe non reconnue comme image JPG/PNG."
+        return None, "Aucune pièce jointe trouvée (envoie l'image EN pièce jointe)."
+
+    def _build_portrait_compare(self, old_path, new_path):
+        """Construit une image de comparaison « ancienne | nouvelle » (temp .png) pour la confirmation."""
+        from PIL import ImageDraw, ImageOps
+        cell = 480
+        gap, top = 24, 36
+        canvas = Image.new("RGB", (cell * 2 + gap * 3, cell + top + gap), (26, 26, 30))
+        draw = ImageDraw.Draw(canvas)
+
+        def _paste(path, x, titre):
+            draw.text((x, 8), titre, fill=(235, 235, 235))
+            if path and os.path.exists(path):
+                im = ImageOps.fit(Image.open(path).convert("RGB"), (cell, cell), Image.LANCZOS)
+                canvas.paste(im, (x, top))
+            else:
+                draw.rectangle((x, top, x + cell, top + cell), fill=(55, 55, 60))
+                draw.text((x + cell // 2 - 30, top + cell // 2), "(aucune)", fill=(190, 190, 190))
+
+        _paste(old_path, gap, "Ancienne")
+        _paste(new_path, gap * 2 + cell, "Nouvelle")
+        os.makedirs(os.path.join(os.path.dirname(__file__), "..", "temp"), exist_ok=True)
+        out = os.path.join(os.path.dirname(__file__), "..", "temp", f"modif_compare_{uuid.uuid4().hex}.png")
+        canvas.save(out, "PNG")
+        return out
+
+    async def _modif_log(self, guild, staff, char, element_label, old_display, new_display,
+                         attach_path=None):
+        """Poste un embed de log par modification CONFIRMÉE dans le salon dédié (créé à la volée).
+        `attach_path` : si fourni (option Image), joint ce fichier au log (nouvelle image conservée)."""
         try:
             log_channel = await get_or_create_modification_logs_channel(guild)
         except discord.HTTPException:
@@ -5353,8 +5448,12 @@ class Depart(commands.Cog):
                 f"**Modifié par :** {staff.mention}\n"
                 f"**{element_label}** : {old_display} → {new_display}"),
             color=discord.Color.orange())
+        files = []
+        if attach_path and os.path.exists(attach_path):
+            embed.set_image(url="attachment://nouvelle_image.png")
+            files = [discord.File(attach_path, filename="nouvelle_image.png")]
         try:
-            await log_channel.send(embed=embed)
+            await log_channel.send(embed=embed, files=files)
         except discord.HTTPException:
             pass
 
@@ -5400,12 +5499,12 @@ class Depart(commands.Cog):
             choix = await self._reroll_wait_text(
                 channel, staff,
                 f"**Modification {i}/{n}** — quel élément corriger ?\n{self.MODIF_MENU_TEXT}\n"
-                "Réponds par un numéro (1-12), ou « annuler ».")
+                "Réponds par un numéro (1-13), ou « annuler ».")
             if choix is None:
                 cancelled += 1
                 continue  # annulé -> compte comme une des N modifications
-            if not (choix.strip().isdigit() and 1 <= int(choix.strip()) <= 12):
-                await channel.send("Numéro invalide (1-12). Cette modification est passée.")
+            if not (choix.strip().isdigit() and 1 <= int(choix.strip()) <= 13):
+                await channel.send("Numéro invalide (1-13). Cette modification est passée.")
                 cancelled += 1
                 continue
 
@@ -5416,25 +5515,51 @@ class Depart(commands.Cog):
             label, old_display, new_display, apply = prepared[:4]
             # 5e élément optionnel : texte de confirmation personnalisé (ex. avertissement changement de clan).
             confirm_override = prepared[4] if len(prepared) > 4 else None
+            pending_file = prepared[5] if len(prepared) > 5 else None   # orphelin à supprimer si NON confirmé
+            confirm_img = prepared[6] if len(prepared) > 6 else None     # image de comparaison (temporaire)
 
-            # Confirmation AVANT l'UPDATE.
+            def _cleanup(*paths):
+                for p in paths:
+                    if p and os.path.exists(p):
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+
+            # Confirmation AVANT l'UPDATE (avec image de comparaison pour l'option Image).
             emb = discord.Embed(
                 title="⚠️ Confirmes-tu ce changement ?",
                 description=confirm_override or f"**{label}** : {old_display} → {new_display}",
                 color=discord.Color.gold())
+            files = []
+            if confirm_img and os.path.exists(confirm_img):
+                emb.set_image(url="attachment://compare.png")
+                files = [discord.File(confirm_img, filename="compare.png")]
             view = _ModifConfirmView(staff.id)
-            await channel.send(embed=emb, view=view)
+            await channel.send(embed=emb, view=view, files=files)
             await view.wait()
             if view.value != "confirm":
                 await channel.send("❌ Modification annulée (elle compte quand même dans le total).")
                 cancelled += 1
+                _cleanup(pending_file, confirm_img)  # pas de fichier orphelin
                 continue
 
-            # Appliquée : UPDATE + rôles/sync, refresh de la copie locale, puis log dédié.
-            await apply()
+            # Appliquée : UPDATE + rôles/sync. Aucun try/except silencieux : en cas d'échec, l'ancienne
+            # valeur reste, le nouveau fichier est supprimé par apply(), et l'erreur est affichée.
+            try:
+                await apply()
+            except Exception as e:
+                await channel.send(f"❌ Échec de l'application de « {label} » : {e!r}. Changement ignoré.")
+                _cleanup(pending_file, confirm_img)
+                cancelled += 1
+                continue
+            _cleanup(confirm_img)  # l'image de comparaison temp n'est plus utile (le nouveau portrait reste)
             char = db.get_validated_character_by_id(char["id"])
             applied.append((label, old_display, new_display))
-            await self._modif_log(guild, staff, char, label, old_display, new_display)
+            # Pour l'option Image : on joint la NOUVELLE image au log (traçabilité + retour arrière).
+            await self._modif_log(
+                guild, staff, char, label, old_display, new_display,
+                attach_path=(pending_file if label == "Image du personnage" else None))
 
         # Application finale : réédite/repost l'embed de fiche (image intégrée), comme /reroll.
         # On EXPLOITE le statut retourné (comme /reroll) : sinon un échec d'édition (salon introuvable,

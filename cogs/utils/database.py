@@ -2180,7 +2180,8 @@ def update_validated_fields(character_id: int, **fields):
     N'accepte qu'une liste blanche de colonnes pour éviter toute injection via un nom de champ."""
     allowed = {"clan", "sort", "eo_classe", "eo_value", "rct", "grade",
                "recompense_type", "recompense_detail",
-               "camp", "nature", "character_name", "prenom", "nom", "age", "histoire"}
+               "camp", "nature", "character_name", "prenom", "nom", "age", "histoire",
+               "portrait_path"}
     cols = {k: v for k, v in fields.items() if k in allowed}
     if not cols:
         return
