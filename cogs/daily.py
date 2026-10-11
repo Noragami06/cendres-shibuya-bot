@@ -17,7 +17,7 @@ from cogs.utils import database as db
 from cogs.utils.image_gen import generate_daily_enemy_image, generate_coffre_image
 from cogs.utils.combat_engine import (
     run_combat, resolve_exchange, init_combat_fields, estimate_win_rate, DAILY_CRIT_RESET_VALUE,
-    renforcement_bonus, apply_damage_cap, apply_renf_wear,
+    renforcement_bonus, apply_damage_cap, apply_renf_wear, renf_attacks_left,
 )
 from cogs.banque import get_characters, get_character, credit_compte_courant, PHOENIX_COLOR
 
@@ -79,6 +79,9 @@ DAILY_EO_POTION_EFFECT = {
 
 DAILY_DAMAGE_RATIO = 0.10  # dégâts = force_actuelle * 0.10 (10 Force = 1 dégât), aucun aléatoire, 2 camps
 DAILY_STAT_GAIN_PAR_BOUTON = 2  # §2 : points de stats gagnés par utilisation d'un bouton de combat
+# §A6 : facteur appliqué à l'EO du joueur quand un PNJ strictement supérieur se renforce en réaction
+# (un seul tirage par déclenchement, 1 chance sur 3 chacun).
+DAILY_PNJ_RENF_FACTEURS = [1.00, 1.10, 1.15]
 
 # §2 : critique « Black Flash » (JOUEUR uniquement, action Attaquer). Chance de départ 10%, dégâts ×3.
 DAILY_CRIT_BASE = 10
@@ -707,6 +710,7 @@ def generate_pnj_daily(player_stats: dict, classe_pnj: str, classe_joueur: str) 
     return {
         "name": generate_pnj_name(),
         "classe": classe_pnj,
+        "classe_joueur": classe_joueur,  # §A6/A7 : sert à savoir si le PNJ est strictement supérieur
         "pv_max": max(1, round(player_stats["pv"] * mult_pv)),
         "eo_max": max(0, round(player_stats["eo"] * mult_stats)),
         "force": s(player_stats["force"]),
@@ -794,6 +798,65 @@ class DailyChoiceView(discord.ui.View):
             await interaction.response.edit_message(view=None)
             self.stop()
         return cb
+
+
+class _OpenCountModal(discord.ui.Modal):
+    """§10 (B10c) : victoire VIP/Booster — modal demandant combien de coffres ouvrir (1 ou 2).
+    1 => ouvre le premier et stocke le second ; 2 => ouvre les deux. Entrée invalide : erreur éphémère,
+    la vue reste active (le joueur peut recliquer sur Ouvrir)."""
+
+    def __init__(self, parent_view):
+        super().__init__(title="Combien de coffres ouvrir ?")
+        self.parent_view = parent_view
+        self.nb = discord.ui.TextInput(
+            label="Nombre de coffres à ouvrir (1 ou 2)",
+            placeholder="1 ou 2", min_length=1, max_length=1, required=True)
+        self.add_item(self.nb)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        val = (self.nb.value or "").strip()
+        if val not in ("1", "2"):
+            await interaction.response.send_message(
+                "Entrée invalide : indique **1** ou **2**.", ephemeral=True)
+            return  # la vue reste active : le joueur peut recliquer sur Ouvrir.
+        self.parent_view.result = "ouvrir"
+        self.parent_view.nb_ouvrir = int(val)
+        await interaction.response.defer()
+        try:
+            if self.parent_view.message is not None:
+                await self.parent_view.message.edit(view=None)
+        except discord.HTTPException:
+            pass
+        self.parent_view.stop()
+
+
+class _DoubleCoffreView(discord.ui.View):
+    """§10 (B10b/c) : victoire VIP/Booster — 2 coffres. Stocker (les 2 -> inventaire) OU Ouvrir
+    (ouvre un modal demandant 1 ou 2). Anti-double-clic : la vue s'arrête au premier choix validé ;
+    re-vérifie le propriétaire à chaque interaction."""
+
+    def __init__(self, owner_id, timeout=180):
+        super().__init__(timeout=timeout)
+        self.owner_id = owner_id
+        self.message = None
+        self.result = None    # "stocker" | "ouvrir"
+        self.nb_ouvrir = 0    # 1 ou 2 (uniquement si result == "ouvrir")
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Ce combat ne t'appartient pas.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Stocker", emoji="📦", style=discord.ButtonStyle.secondary)
+    async def stocker(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.result = "stocker"
+        await interaction.response.edit_message(view=None)
+        self.stop()
+
+    @discord.ui.button(label="Ouvrir", emoji="🔓", style=discord.ButtonStyle.success)
+    async def ouvrir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(_OpenCountModal(self))
 
 
 # =====================================================================
@@ -1244,6 +1307,14 @@ class Daily(commands.Cog):
             "renf_bonus_force_j": 0.0, "renf_bonus_def_j": 0.0,       # bonus actifs
             "renf_total_eo_force_j": 0, "renf_total_eo_def_j": 0,     # cumul EO investi (dégressif)
             "renf_usure_force_j": None, "renf_usure_def_j": None,     # nombre d'usure FIXE (§1)
+            # §A6/A7 : PNJ strictement supérieur -> Renforcement en réaction + Black Flash.
+            "pnj_superior": DAILY_CLASSE_RANK[pnj["classe"]] > DAILY_CLASSE_RANK.get(
+                pnj.get("classe_joueur"), 99),
+            "crit_chance_p": DAILY_CRIT_RESET_VALUE, "crit_echecs_p": 0,
+            "renf_bonus_force_p": 0.0, "renf_bonus_def_p": 0.0,
+            "renf_total_eo_force_p": 0, "renf_total_eo_def_p": 0,
+            "renf_usure_force_p": None, "renf_usure_def_p": None,
+            "pnj_renf_trigger": None,
         }
         init_combat_fields(st)  # crit_echecs_j, block_pending_j/p, last_action_j/p
         gains = {"force": 0, "endurance": 0, "energie_occulte": 0, "sorts": 0}
@@ -1327,10 +1398,9 @@ class Daily(commands.Cog):
             desc = (
                 preambule
                 + f"PV : **{max(st['pv_j'], DAILY_PV_FLOOR):,}** · Énergie occulte : **{st['eo_j']:,}**"
-                + (f"\n🔮 Renforcement Force : +{int(round(st['renf_bonus_force_j']))} (s'use à chaque Attaque)"
-                   if (st.get("renf_bonus_force_j", 0) or 0) > 0 else "")
-                + (f"\n🛡️ Renforcement Défense : +{int(round(st['renf_bonus_def_j']))} (s'use à chaque Attaque)"
-                   if (st.get("renf_bonus_def_j", 0) or 0) > 0 else "")
+                + ((f"\n🔮 Renforcement actif : +{int(round(st.get('renf_bonus_force_j', 0) or 0))} Force / "
+                    f"+{int(round(st.get('renf_bonus_def_j', 0) or 0))} Défense, encore "
+                    f"{renf_attacks_left(st, 'j')} attaque(s)") if renf_actif else "")
                 + "\n\n⚡ **Critique (Black Flash)**\n"
                 f"Chance actuelle : **{st.get('crit_chance_j', DAILY_CRIT_RESET_VALUE)}%**\n"
                 "À chaque échec : 5%, puis 10%, puis +1%/échec. Une réussite retombe à 1% et inflige "
@@ -1348,6 +1418,13 @@ class Daily(commands.Cog):
                                   int(round(st.get("renf_bonus_force_j", 0) or 0)))
 
             if act == "renfort":
+                # §5 : VERROU — refus serveur si un Renforcement est déjà actif (ancien message / double clic).
+                if renf_actif:
+                    n = renf_attacks_left(st, "j")
+                    await channel.send(
+                        f"🔒 Ton Renforcement est encore actif (encore {n} attaque(s)). "
+                        "Tu pourras te renforcer à nouveau quand il sera terminé.")
+                    continue
                 # §1 : le coût en EO reste plein, mais le BONUS de Force est DÉGRESSIF sur le total cumulé
                 # investi en Renforcement (empêche le one-shot à 1 EO = 1 Force). Ce bonus est PERSISTANT
                 # mais s'USE de 10 % à chaque Attaque (apply_renf_wear).
@@ -1367,6 +1444,9 @@ class Daily(commands.Cog):
                 st["renf_bonus_force_j"] += delta
                 st["renf_total_eo_force_j"] = nouveau_total
                 st["renf_usure_force_j"] = None                    # recalcul de l'usure au prochain Attaque
+                # §A6 : un PNJ supérieur se renforcera en réaction (mirror des EO investies par le joueur).
+                st["pnj_renf_trigger"] = {"force": st["renf_total_eo_force_j"],
+                                          "def": st["renf_total_eo_def_j"]}
                 gains["energie_occulte"] += 1  # §9 : renforcement utilisé = +points EO (compté à la fin)
                 await channel.send(
                     f"🔮 +{int(round(delta))} Force (renforcement maudit, rendement dégressif ; "
@@ -1418,9 +1498,11 @@ class Daily(commands.Cog):
         n'est PAS débitée ici (elle ne l'est, dans resolve_exchange, que si le blocage classique échoue)."""
         endurance = (db.get_stat_base_pts(character_id, "endurance")
                      + db.sum_buff_points(character_id, "endurance"))
+        # §5 VERROU : on ne propose « me renforcer » que si AUCUN Renforcement (Force/Défense) n'est actif.
+        renf_actif = (st.get("renf_bonus_force_j", 0) or 0) > 0 or (st.get("renf_bonus_def_j", 0) or 0) > 0
         # §1 : le Renforcement de Défense devient un bonus PERSISTANT (dégressif, EO payé d'avance) qui
         # amortit CHAQUE défense tant qu'il est actif et s'USE de 10 % à chaque Attaque (comme la Force).
-        if st["eo_j"] > 0:
+        if st["eo_j"] > 0 and not renf_actif:
             view = DailyChoiceView(user.id, [
                 ("oui", "Oui, me renforcer", "🔮", discord.ButtonStyle.primary),
                 ("non", "Non, garde simple", "🛡️", discord.ButtonStyle.secondary)])
@@ -1439,6 +1521,9 @@ class Daily(commands.Cog):
                     st["renf_bonus_def_j"] += (nouveau_bonus - st["renf_bonus_def_j"])
                     st["renf_total_eo_def_j"] = nouveau_total
                     st["renf_usure_def_j"] = None
+                    # §A6 : déclenche le Renforcement en réaction d'un PNJ supérieur (mirror des EO).
+                    st["pnj_renf_trigger"] = {"force": st["renf_total_eo_force_j"],
+                                              "def": st["renf_total_eo_def_j"]}
                     await channel.send(
                         f"🛡️ Renforcement de Défense : +{int(round(nouveau_bonus))} "
                         "(amortit chaque coup reçu, s'use à chaque Attaque).")
@@ -1613,6 +1698,24 @@ class Daily(commands.Cog):
             st["eo_p"] = min(st["eo_max_p"], st["eo_p"] + restore)
             st["potions_p"] -= 1
 
+        # §A6 : PNJ STRICTEMENT SUPÉRIEUR -> Renforcement en RÉACTION au joueur (dégressif + verrou + usure),
+        # qui REMPLACE le renfort ponctuel ci-dessous. Les PNJ de classe <= joueur gardent l'ancien comportement.
+        if st.get("pnj_superior"):
+            self._pnj_superior_maybe_renforce(st)
+            choix = weighted_pick(DAILY_PNJ_WEIGHTS[classe])
+            if choix == "renforcement":
+                choix = "attaquer"  # le PNJ supérieur ne « renforce » plus ponctuellement : il mirror le joueur
+            f_act = current_force(st["force_base_p"], st["pv_p"], st["pv_max_p"],
+                                  int(round(st.get("renf_bonus_force_p", 0) or 0)))
+            if choix == "attaquer":
+                action = {"kind": "attaquer", "attacking": True, "damage": physical_damage(f_act),
+                          "dtype": "phys", "blocking": False, "force_actuelle": f_act}
+                from cogs.utils.combat_engine import apply_renf_wear
+                apply_renf_wear(st, "p")  # usure des bonus du PNJ à chaque attaque
+                return action
+            return {"kind": "defendre", "attacking": False, "damage": 0, "dtype": None, "blocking": True,
+                    "force_actuelle": f_act, "def_reinforce": 0, "def_endurance": 0}
+
         bonus_force = 0
         choix = weighted_pick(DAILY_PNJ_WEIGHTS[classe])
         if choix == "renforcement" and st["eo_p"] > 0:
@@ -1640,6 +1743,44 @@ class Daily(commands.Cog):
             def_reinforce = random.randint(0, cap)
         return {"kind": "defendre", "attacking": False, "damage": 0, "dtype": None, "blocking": True,
                 "force_actuelle": f_act, "def_reinforce": def_reinforce, "def_endurance": 0}
+
+    def _pnj_superior_maybe_renforce(self, st):
+        """§A6 : un PNJ strictement supérieur se renforce quand le joueur vient de se renforcer (trigger),
+        dans les MÊMES domaines (Force/Défense), EO = EO investie par le joueur × facteur (1/1.10/1.15),
+        bornée à sa réserve (proportionnelle si insuffisante). Verrou : rien tant qu'un bonus PNJ est actif."""
+        trigger = st.get("pnj_renf_trigger")
+        if not trigger:
+            return
+        # Verrou : pas de nouveau Renforcement tant qu'un bonus du PNJ est encore actif.
+        if (st.get("renf_bonus_force_p", 0) or 0) > 0 or (st.get("renf_bonus_def_p", 0) or 0) > 0:
+            return
+        st["pnj_renf_trigger"] = None  # consommé (un seul déclenchement par Renforcement du joueur)
+        factor = random.choice(DAILY_PNJ_RENF_FACTEURS)
+        voulu_force = int(round(trigger.get("force", 0) * factor))
+        voulu_def = int(round(trigger.get("def", 0) * factor))
+        voulu_total = voulu_force + voulu_def
+        if voulu_total <= 0:
+            return
+        dispo = st["eo_p"]
+        if dispo < 1:
+            return
+        # Bornage à la réserve d'EO, en conservant la PROPORTION entre domaines si elle ne suffit pas.
+        if voulu_total > dispo:
+            ratio = dispo / voulu_total
+            voulu_force = int(voulu_force * ratio)
+            voulu_def = int(voulu_def * ratio)
+        depense = voulu_force + voulu_def
+        if depense < 1:
+            return
+        st["eo_p"] -= depense
+        if voulu_force > 0:
+            st["renf_total_eo_force_p"] = st.get("renf_total_eo_force_p", 0) + voulu_force
+            st["renf_bonus_force_p"] = renforcement_bonus(st["renf_total_eo_force_p"])
+            st["renf_usure_force_p"] = None
+        if voulu_def > 0:
+            st["renf_total_eo_def_p"] = st.get("renf_total_eo_def_p", 0) + voulu_def
+            st["renf_bonus_def_p"] = renforcement_bonus(st["renf_total_eo_def_p"])
+            st["renf_usure_def_p"] = None
 
     # ---------- §7 : résolution d'un tour ----------
     # NOTE : la résolution d'un échange est centralisée dans cogs/utils/combat_engine.resolve_exchange,
@@ -1750,6 +1891,9 @@ class Daily(commands.Cog):
         recap = "\n".join(f"• +{v} points {stat_labels[k]}" for k, v in applied.items()) or "Aucun point gagné."
         recap += f"\n• +{xp_gagnee:,} XP".replace(",", " ")
         recap += f"\n🎁 +{bonus_libre} points à répartir librement"
+        # §10 (B10a) : mention explicite du doublement VIP/Booster sur points / XP / points à répartir.
+        if apply_vip_booster_multiplier(user, 1) > 1:
+            recap += "\n✨ *Bonus VIP/Booster ×2 appliqué*"
         if issue == "victoire":
             coffres = ", ".join(DAILY_COFFRE_LABELS[k] for k in DAILY_COFFRE_KEYS
                                 if DAILY_COFFRE_ACCESS.get(classe, {}).get(k))
@@ -1775,14 +1919,25 @@ class Daily(commands.Cog):
             rarete = weighted_pick(DAILY_COFFRE_ACCESS[classe])
             await self._offer_coffre(channel, user, character_id, rarete)
 
-    # ---------- §2 : coffre obtenu à la victoire ----------
+    # ---------- §2 / §10 : coffre(s) obtenu(s) à la victoire ----------
     async def _offer_coffre(self, channel, user, character_id, rarete):
+        """§10 (B10b) : VIP/Booster gagnent 2 coffres de victoire, sinon 1. Le choix (Stocker / Ouvrir)
+        est proposé AVANT tout crédit d'inventaire, et réutilise le même mécanisme non persistant (vue en
+        session, timeout -> on stocke, jamais de perte)."""
+        from cogs.utils.rewards import multiplier_for_character
+        nb = multiplier_for_character(channel.guild, character_id)  # 1, ou 2 pour VIP/Booster
+        if nb >= 2:
+            await self._offer_coffre_double(channel, user, character_id, rarete)
+        else:
+            await self._offer_coffre_simple(channel, user, character_id, rarete)
+
+    async def _send_coffre_image(self, channel, user, rarete, nombre):
+        """Message texte + image du coffre (facteur partagé entre le flux simple et le flux double)."""
         import os
         import uuid
         label = DAILY_COFFRE_LABELS[rarete]
-        # Message TEXTE classique (pas embed).
-        await channel.send(f"**{user.mention}, tu as obtenu un coffre {label} !**")
-        # Image du coffre sous le message.
+        sfx = f" (×{nombre})" if nombre > 1 else ""
+        await channel.send(f"**{user.mention}, tu as obtenu un coffre {label}{sfx} !**")
         os.makedirs("temp", exist_ok=True)
         path = os.path.join("temp", f"coffre_{rarete}_{uuid.uuid4().hex}.png")
         generate_coffre_image(rarete, path)
@@ -1791,7 +1946,26 @@ class Daily(commands.Cog):
             os.remove(path)
         except OSError:
             pass
-        # 2 boutons sous l'image.
+
+    def _store_coffre(self, character_id, rarete, qty):
+        """Ajoute `qty` coffre(s) de cette rareté à l'inventaire (jamais perdu)."""
+        item = db.get_coffre_item_by_rarete(rarete)
+        if item is not None and qty > 0:
+            db.inv_add_item(character_id, item["id"], qty)
+        return item
+
+    async def _open_one_coffre(self, channel, user, character_id, rarete):
+        """Ouvre UN coffre via roll_coffre_reward (contenu ×2 déjà géré pour VIP/Booster). En cas
+        d'échec d'application, conserve le coffre dans l'inventaire. Renvoie le dict de récompense."""
+        reward = await roll_coffre_reward(character_id, channel.guild, rarete)
+        if not reward["ok"]:
+            self._store_coffre(character_id, rarete, 1)
+        return reward
+
+    async def _offer_coffre_simple(self, channel, user, character_id, rarete):
+        """Flux historique : 1 coffre, Stocker / Ouvrir (non persistant)."""
+        label = DAILY_COFFRE_LABELS[rarete]
+        await self._send_coffre_image(channel, user, rarete, 1)
         view = DailyChoiceView(user.id, [
             ("stocker", "Stocker", "📦", discord.ButtonStyle.secondary),
             ("ouvrir", "Ouvrir", "🔓", discord.ButtonStyle.success),
@@ -1800,25 +1974,54 @@ class Daily(commands.Cog):
         await view.wait()
         # Timeout -> on stocke par défaut (ne jamais perdre le coffre gagné).
         if view.result == "ouvrir":
-            reward = await roll_coffre_reward(character_id, channel.guild, rarete)
+            reward = await self._open_one_coffre(channel, user, character_id, rarete)
             if reward["ok"]:
                 await channel.send(embed=daily_coffre_summary_embed(1, rarete, [reward]))
             else:
-                # Échec d'application : on CONSERVE le coffre dans l'inventaire (jamais perdu).
-                item = db.get_coffre_item_by_rarete(rarete)
-                if item is not None:
-                    db.inv_add_item(character_id, item["id"], 1)
                 await channel.send(
                     f"⚠️ Impossible d'ouvrir ce coffre {label} : {reward['error']}\n"
                     "Il a été **conservé dans ton inventaire**, réessaie plus tard.")
         else:
-            from cogs.utils.rewards import apply_vip_booster_multiplier
-            item = db.get_coffre_item_by_rarete(rarete)
-            qty = apply_vip_booster_multiplier(user, 1)  # VIP/Booster : 1 coffre stocké -> 2
-            if item is not None:
-                db.inv_add_item(character_id, item["id"], qty)
-            suffix = f" (×{qty} grâce à ton statut VIP/Booster)" if qty > 1 else ""
-            await channel.send(f"✅ Le coffre a été ajouté à ton inventaire{suffix}.")
+            self._store_coffre(character_id, rarete, 1)
+            await channel.send("✅ Le coffre a été ajouté à ton inventaire.")
+
+    async def _offer_coffre_double(self, channel, user, character_id, rarete):
+        """§10 (B10b/c) : 2 coffres (VIP/Booster). Stocker -> les 2 en inventaire ; Ouvrir -> modal 1/2
+        (1 = ouvre le premier + stocke le second ; 2 = ouvre les deux). Résumé : un embed, une section
+        par coffre, NON fusionné. Avec le contenu doublé à l'ouverture, cela donne ×4 sur le butin : voulu."""
+        await self._send_coffre_image(channel, user, rarete, 2)
+        view = _DoubleCoffreView(user.id)
+        view.message = await channel.send("Que fais-tu de ces 2 coffres ?", view=view)
+        await view.wait()
+        # Timeout -> on stocke les 2 par défaut (ne jamais perdre les coffres gagnés).
+        if view.result == "ouvrir":
+            n = view.nb_ouvrir
+            rewards = [await self._open_one_coffre(channel, user, character_id, rarete) for _ in range(n)]
+            stored = 1 if n == 1 else 0
+            if stored:
+                self._store_coffre(character_id, rarete, 1)  # le second coffre est stocké
+            await channel.send(embed=self._double_coffre_summary(rarete, rewards, stored))
+        else:
+            self._store_coffre(character_id, rarete, 2)
+            await channel.send(
+                "✅ Les **2 coffres** ont été ajoutés à ton inventaire (bonus VIP/Booster ×2).")
+
+    def _double_coffre_summary(self, rarete, rewards, stored):
+        """§10 (B10c) : embed récapitulatif avec UNE section par coffre (jamais fusionné)."""
+        label = DAILY_COFFRE_LABELS[rarete]
+        embed = discord.Embed(
+            title=f"🎁 Résumé de l'ouverture (Coffre {label})", color=PHOENIX_COLOR)
+        for i, r in enumerate(rewards, 1):
+            if r["ok"]:
+                n = r.get("n", 1)
+                ligne = f"{n}x {r['texte']}" if n > 1 else r["texte"]
+            else:
+                ligne = f"⚠️ Non ouvert ({r['error']}) — conservé dans ton inventaire."
+            embed.add_field(name=f"Coffre {i}", value=f"• {ligne}", inline=False)
+        if stored:
+            embed.add_field(name=f"Coffre {len(rewards) + 1}",
+                            value="📦 Stocké dans ton inventaire.", inline=False)
+        return embed
 
 
 def daily_coffre_summary_embed(nombre, rarete, rewards):
