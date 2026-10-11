@@ -37,6 +37,33 @@ import discord
 DAILY_RENF_PALIERS = [(10_000, 1.0), (100_000, 0.2), (1_000_000, 0.05), (math.inf, 0.01)]
 # Plafond de dégâts par coup du JOUEUR : au plus ce % des PV MAX de la cible (sauf Black Flash).
 DAILY_COUP_PLAFOND_PCT = 10
+# Usure du Renforcement : à CHAQUE clic sur Attaquer, le bonus perd ce % (« % la 1re fois, nombre fixe
+# ensuite » : on fige l'usure à ceil(10 % du bonus) au 1er coup, puis on retire ce nombre à chaque coup).
+DAILY_RENF_USURE_PCT = 10
+
+
+def apply_renf_wear(st):
+    """Use les bonus de Renforcement du joueur (Force ET Défense), déclenché à CHAQUE clic sur Attaquer.
+    Chaque bonus a son propre nombre d'usure FIXE (figé au 1er coup = ceil(DAILY_RENF_USURE_PCT % du
+    bonus)). Le dernier retrait est borné (jamais de bonus négatif) ; à 0, le nombre fixe repasse à None.
+    Quand les DEUX bonus sont revenus à 0, les totaux d'EO investis sont remis à 0 (le prochain
+    Renforcement repart de zéro pour le rendement dégressif)."""
+    for bonus_key, usure_key in (("renf_bonus_force_j", "renf_usure_force_j"),
+                                 ("renf_bonus_def_j", "renf_usure_def_j")):
+        bonus = st.get(bonus_key, 0) or 0
+        if bonus <= 0:
+            continue
+        usure = st.get(usure_key)
+        if usure is None:  # 1re fois : on fige le NOMBRE (ceil de 10 % du bonus actuel)
+            usure = math.ceil(bonus * DAILY_RENF_USURE_PCT / 100)
+            st[usure_key] = usure
+        nouveau = max(0, bonus - usure)  # dernier retrait borné : jamais négatif
+        st[bonus_key] = nouveau
+        if nouveau <= 0:
+            st[usure_key] = None
+    if (st.get("renf_bonus_force_j", 0) or 0) <= 0 and (st.get("renf_bonus_def_j", 0) or 0) <= 0:
+        st["renf_total_eo_force_j"] = 0
+        st["renf_total_eo_def_j"] = 0
 
 
 def renforcement_bonus(total_eo_investi) -> float:
@@ -138,7 +165,14 @@ def _apply_hit(st, attack, defender, defender_action, crit_bypass=False):
             if random.randint(1, 100) <= block_chance(st[key]):
                 dmg = 0
                 block_ok = True
-        # §5 : renforcement défensif — appliqué UNIQUEMENT s'il reste des dégâts (blocage insuffisant).
+        # Bonus de Renforcement de Défense PERSISTANT (s'use par Attaque, comme la Force) : soak à chaque
+        # défense tant qu'il est actif, uniquement côté joueur.
+        if dmg > 0 and defender == "j":
+            soak = int(round(st.get("renf_bonus_def_j", 0) or 0))
+            if soak > 0:
+                dmg = max(0, dmg - soak)
+                def_used = def_used or True
+        # §5 : renforcement défensif PONCTUEL — appliqué UNIQUEMENT s'il reste des dégâts (blocage insuffisant).
         if dmg > 0 and defender_action.get("def_reinforce", 0) > 0:
             amount = defender_action["def_reinforce"]
             eo_key = "eo_p" if defender == "p" else "eo_j"

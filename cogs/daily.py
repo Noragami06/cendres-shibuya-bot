@@ -17,7 +17,7 @@ from cogs.utils import database as db
 from cogs.utils.image_gen import generate_daily_enemy_image, generate_coffre_image
 from cogs.utils.combat_engine import (
     run_combat, resolve_exchange, init_combat_fields, estimate_win_rate, DAILY_CRIT_RESET_VALUE,
-    renforcement_bonus, apply_damage_cap,
+    renforcement_bonus, apply_damage_cap, apply_renf_wear,
 )
 from cogs.banque import get_characters, get_character, credit_compte_courant, PHOENIX_COLOR
 
@@ -77,7 +77,8 @@ DAILY_EO_POTION_EFFECT = {
     "1": {"eo_pct": 75}, "S": {"eo_pct": 100},
 }
 
-DAILY_DAMAGE_RATIO = 0.05  # dégâts = force_actuelle * 0.05 (1000 Force = 50 dégâts), aucun aléatoire
+DAILY_DAMAGE_RATIO = 0.10  # dégâts = force_actuelle * 0.10 (10 Force = 1 dégât), aucun aléatoire, 2 camps
+DAILY_STAT_GAIN_PAR_BOUTON = 2  # §2 : points de stats gagnés par utilisation d'un bouton de combat
 
 # §2 : critique « Black Flash » (JOUEUR uniquement, action Attaquer). Chance de départ 10%, dégâts ×3.
 DAILY_CRIT_BASE = 10
@@ -1183,8 +1184,8 @@ class Daily(commands.Cog):
         sep = "━━━━━━━━━━━━━━━"
         desc = (
             f"{sep}\n🎯 **RÉCOMPENSES PAR ACTION**\n{sep}\n"
-            f"Victoire : **+{DAILY_REWARD_POINTS[classe]['victoire']}** points par action réussie\n"
-            f"Défaite : **+{DAILY_REWARD_POINTS[classe]['defaite']}** points par action réussie\n\n"
+            f"**+{DAILY_STAT_GAIN_PAR_BOUTON}** points de stat par action réussie (Force, Endurance, "
+            f"Sort, EO…), quelle que soit l'issue\n\n"
             f"{sep}\n🎁 **COFFRES ACCESSIBLES**\n{sep}\n{coffres}\n\n"
             f"{sep}\n⚔️ **NIVEAU DE DIFFICULTÉ**\n{sep}\n{diff}\nCombat estimé **{palier}** (~{win_rate}%)."
         )
@@ -1239,8 +1240,10 @@ class Daily(commands.Cog):
             "potions_p": pnj["potions"], "potion_pct_p": pnj["potion_pct"],
             "crit_chance_j": DAILY_CRIT_RESET_VALUE,  # §2 : chance de Black Flash (progression centralisée)
             "sort_bonus_j": 0,                 # bonus de dégâts de sort/arme (potion « force du sort »)
-            "renf_total_eo_j": 0,              # §1 : total d'EO investi en Renforcement (cumulé sur le combat)
-            "renf_bonus_j": 0.0,               # §1 : bonus de Force déjà accordé par ce total (dégressif)
+            # Renforcement du joueur (persistant, dégressif + usure par Attaque) : Force et Défense séparés.
+            "renf_bonus_force_j": 0.0, "renf_bonus_def_j": 0.0,       # bonus actifs
+            "renf_total_eo_force_j": 0, "renf_total_eo_def_j": 0,     # cumul EO investi (dégressif)
+            "renf_usure_force_j": None, "renf_usure_def_j": None,     # nombre d'usure FIXE (§1)
         }
         init_combat_fields(st)  # crit_echecs_j, block_pending_j/p, last_action_j/p
         gains = {"force": 0, "endurance": 0, "energie_occulte": 0, "sorts": 0}
@@ -1307,9 +1310,12 @@ class Daily(commands.Cog):
             ]
             if armes:
                 options.append(("arme", "Utiliser une arme maudite", "🗡️", discord.ButtonStyle.primary))
+            renf_actif = (st.get("renf_bonus_force_j", 0) or 0) > 0 or (st.get("renf_bonus_def_j", 0) or 0) > 0
             if not reaction:
                 # Renfort maudit offensif + Potion : uniquement en DÉCLARATION (ne consomment pas le tour).
-                options.insert(2, ("renfort", "Renforcement maudit", "🔮", discord.ButtonStyle.primary))
+                # §1 : le bouton Renforcement DISPARAÎT tant qu'un bonus (Force OU Défense) est actif.
+                if not renf_actif:
+                    options.insert(2, ("renfort", "Renforcement maudit", "🔮", discord.ButtonStyle.primary))
                 if potions:
                     options.append(("potion", "Utiliser une potion", "🧪", discord.ButtonStyle.success))
             view = DailyChoiceView(user.id, options)
@@ -1321,9 +1327,10 @@ class Daily(commands.Cog):
             desc = (
                 preambule
                 + f"PV : **{max(st['pv_j'], DAILY_PV_FLOOR):,}** · Énergie occulte : **{st['eo_j']:,}**"
-                + (f"\n🔮 Renforcement cumulé : +{int(round(st['renf_bonus_j']))} Force "
-                   f"({st['renf_total_eo_j']:,} EO investis)".replace(",", " ")
-                   if st.get("renf_bonus_j") else "")
+                + (f"\n🔮 Renforcement Force : +{int(round(st['renf_bonus_force_j']))} (s'use à chaque Attaque)"
+                   if (st.get("renf_bonus_force_j", 0) or 0) > 0 else "")
+                + (f"\n🛡️ Renforcement Défense : +{int(round(st['renf_bonus_def_j']))} (s'use à chaque Attaque)"
+                   if (st.get("renf_bonus_def_j", 0) or 0) > 0 else "")
                 + "\n\n⚡ **Critique (Black Flash)**\n"
                 f"Chance actuelle : **{st.get('crit_chance_j', DAILY_CRIT_RESET_VALUE)}%**\n"
                 "À chaque échec : 5%, puis 10%, puis +1%/échec. Une réussite retombe à 1% et inflige "
@@ -1336,32 +1343,35 @@ class Daily(commands.Cog):
             if view.result is None:
                 return None
             act = view.result
-            f_act = current_force(st["force_base_j"], st["pv_j"], st["pv_max_j"], bonus_force)
+            # Force actuelle = force de base × (pv/pv_max) + bonus de Renforcement Force ACTIF (flat).
+            f_act = current_force(st["force_base_j"], st["pv_j"], st["pv_max_j"],
+                                  int(round(st.get("renf_bonus_force_j", 0) or 0)))
 
             if act == "renfort":
                 # §1 : le coût en EO reste plein, mais le BONUS de Force est DÉGRESSIF sur le total cumulé
-                # investi en Renforcement (empêche le one-shot à 1 EO = 1 Force). Le bonus s'ajoute à la
-                # Force de BASE (persistant pour le reste du combat), pas seulement au tour courant.
+                # investi en Renforcement (empêche le one-shot à 1 EO = 1 Force). Ce bonus est PERSISTANT
+                # mais s'USE de 10 % à chaque Attaque (apply_renf_wear).
                 if st["eo_j"] <= 0:
                     await channel.send("Tu n'as plus d'énergie occulte à investir.")
                     continue
                 montant = await self._ask_int(
                     channel, user,
                     f"Ta réserve actuelle est de {st['eo_j']} points exacts. Combien veux tu en utiliser "
-                    "pour renforcer ta Force ce tour-ci ?", 1, st["eo_j"])
+                    "pour renforcer ta Force ?", 1, st["eo_j"])
                 if montant is None:
                     continue
                 st["eo_j"] -= montant
-                nouveau_total = st["renf_total_eo_j"] + montant
+                nouveau_total = st["renf_total_eo_force_j"] + montant
                 nouveau_bonus = renforcement_bonus(nouveau_total)
-                delta = nouveau_bonus - st["renf_bonus_j"]        # rendement dégressif (cumul anti-contournement)
-                st["force_base_j"] += delta
-                st["renf_total_eo_j"] = nouveau_total
-                st["renf_bonus_j"] = nouveau_bonus
+                delta = nouveau_bonus - st["renf_bonus_force_j"]   # rendement dégressif (cumul anti-contournement)
+                st["renf_bonus_force_j"] += delta
+                st["renf_total_eo_force_j"] = nouveau_total
+                st["renf_usure_force_j"] = None                    # recalcul de l'usure au prochain Attaque
                 gains["energie_occulte"] += 1  # §9 : renforcement utilisé = +points EO (compté à la fin)
                 await channel.send(
                     f"🔮 +{int(round(delta))} Force (renforcement maudit, rendement dégressif ; "
-                    f"total investi : {nouveau_total:,} EO → +{int(round(nouveau_bonus)):,} Force).".replace(",", " "))
+                    f"total investi : {nouveau_total:,} EO → +{int(round(nouveau_bonus)):,} Force, "
+                    f"s'use à chaque Attaque).".replace(",", " "))
                 continue
 
             if act == "potion":
@@ -1394,8 +1404,11 @@ class Daily(commands.Cog):
                         "blocking": False, "spell_name": arme["name"], "force_actuelle": f_act}
 
             if act == "attaquer":
-                return {"kind": "attaquer", "attacking": True, "damage": physical_damage(f_act),
-                        "dtype": "phys", "blocking": False, "force_actuelle": f_act}
+                # Ordre §1 : on calcule d'abord les dégâts avec le bonus ACTUEL, PUIS on use le Renforcement.
+                action = {"kind": "attaquer", "attacking": True, "damage": physical_damage(f_act),
+                          "dtype": "phys", "blocking": False, "force_actuelle": f_act}
+                apply_renf_wear(st)  # use les bonus Force ET Défense (nombre fixe, 10 %)
+                return action
 
             if act == "defendre":
                 return await self._collect_defense(channel, user, character_id, st, f_act)
@@ -1405,7 +1418,8 @@ class Daily(commands.Cog):
         n'est PAS débitée ici (elle ne l'est, dans resolve_exchange, que si le blocage classique échoue)."""
         endurance = (db.get_stat_base_pts(character_id, "endurance")
                      + db.sum_buff_points(character_id, "endurance"))
-        def_reinforce = 0
+        # §1 : le Renforcement de Défense devient un bonus PERSISTANT (dégressif, EO payé d'avance) qui
+        # amortit CHAQUE défense tant qu'il est actif et s'USE de 10 % à chaque Attaque (comme la Force).
         if st["eo_j"] > 0:
             view = DailyChoiceView(user.id, [
                 ("oui", "Oui, me renforcer", "🔮", discord.ButtonStyle.primary),
@@ -1416,13 +1430,23 @@ class Daily(commands.Cog):
             if view.result == "oui":
                 montant = await self._ask_int(
                     channel, user,
-                    f"Combien d'énergie occulte investir dans cette défense ? (réserve : {st['eo_j']}) "
-                    "Elle ne sera débitée que si ton blocage échoue.", 1, st["eo_j"])
+                    f"Combien d'énergie occulte investir en Renforcement de Défense ? (réserve : "
+                    f"{st['eo_j']}) Rendement dégressif, et le bonus s'use à chaque Attaque.", 1, st["eo_j"])
                 if montant:
-                    def_reinforce = montant
+                    st["eo_j"] -= montant  # payé d'avance (comme le Renforcement de Force)
+                    nouveau_total = st["renf_total_eo_def_j"] + montant
+                    nouveau_bonus = renforcement_bonus(nouveau_total)
+                    st["renf_bonus_def_j"] += (nouveau_bonus - st["renf_bonus_def_j"])
+                    st["renf_total_eo_def_j"] = nouveau_total
+                    st["renf_usure_def_j"] = None
+                    await channel.send(
+                        f"🛡️ Renforcement de Défense : +{int(round(nouveau_bonus))} "
+                        "(amortit chaque coup reçu, s'use à chaque Attaque).")
+        # def_reinforce=0 : plus de débit au blocage raté ; le bonus persistant (renf_bonus_def_j) est
+        # appliqué directement dans resolve_exchange (_apply_hit), côté défenseur joueur.
         return {"kind": "defendre", "attacking": False, "damage": 0, "dtype": None,
                 "blocking": True, "force_actuelle": f_act,
-                "def_reinforce": def_reinforce, "def_endurance": endurance}
+                "def_reinforce": 0, "def_endurance": endurance}
 
     async def _use_combat_potion(self, channel, user, character_id, st):
         """§2/§3/§4 : sélection RÉELLE parmi les potions possédées (lues EN DIRECT), application de l'effet
@@ -1682,12 +1706,13 @@ class Daily(commands.Cog):
     async def _finish_combat(self, channel, user, character_id, classe, st, gains, sort_xp, issue):
         # Règle universelle : VIP/Booster -> ×2 sur tous les gains (points de stats, bonus, XP).
         from cogs.utils.rewards import apply_vip_booster_multiplier
-        # §8 : points par action réussie selon la classe ET l'issue (victoire/défaite).
-        pts = DAILY_REWARD_POINTS[classe]["victoire" if issue == "victoire" else "defaite"]
+        # §2 : gain de stats = 2 points FIXES par utilisation de bouton (DAILY_STAT_GAIN_PAR_BOUTON),
+        # quelle que soit la classe/issue (remplace l'ancien barème DAILY_REWARD_POINTS par action).
+        pts = DAILY_REWARD_POINTS[classe]["victoire" if issue == "victoire" else "defaite"]  # bonus libre
         applied = {}
         for key, count in gains.items():
             if count > 0:
-                gain = apply_vip_booster_multiplier(user, count * pts)
+                gain = apply_vip_booster_multiplier(user, count * DAILY_STAT_GAIN_PAR_BOUTON)
                 # add_stat_base_pts renvoie 0 si la stat est verrouillée : gain ignoré, non affiché.
                 got = db.add_stat_base_pts(character_id, key, gain)
                 if got > 0:

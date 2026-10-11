@@ -279,6 +279,13 @@ class _Combatant:
         self.crit_echecs = 0
         self.sort_bonus = 0
         self.bloc = 0
+        # Renforcement persistant (Force & Défense) : partagé avec /daily (dégressif + usure par Attaque).
+        self.renf_bonus_force = 0.0
+        self.renf_bonus_def = 0.0
+        self.renf_total_eo_force = 0
+        self.renf_total_eo_def = 0
+        self.renf_usure_force = None
+        self.renf_usure_def = None
         self.block_pending = False  # posture de blocage du joueur (alternance stricte)
         self.total_damage = 0
         self.alive = True
@@ -582,6 +589,10 @@ class Raid(commands.Cog):
             "potions_p": monster["potions"], "potion_pct_p": monster["potion_pct"],
             "crit_chance_j": comb.crit_chance, "crit_echecs_j": comb.crit_echecs,
             "sort_bonus_j": comb.sort_bonus,
+            # Renforcement persistant (lu depuis le combattant, réécrit par _writeback_st).
+            "renf_bonus_force_j": comb.renf_bonus_force, "renf_bonus_def_j": comb.renf_bonus_def,
+            "renf_total_eo_force_j": comb.renf_total_eo_force, "renf_total_eo_def_j": comb.renf_total_eo_def,
+            "renf_usure_force_j": comb.renf_usure_force, "renf_usure_def_j": comb.renf_usure_def,
             "block_pending_j": comb.block_pending, "block_pending_p": monster.get("block_pending", False),
             "last_action_j": None, "last_action_p": None,
         }
@@ -591,6 +602,12 @@ class Raid(commands.Cog):
         comb.crit_chance = st["crit_chance_j"]; comb.crit_echecs = st.get("crit_echecs_j", 0)
         comb.sort_bonus = st["sort_bonus_j"]
         comb.bloc = st["bloc_j"]; comb.force_base = st["force_base_j"]
+        comb.renf_bonus_force = st.get("renf_bonus_force_j", 0.0)
+        comb.renf_bonus_def = st.get("renf_bonus_def_j", 0.0)
+        comb.renf_total_eo_force = st.get("renf_total_eo_force_j", 0)
+        comb.renf_total_eo_def = st.get("renf_total_eo_def_j", 0)
+        comb.renf_usure_force = st.get("renf_usure_force_j")
+        comb.renf_usure_def = st.get("renf_usure_def_j")
         comb.block_pending = st.get("block_pending_j", False)
         monster["pv"] = st["pv_p"]; monster["eo"] = st["eo_p"]; monster["bloc"] = st["bloc_p"]
         monster["potions"] = st["potions_p"]; monster["force"] = st["force_base_p"]
