@@ -17,6 +17,7 @@ from cogs.utils import database as db
 from cogs.utils.image_gen import generate_daily_enemy_image, generate_coffre_image
 from cogs.utils.combat_engine import (
     run_combat, resolve_exchange, init_combat_fields, estimate_win_rate, DAILY_CRIT_RESET_VALUE,
+    renforcement_bonus, apply_damage_cap,
 )
 from cogs.banque import get_characters, get_character, credit_compte_courant, PHOENIX_COLOR
 
@@ -212,6 +213,17 @@ DAILY_PV_FLOOR = 100  # le combat s'arrête dès qu'un camp atteint 100 PV ou mo
 DAILY_PV_REF_MULTIPLIER = {"4": 25, "3": 23, "2": 17, "1": 15, "S": 11}
 DAILY_GAP_FACTOR = {-4: 0.45, -3: 0.55, -2: 0.65, -1: 0.82, 0: 1.00, 1: 1.42, 2: 1.68, 3: 1.85, 4: 2.00}
 DAILY_CLASSE_RANK = {"4": 0, "3": 1, "2": 2, "1": 3, "S": 4}
+
+# §3 : génération du PNJ par tableau (classe RP du JOUEUR -> classe du PNJ) = (mult_pv, mult_stats).
+#   PV du PNJ        = pv_max du joueur  × mult_pv
+#   Force/Vitesse/Endurance/Sorts/EO du PNJ = stat correspondante du joueur × mult_stats
+DAILY_PNJ_TABLE = {
+    "4": {"4": (10.5, 0.8), "3": (11.5, 1.0), "2": (15, 1.3),  "1": (18, 1.7),   "S": (18, 2.2)},
+    "3": {"4": (8.5, 0.6),  "3": (10.5, 0.8), "2": (11.5, 1.0), "1": (21, 1.3),   "S": (21, 1.7)},
+    "2": {"4": (11, 0.45),  "3": (7, 0.6),    "2": (10.5, 0.8), "1": (12, 1.0),   "S": (16, 1.3)},
+    "1": {"4": (14, 0.35),  "3": (11, 0.45),  "2": (7, 0.6),    "1": (10.5, 0.8), "S": (15.5, 1.0)},
+    "S": {"4": (19.5, 0.25),"3": (14, 0.35),  "2": (11, 0.45),  "1": (7, 0.6),    "S": (14, 0.8)},
+}
 # Rôles de classe RP (attribués par le staff). Servent à déterminer la classe RP réelle du personnage.
 DAILY_ROLE_CLASSE_RP = {
     "4": 1551331559418896405,
@@ -682,6 +694,30 @@ def generate_pnj(player_stats: dict, classe: str, pv_override=None) -> dict:
     }
 
 
+def generate_pnj_daily(player_stats: dict, classe_pnj: str, classe_joueur: str) -> dict:
+    """§3 (/daily) : génère le PNJ via DAILY_PNJ_TABLE[classe_joueur][classe_pnj] = (mult_pv, mult_stats).
+    PV = pv_max joueur × mult_pv ; Force/Vitesse/EO/… = stat joueur × mult_stats. Déterministe (aucune
+    variance). `generate_pnj` (ancienne, par pourcentages) reste réservée à /raid (boss inchangés)."""
+    mult_pv, mult_stats = DAILY_PNJ_TABLE[classe_joueur][classe_pnj]
+
+    def s(value):
+        return max(0, round(value * mult_stats))
+
+    return {
+        "name": generate_pnj_name(),
+        "classe": classe_pnj,
+        "pv_max": max(1, round(player_stats["pv"] * mult_pv)),
+        "eo_max": max(0, round(player_stats["eo"] * mult_stats)),
+        "force": s(player_stats["force"]),
+        "vitesse": s(player_stats["vitesse"]),
+        "arme": s(player_stats["arme"]),
+        "rct": s(player_stats["rct"]),
+        "territoire": s(player_stats["territoire"]),
+        "potions": DAILY_POTION_TABLE[classe_pnj]["nombre"],
+        "potion_pct": DAILY_POTION_TABLE[classe_pnj]["pct_restaure"],
+    }
+
+
 def weighted_pick(weights: dict):
     """Choix pondéré parmi {clé: poids}. Retourne une clé."""
     total = sum(weights.values())
@@ -1069,8 +1105,8 @@ class Daily(commands.Cog):
         gap = DAILY_CLASSE_RANK[classe] - DAILY_CLASSE_RANK[player_rp_classe]
 
         # §2 : ordre pré-combat = PNJ d'abord, PUIS l'embed d'informations, PUIS attente, PUIS « Commencer ».
-        pv_override = self._burst_pv_override(character_id, player_stats, classe, gap)
-        pnj = generate_pnj(player_stats, classe, pv_override=pv_override)
+        # §3 : génération du PNJ par tableau (classe joueur × classe PNJ), plus par burst/pourcentages.
+        pnj = generate_pnj_daily(player_stats, classe, player_rp_classe)
         await self._send_pnj_pillow(channel, pnj)  # 1) pillow du PNJ EN PREMIER
         await channel.send(embed=self._info_embed(classe, rates.get(classe, 50)))  # 2) infos ensuite
         await asyncio.sleep(random.uniform(3, 5))  # 4) petite attente
@@ -1203,6 +1239,8 @@ class Daily(commands.Cog):
             "potions_p": pnj["potions"], "potion_pct_p": pnj["potion_pct"],
             "crit_chance_j": DAILY_CRIT_RESET_VALUE,  # §2 : chance de Black Flash (progression centralisée)
             "sort_bonus_j": 0,                 # bonus de dégâts de sort/arme (potion « force du sort »)
+            "renf_total_eo_j": 0,              # §1 : total d'EO investi en Renforcement (cumulé sur le combat)
+            "renf_bonus_j": 0.0,               # §1 : bonus de Force déjà accordé par ce total (dégressif)
         }
         init_combat_fields(st)  # crit_echecs_j, block_pending_j/p, last_action_j/p
         gains = {"force": 0, "endurance": 0, "energie_occulte": 0, "sorts": 0}
@@ -1283,7 +1321,9 @@ class Daily(commands.Cog):
             desc = (
                 preambule
                 + f"PV : **{max(st['pv_j'], DAILY_PV_FLOOR):,}** · Énergie occulte : **{st['eo_j']:,}**"
-                + (f"\n🔮 Renforcement actif : +{bonus_force} Force" if bonus_force else "")
+                + (f"\n🔮 Renforcement cumulé : +{int(round(st['renf_bonus_j']))} Force "
+                   f"({st['renf_total_eo_j']:,} EO investis)".replace(",", " ")
+                   if st.get("renf_bonus_j") else "")
                 + "\n\n⚡ **Critique (Black Flash)**\n"
                 f"Chance actuelle : **{st.get('crit_chance_j', DAILY_CRIT_RESET_VALUE)}%**\n"
                 "À chaque échec : 5%, puis 10%, puis +1%/échec. Une réussite retombe à 1% et inflige "
@@ -1299,7 +1339,9 @@ class Daily(commands.Cog):
             f_act = current_force(st["force_base_j"], st["pv_j"], st["pv_max_j"], bonus_force)
 
             if act == "renfort":
-                # Ne consomme PAS le tour : puise dans l'EO, ajoute à la Force du tour, puis redemande.
+                # §1 : le coût en EO reste plein, mais le BONUS de Force est DÉGRESSIF sur le total cumulé
+                # investi en Renforcement (empêche le one-shot à 1 EO = 1 Force). Le bonus s'ajoute à la
+                # Force de BASE (persistant pour le reste du combat), pas seulement au tour courant.
                 if st["eo_j"] <= 0:
                     await channel.send("Tu n'as plus d'énergie occulte à investir.")
                     continue
@@ -1310,9 +1352,16 @@ class Daily(commands.Cog):
                 if montant is None:
                     continue
                 st["eo_j"] -= montant
-                bonus_force += montant
+                nouveau_total = st["renf_total_eo_j"] + montant
+                nouveau_bonus = renforcement_bonus(nouveau_total)
+                delta = nouveau_bonus - st["renf_bonus_j"]        # rendement dégressif (cumul anti-contournement)
+                st["force_base_j"] += delta
+                st["renf_total_eo_j"] = nouveau_total
+                st["renf_bonus_j"] = nouveau_bonus
                 gains["energie_occulte"] += 1  # §9 : renforcement utilisé = +points EO (compté à la fin)
-                await channel.send(f"🔮 +{montant} Force ce tour (renforcement maudit).")
+                await channel.send(
+                    f"🔮 +{int(round(delta))} Force (renforcement maudit, rendement dégressif ; "
+                    f"total investi : {nouveau_total:,} EO → +{int(round(nouveau_bonus)):,} Force).".replace(",", " "))
                 continue
 
             if act == "potion":

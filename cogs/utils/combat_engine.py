@@ -24,9 +24,45 @@ pour éviter tout cycle d'import au chargement (daily importe ce module au nivea
 
 import asyncio
 import inspect
+import math
 import random
 
 import discord
+
+# =====================================================================
+# ÉQUILIBRAGE PARTAGÉ (/daily ET /raid) : renforcement dégressif + plafond de dégâts par coup
+# =====================================================================
+# Renforcement du JOUEUR : le coût en EO reste payé plein, mais le BONUS de Force est dégressif selon le
+# TOTAL d'EO investi en Renforcement sur le combat. (seuil_haut_inclus, Force par EO dans cette tranche).
+DAILY_RENF_PALIERS = [(10_000, 1.0), (100_000, 0.2), (1_000_000, 0.05), (math.inf, 0.01)]
+# Plafond de dégâts par coup du JOUEUR : au plus ce % des PV MAX de la cible (sauf Black Flash).
+DAILY_COUP_PLAFOND_PCT = 10
+
+
+def renforcement_bonus(total_eo_investi) -> float:
+    """Bonus de Force total pour `total_eo_investi` EO cumulés en Renforcement (paliers dégressifs).
+    Ex : 100 000 -> +28 000 ; 1 000 000 -> +73 000."""
+    total = max(0, total_eo_investi)
+    bonus = 0.0
+    prev = 0
+    for seuil, taux in DAILY_RENF_PALIERS:
+        tranche = min(total, seuil) - prev
+        if tranche <= 0:
+            break
+        bonus += tranche * taux
+        prev = seuil
+        if total <= seuil:
+            break
+    return bonus
+
+
+def apply_damage_cap(degats, pv_max_cible, is_black_flash) -> int:
+    """Plafonne un coup du JOUEUR à DAILY_COUP_PLAFOND_PCT % des PV max de la cible. EXCEPTION : un Black
+    Flash (×10) n'est JAMAIS plafonné. Les coups du PNJ/boss sur le joueur ne passent pas par ici."""
+    if is_black_flash:
+        return degats
+    cap = int((pv_max_cible or 0) * DAILY_COUP_PLAFOND_PCT / 100)
+    return min(degats, cap) if cap > 0 else degats
 
 # =====================================================================
 # §4 : PROGRESSION DU CRITIQUE (BLACK FLASH)
@@ -114,9 +150,11 @@ def _apply_hit(st, attack, defender, defender_action, crit_bypass=False):
             else:
                 dmg = max(0, dmg - boosted)
     if defender == "p":
+        # §2 : plafond de dégâts du JOUEUR sur le PNJ/boss (10 % des PV max), SAUF Black Flash (crit_bypass).
+        dmg = apply_damage_cap(dmg, st.get("pv_max_p"), crit_bypass)
         st["pv_p"] -= dmg
     else:
-        st["pv_j"] -= dmg
+        st["pv_j"] -= dmg  # les coups du PNJ/boss sur le joueur ne sont jamais plafonnés
     return dmg, block_ok, def_used
 
 
@@ -160,10 +198,12 @@ def resolve_exchange(st, aj, ap, gains=None):
         if f_j == f_p:
             return (entete + f"⚔️ **Clash égal !** Le choc s'annule, aucun dégât." + crit_text, "blue", False)
         if f_j > f_p:
-            st["pv_p"] -= aj["damage"]
+            # §2 : coup normal (pas de crit ici, le crit est traité plus haut) -> plafonné.
+            dmg = apply_damage_cap(aj["damage"], st.get("pv_max_p"), False)
+            st["pv_p"] -= dmg
             if gains is not None:
                 gains["force"] = gains.get("force", 0) + 1
-            txt = f"🏆 **{nj}** remporte le choc et inflige **{aj['damage']:,}** dégâts à {npnj} !"
+            txt = f"🏆 **{nj}** remporte le choc et inflige **{dmg:,}** dégâts à {npnj} !"
             return (entete + txt.replace(",", " ") + crit_text, "green", False)
         st["pv_j"] -= ap["damage"]
         txt = f"🏆 **{npnj}** remporte le choc et inflige **{ap['damage']:,}** dégâts à {nj} !"
