@@ -799,6 +799,23 @@ CREATE TABLE IF NOT EXISTS giveaway_claim_state (
     dm_channel_id INTEGER,
     dm_message_id INTEGER
 );
+
+-- /suggestion : demande EN ATTENTE d'un joueur (le prochain MP qu'il écrit au bot devient sa suggestion).
+-- Clé = user_id (pas character_id) : la commande est ouverte à tous, même sans personnage -> AUCUN lien
+-- avec delete_character_cascade(). Persistante : aucune limite de temps, survit aux redémarrages.
+CREATE TABLE IF NOT EXISTS suggestion_pending (
+    user_id INTEGER PRIMARY KEY,
+    created_at TEXT
+);
+
+-- /suggestion : journal des suggestions réellement publiées (traçabilité). Clé = message_id Discord.
+-- Non liée à character_id (ouverte à tous) -> pas de nettoyage par delete_character_cascade().
+CREATE TABLE IF NOT EXISTS suggestions (
+    message_id INTEGER PRIMARY KEY,
+    user_id INTEGER,
+    content TEXT,
+    created_at TEXT
+);
 """
 
 
@@ -1352,6 +1369,75 @@ def fiche_sync_log_add(character_id: int, champ: str, ancienne, nouvelle, date: 
             "VALUES (?, ?, ?, ?, ?)",
             (character_id, champ, None if ancienne is None else str(ancienne),
              None if nouvelle is None else str(nouvelle), date))
+
+
+def compute_character_display_name(prenom, nom, clan) -> str:
+    """SOURCE UNIQUE du nom de dossier (character_name) affiché par /profil, selon la MÊME règle que la
+    fiche (build_fiche_embed) : un `nom` explicite est prioritaire ; sinon, pour un personnage de clan, le
+    nom de famille = le clan ACTUEL (capitalisé) ; sinon le prénom seul. La fiche fait foi -> cette fonction
+    reproduit exactement ce qu'elle affiche."""
+    prenom = (prenom or "").strip()
+    nom_val = (nom or "").strip()
+    has_clan = bool(clan) and clan != "sans_clan"
+    if nom_val:
+        nom_final = nom_val
+    elif has_clan:
+        nom_final = clan.capitalize()
+    else:
+        nom_final = ""
+    return f"{prenom} {nom_final}".strip()
+
+
+def refresh_character_identity(character_id: int):
+    """Recompose character_name (ce que lit /profil) à partir des champs d'identité AUTORITAIRES de la
+    base (prénom + nom/clan), via compute_character_display_name. À appeler après TOUTE modification de
+    prénom, nom ou clan (n'importe quelle commande ou sync) : la base — et donc /profil, qui n'a aucune
+    image mise en cache (image regénérée à chaque appel) — reflète alors toujours la fiche.
+    Retourne (ancien_nom, nouveau_nom) si character_name a changé, sinon None."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT character_name, prenom, nom, clan FROM validated_characters WHERE id = ?",
+            (character_id,)).fetchone()
+        if row is None:
+            return None
+        new_name = compute_character_display_name(row["prenom"], row["nom"], row["clan"])
+        old_name = row["character_name"]
+        if new_name and new_name != old_name:
+            conn.execute("UPDATE validated_characters SET character_name = ? WHERE id = ?",
+                         (new_name, character_id))
+            return (old_name, new_name)
+    return None
+
+
+# ---------- /suggestion : demandes en attente + journal ----------
+def suggestion_pending_add(user_id: int, created_at: str):
+    """Enregistre (ou rafraîchit) la demande de suggestion en attente d'un joueur. Idempotent : relancer
+    /suggestion ne crée pas de doublon (user_id est la clé primaire)."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO suggestion_pending (user_id, created_at) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO NOTHING",
+            (user_id, created_at))
+
+
+def suggestion_pending_exists(user_id: int) -> bool:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT 1 FROM suggestion_pending WHERE user_id = ?", (user_id,)).fetchone() is not None
+
+
+def suggestion_pending_delete(user_id: int):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM suggestion_pending WHERE user_id = ?", (user_id,))
+
+
+def suggestion_log_add(message_id: int, user_id: int, content: str, created_at: str):
+    """Journalise une suggestion RÉELLEMENT publiée (traçabilité)."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO suggestions (message_id, user_id, content, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (message_id, user_id, content, created_at))
 
 
 def chest_open_log_add(character_id: int, rarete, reward_json: str, applied, error, opened_at: str):

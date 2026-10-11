@@ -1185,6 +1185,8 @@ async def backfill_role_points(guild):
 # =====================================================================
 FICHE_SYNC_MAX_CHANGES_PER_RUN = 25   # garde-fou : au-delà, on n'applique RIEN (réglable)
 FICHE_SYNC_OWNER_ID = SPECIAL_USER_ID  # destinataire du rapport MP (owner)
+IDENTITY_SYNC_BATCH = 25              # personnages traités par lot avant une courte pause (part 1c)
+IDENTITY_SYNC_BATCH_PAUSE = 0.5       # pause (s) entre deux lots : ménage les I/O, ne bloque pas le bot
 
 # Rôles de stade RCT (n'importe lequel => RCT possédé). 'moyenne' == RCT_POSSEDE_ROLE_ID.
 RCT_STAGE_ROLE_IDS = {RCT_POSSEDE_ROLE_ID, 1522181335962091621, 1522181336834506894}
@@ -1302,9 +1304,12 @@ async def compute_fiche_corrections(guild):
                 out["signals"].append((char, "techniques déjà créées : sort héréditaire non modifié"))
             elif char["sort"] not in sort_heredit_keys:
                 out["corrections"].append((char, "sort", char["sort"], expected))
-        elif char["sort"] in sort_heredit_keys and eff_grade != "Héritier":
+        elif char["sort"] == "sort_heredit" and eff_grade != "Héritier":
+            # Sort héréditaire COMPLET sans rôle Héritier : exigence inchangée -> on signale.
+            # Le sort héréditaire PARTIEL (sort_heredit_partiel) ne requiert PAS d'être Héritier :
+            # quel que soit le rang, on ne le signale pas, on ne le corrige pas, on ne le retire pas.
             out["signals"].append(
-                (char, "sort héréditaire sans rôle Héritier (à vérifier manuellement)"))
+                (char, "sort héréditaire complet sans rôle Héritier (à vérifier manuellement)"))
     return out
 
 
@@ -1315,6 +1320,9 @@ async def _apply_fiche_correction(bot, guild, char, champ, old, new):
     """Applique UNE correction : UPDATE du champ + resynchro des points (camp/clan/grade) + journal.
     Lève en cas d'échec (capté par l'appelant pour marquer le personnage en erreur)."""
     db.update_validated_fields(char["id"], **{champ: new})
+    # Un changement de clan modifie le nom de famille affiché : recompose character_name (lu par /profil).
+    if champ == "clan":
+        db.refresh_character_identity(char["id"])
     if champ in _CHAMP_TO_POINT_CATEGORY:
         # Resynchronise le barème sur le NOUVEAU rôle (dette si points déjà dépensés) via la fonction
         # existante. resolve_role_point_ids attend (camp, clan, grade) ; on ne passe que le champ changé.
@@ -1386,6 +1394,42 @@ async def sync_fiches_from_roles(bot):
     if applied or conflicts or signals or failed:
         await _fiche_sync_owner_report(bot, "🧾 Synchronisation des fiches",
                                        applied, conflicts, signals, failed, blocked=False)
+
+
+async def sync_identity_from_fiche(bot):
+    """Part 1c : APRÈS la sync fiches<-rôles, réaligne character_name (ce que lit /profil) sur l'identité
+    AUTORITAIRE de la fiche (prénom + nom/clan) pour TOUS les personnages. La fiche (embed) est elle-même
+    générée depuis ces mêmes colonnes (prenom/nom/clan) — les relire via compute_character_display_name
+    équivaut donc à lire ce que la fiche affiche. Aucun drapeau bot_state : tourne à CHAQUE démarrage.
+    Par lots avec une courte pause, en arrière-plan, sans bloquer le démarrage. Journalise chaque
+    correction dans fiche_sync_log ; ignore ET journalise toute fiche illisible, sans rien modifier."""
+    import asyncio
+    verifies = corriges = ignores = 0
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, character_name, prenom, nom, clan FROM validated_characters").fetchall()
+    for i, row in enumerate(rows, 1):
+        try:
+            # Fiche illisible : aucune donnée d'identité exploitable (ni prénom, ni nom, ni clan réel).
+            has_clan = bool(row["clan"]) and row["clan"] != "sans_clan"
+            if not (row["prenom"] or row["nom"] or has_clan):
+                ignores += 1
+                print(f"[identity-sync] #{row['id']} ignoré : identité illisible (ni prénom ni clan).")
+                continue
+            verifies += 1
+            res = db.refresh_character_identity(row["id"])
+            if res is not None:
+                old, new = res
+                db.fiche_sync_log_add(row["id"], "character_name", old, new,
+                                      datetime.utcnow().isoformat())
+                corriges += 1
+                print(f"[identity-sync] #{row['id']} : character_name {old!r} -> {new!r}")
+        except Exception as e:  # une fiche en erreur n'interrompt jamais le parcours
+            ignores += 1
+            print(f"[identity-sync] #{row['id']} ignoré (erreur) : {e!r}")
+        if i % IDENTITY_SYNC_BATCH == 0:
+            await asyncio.sleep(IDENTITY_SYNC_BATCH_PAUSE)
+    print(f"[identity-sync] Terminé : {verifies} vérifié(s), {corriges} corrigé(s), {ignores} ignoré(s).")
 
 
 def _fiche_sync_print_report(examined, applied, conflicts, signals, failed, avant, apres):
@@ -4762,6 +4806,9 @@ class Depart(commands.Cog):
         # patronyme personnalisé (différent du clan) n'est JAMAIS touché.
         if self._nom_is_frozen_clan(char["nom"], old_clan):
             db.update_validated_fields(character_id, nom=None)
+        # Source unique : recompose character_name (lu par /profil) sur le NOUVEAU clan. Sans cela, le
+        # profil continuait d'afficher l'ancien clan figé dans character_name (bug Zenin -> Gojo).
+        db.refresh_character_identity(character_id)
 
         status = "ok"
         if slot == 1:
@@ -5063,11 +5110,12 @@ class Depart(commands.Cog):
             if val is None:
                 return None
             val = val.strip()
-            nom_part = (char["nom"] or "").strip()
-            character_name = f"{val} {nom_part}".strip()
 
             async def apply():
-                db.update_validated_fields(cid, prenom=val, character_name=character_name)
+                # Source unique : on écrit le prénom, puis refresh_character_identity recompose
+                # character_name (lu par /profil) — plus de calcul dupliqué ici.
+                db.update_validated_fields(cid, prenom=val)
+                db.refresh_character_identity(cid)
             return "Prénom", old, val, apply
 
         # --- 2. Nom : mention d'un rôle de clan = VRAI changement de clan ; sinon = cosmétique ---
@@ -5111,11 +5159,12 @@ class Depart(commands.Cog):
             # Aucune mention de rôle -> PUREMENT cosmétique (aucune comparaison de texte avec les clans).
             val = msg.content.strip()
             old = char["nom"] or "—"
-            prenom_part = (char["prenom"] or "").strip()
-            character_name = f"{prenom_part} {val}".strip()
 
             async def apply():
-                db.update_validated_fields(cid, nom=val, character_name=character_name)
+                # Source unique : on écrit le nom, puis refresh_character_identity recompose
+                # character_name (lu par /profil) — plus de calcul dupliqué ici.
+                db.update_validated_fields(cid, nom=val)
+                db.refresh_character_identity(cid)
             return "Nom", old, val, apply
 
         # --- 3. Âge ---

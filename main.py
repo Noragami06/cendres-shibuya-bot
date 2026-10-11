@@ -7,6 +7,7 @@ from cogs.clans import build_clans_report
 from cogs.depart import (
     retroactive_departure_check, backfill_role_points, backfill_fiche_message_ids,
     fix_detached_fiche_images, backfill_nom_frozen_to_clan, sync_fiches_from_roles,
+    sync_identity_from_fiche,
 )
 from cogs.utils.database import get_bot_state, set_bot_state
 from cogs.profil import (
@@ -57,6 +58,7 @@ async def setup_hook():
     await bot.load_extension("cogs.giveaway")
     await bot.load_extension("cogs.xp")
     await bot.load_extension("cogs.recompense")
+    await bot.load_extension("cogs.suggestion")
 
 
 @bot.event
@@ -116,6 +118,10 @@ async def on_ready():
             import traceback
             traceback.print_exc()
             print(f"[fiche-sync] Erreur non bloquante : {e!r}")
+        # Part 1c : réalignement de l'identité (character_name lu par /profil) sur la fiche, APRÈS la
+        # sync fiches<-rôles. Tâche de fond : ne bloque jamais le démarrage, par lots avec pause.
+        import asyncio
+        asyncio.create_task(sync_identity_from_fiche(bot))
     if not status_loop.is_running():
         status_loop.start()
 
