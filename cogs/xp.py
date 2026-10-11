@@ -138,6 +138,44 @@ class Xp(commands.Cog):
         self.bot = bot
         # Tâches de flux en cours : référence forte pour éviter le ramassage par le GC.
         self._flows = set()
+        self._levelup_task = None  # C11 : boucle d'envoi des MP de montée de niveau
+
+    async def cog_load(self):
+        if self._levelup_task is None or self._levelup_task.done():
+            self._levelup_task = asyncio.create_task(self._levelup_dm_loop())
+
+    async def cog_unload(self):
+        if self._levelup_task is not None:
+            self._levelup_task.cancel()
+            self._levelup_task = None
+
+    async def _levelup_dm_loop(self):
+        """C11 : vide la file levelup_dm_queue et envoie à chaque joueur son MP « du niveau X au niveau Y ».
+        Persistant (un MP survit à un redémarrage) ; un MP fermé n'échoue jamais l'attribution d'XP."""
+        from cogs.banque import PHOENIX_COLOR
+        await self.bot.wait_until_ready()
+        while not self.bot.is_closed():
+            try:
+                for row in db.levelup_dm_all():
+                    try:
+                        user = self.bot.get_user(row["user_id"]) or await self.bot.fetch_user(row["user_id"])
+                        if user is not None:
+                            embed = discord.Embed(
+                                title="🎉 Montée de niveau !",
+                                description=(f"Tu es passé du **niveau {row['old_level']}** au "
+                                             f"**niveau {row['new_level']}** et tu as gagné "
+                                             f"**{row['points']}** points à répartir."),
+                                color=PHOENIX_COLOR)
+                            dm = await user.create_dm()
+                            await dm.send(embed=embed)
+                    except discord.HTTPException:
+                        # MP fermés / utilisateur inaccessible : on log et on retire la ligne (sans bloquer).
+                        print(f"[levelup] MP impossible pour user {row['user_id']} (ignoré).")
+                    db.levelup_dm_delete(row["id"])  # traité (ou abandonné) : jamais renvoyé en boucle
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            await asyncio.sleep(8)
 
     @app_commands.command(name="xp", description="Ajoute ou retire de l'XP à un personnage (staff)")
     async def xp(self, interaction: discord.Interaction):
@@ -248,7 +286,9 @@ class Xp(commands.Cog):
             return
 
         delta = valeur if action == "add" else -valeur
-        res = db.apply_xp_cascade(char["id"], delta)  # JAMAIS de ×2 VIP/Booster
+        # notify=True : un gain d'XP par /xp est une vraie montée -> MP de niveau (C11). Un retrait
+        # (delta négatif) ne déclenche aucun MP (géré dans apply_xp_cascade : seulement si gained>0).
+        res = db.apply_xp_cascade(char["id"], delta, notify=True)  # JAMAIS de ×2 VIP/Booster
         if not res.get("found"):
             await dm.send("❌ Ce personnage n'a pas de profil (niveau/XP) exploitable.")
             return

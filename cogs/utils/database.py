@@ -777,6 +777,18 @@ CREATE TABLE IF NOT EXISTS fiche_sync_log (
     date TEXT
 );
 
+-- File d'attente des MP de montée de niveau (C11) : écrite par apply_xp_cascade (gains RÉELS d'XP),
+-- vidée par une tâche de fond qui envoie le MP. Persistante (un MP n'est jamais perdu à un redémarrage).
+CREATE TABLE IF NOT EXISTS levelup_dm_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    character_id INTEGER,
+    old_level INTEGER,
+    new_level INTEGER,
+    points INTEGER,
+    created_at TEXT
+);
+
 -- Distribution de récompenses de giveaway PERSISTANTE (survit aux redémarrages, chrono gelé hors-ligne).
 CREATE TABLE IF NOT EXISTS giveaway_claim_state (
     giveaway_id INTEGER PRIMARY KEY,
@@ -2902,10 +2914,11 @@ CHARACTER_POINTS_PER_LEVEL = 250   # points de stats à répartir, gagnés/retir
 CHARACTER_PV_PER_LEVEL = 500       # PV max gagnés/retirés par niveau (et PV actuel au gain)
 
 
-def _adjust_points_with_debt(conn, character_id: int, delta: int):
+def _adjust_points_with_debt(conn, character_id: int, delta: int) -> int:
     """Ajuste points_restants de `delta` (signé) EN RÉUTILISANT la mécanique de dette existante (retrait
     de rôle) : un gain éponge d'abord une dette, un retrait qui dépasse les points libres crée une dette
-    (points_debt) reprise sur les prochains gains. Même connexion => atomique avec la cascade."""
+    (points_debt) reprise sur les prochains gains. Même connexion => atomique avec la cascade.
+    Retourne le nombre de points RÉELLEMENT crédités sur points_restants (gain net après dette ; 0 si retrait)."""
     conn.execute("INSERT OR IGNORE INTO character_stats (character_id) VALUES (?)", (character_id,))
     if delta > 0:
         row = conn.execute(
@@ -2915,6 +2928,7 @@ def _adjust_points_with_debt(conn, character_id: int, delta: int):
         conn.execute(
             "UPDATE character_stats SET points_restants = points_restants + ?, points_debt = ? "
             "WHERE character_id = ?", (delta - offset, debt - offset, character_id))
+        return delta - offset                      # points réellement ajoutés à répartir
     elif delta < 0:
         reclaim = -delta
         row = conn.execute(
@@ -2928,9 +2942,33 @@ def _adjust_points_with_debt(conn, character_id: int, delta: int):
             conn.execute(
                 "UPDATE character_stats SET points_restants = 0, points_debt = points_debt + ? "
                 "WHERE character_id = ?", (reclaim - current, character_id))
+    return 0
 
 
-def apply_xp_cascade(character_id: int, delta: int, max_level: int = None) -> dict:
+def _levelup_dm_enqueue(conn, character_id, old_level, new_level, points):
+    """File un MP de montée de niveau (C11), dans la MÊME connexion que la cascade. user_id résolu depuis
+    le personnage ; silencieux si le personnage n'existe pas (pas de MP possible)."""
+    row = conn.execute(
+        "SELECT user_id FROM validated_characters WHERE id = ?", (character_id,)).fetchone()
+    if row is None:
+        return
+    conn.execute(
+        "INSERT INTO levelup_dm_queue (user_id, character_id, old_level, new_level, points, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (row["user_id"], character_id, old_level, new_level, points, datetime.utcnow().isoformat()))
+
+
+def levelup_dm_all():
+    with get_connection() as conn:
+        return conn.execute("SELECT * FROM levelup_dm_queue ORDER BY id").fetchall()
+
+
+def levelup_dm_delete(row_id):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM levelup_dm_queue WHERE id = ?", (row_id,))
+
+
+def apply_xp_cascade(character_id: int, delta: int, max_level: int = None, notify: bool = False) -> dict:
     """Applique un gain OU un retrait d'XP (delta signé) au NIVEAU GÉNÉRAL, en cascade montante ET
     descendante. Par niveau gagné : +CHARACTER_POINTS_PER_LEVEL points à répartir et +CHARACTER_PV_PER_LEVEL
     PV (max ET actuel). Par niveau perdu : l'inverse (points via la mécanique de dette ; pv_actuel ramené
@@ -2963,8 +3001,13 @@ def apply_xp_cascade(character_id: int, delta: int, max_level: int = None) -> di
         net = gained - lost
         points_delta = CHARACTER_POINTS_PER_LEVEL * net
         pv_delta = CHARACTER_PV_PER_LEVEL * net
+        points_credited = 0
         if points_delta != 0:
-            _adjust_points_with_debt(conn, character_id, points_delta)
+            points_credited = _adjust_points_with_debt(conn, character_id, points_delta)
+        # C11 : MP de montée de niveau UNIQUEMENT pour une vraie montée par gain d'XP (notify=True) ;
+        # jamais pour les descentes, ni les éditions staff/backfills (notify=False). Un seul MP par cascade.
+        if notify and gained > 0:
+            _levelup_dm_enqueue(conn, character_id, level_before, level, points_credited)
         new_pv_max = max(1, row["pv_max"] + pv_delta)
         if pv_delta >= 0:
             new_pv_actuel = row["pv_actuel"] + pv_delta            # le nouveau palier s'ajoute à la vie
@@ -2982,11 +3025,12 @@ def apply_xp_cascade(character_id: int, delta: int, max_level: int = None) -> di
             "points_delta": points_delta, "pv_delta": pv_delta}
 
 
-async def grant_character_xp(character_id: int, xp_gained: int) -> int:
+async def grant_character_xp(character_id: int, xp_gained: int, notify: bool = True) -> int:
     """Accorde de l'XP au NIVEAU GLOBAL du personnage (signature conservée : tous les appelants de
-    gameplay restent inchangés). Délègue à apply_xp_cascade (gère la cascade, les récompenses, et la
-    descente si delta négatif). Retourne le nombre de niveaux gagnés."""
-    res = apply_xp_cascade(character_id, xp_gained)
+    gameplay restent inchangés). Délègue à apply_xp_cascade. notify=True par défaut : les gains de
+    gameplay (daily/raid/train/giveaway/coffres) envoient le MP de montée de niveau (C11). Retourne le
+    nombre de niveaux gagnés."""
+    res = apply_xp_cascade(character_id, xp_gained, notify=notify)
     return res.get("levels_gained", 0) if res.get("found") else 0
 
 

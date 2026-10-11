@@ -142,7 +142,7 @@ class Recompense(commands.Cog):
         kind, item_id, amount = plan
         # Seule exception (pour l'instant) à la règle VIP/Booster ×2 : le don de départ reste exact pour tous.
         if kind == "xp":
-            db.apply_xp_cascade(character_id, amount)            # cascade, jamais de ×2
+            db.apply_xp_cascade(character_id, amount, notify=True)  # cascade (MP de niveau), jamais de ×2
         elif kind == "item":
             from cogs.shop import inv_give                        # reçu gratuitement (gifted_quantity)
             inv_give(character_id, item_id, amount)

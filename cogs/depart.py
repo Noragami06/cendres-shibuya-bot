@@ -3461,6 +3461,8 @@ def delete_character_cascade(character_id):
         conn.execute("DELETE FROM character_stat_locks WHERE character_id = ?", (character_id,))
         # Journal de synchronisation fiches<-rôles propre au personnage.
         conn.execute("DELETE FROM fiche_sync_log WHERE character_id = ?", (character_id,))
+        # MP de montée de niveau en attente pour ce personnage (C11).
+        conn.execute("DELETE FROM levelup_dm_queue WHERE character_id = ?", (character_id,))
         # Réservations d'apparence (/réserv-appa) : découplées de character_id, on nettoie par le triplet
         # (user_id, guild_id, slot_number) résolu ci-dessus. Ainsi le joueur devra refaire valider une
         # apparence s'il recrée un personnage sur ce slot.

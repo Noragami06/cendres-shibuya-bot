@@ -42,14 +42,13 @@ DAILY_COUP_PLAFOND_PCT = 10
 DAILY_RENF_USURE_PCT = 10
 
 
-def apply_renf_wear(st):
-    """Use les bonus de Renforcement du joueur (Force ET Défense), déclenché à CHAQUE clic sur Attaquer.
-    Chaque bonus a son propre nombre d'usure FIXE (figé au 1er coup = ceil(DAILY_RENF_USURE_PCT % du
-    bonus)). Le dernier retrait est borné (jamais de bonus négatif) ; à 0, le nombre fixe repasse à None.
-    Quand les DEUX bonus sont revenus à 0, les totaux d'EO investis sont remis à 0 (le prochain
-    Renforcement repart de zéro pour le rendement dégressif)."""
-    for bonus_key, usure_key in (("renf_bonus_force_j", "renf_usure_force_j"),
-                                 ("renf_bonus_def_j", "renf_usure_def_j")):
+def apply_renf_wear(st, side="j"):
+    """Use les bonus de Renforcement d'UN camp (`side` = 'j' joueur / 'p' PNJ), déclenché à CHAQUE clic
+    sur Attaquer de CE camp. Force ET Défense ont chacun leur nombre d'usure FIXE (figé au 1er coup =
+    ceil(DAILY_RENF_USURE_PCT % du bonus)). Dernier retrait borné (jamais négatif) ; à 0, usure -> None.
+    Quand les DEUX bonus du camp sont à 0, ses totaux d'EO investis repartent de 0 (dégressif remis à zéro)."""
+    for bonus_key, usure_key in ((f"renf_bonus_force_{side}", f"renf_usure_force_{side}"),
+                                 (f"renf_bonus_def_{side}", f"renf_usure_def_{side}")):
         bonus = st.get(bonus_key, 0) or 0
         if bonus <= 0:
             continue
@@ -61,9 +60,24 @@ def apply_renf_wear(st):
         st[bonus_key] = nouveau
         if nouveau <= 0:
             st[usure_key] = None
-    if (st.get("renf_bonus_force_j", 0) or 0) <= 0 and (st.get("renf_bonus_def_j", 0) or 0) <= 0:
-        st["renf_total_eo_force_j"] = 0
-        st["renf_total_eo_def_j"] = 0
+    if (st.get(f"renf_bonus_force_{side}", 0) or 0) <= 0 and (st.get(f"renf_bonus_def_{side}", 0) or 0) <= 0:
+        st[f"renf_total_eo_force_{side}"] = 0
+        st[f"renf_total_eo_def_{side}"] = 0
+
+
+def renf_attacks_left(st, side="j") -> int:
+    """Nombre d'attaques restantes avant que les bonus de Renforcement du camp tombent à 0 (max des deux
+    domaines). Sert au verrou (§5) : « encore N attaques »."""
+    n = 0
+    for bonus_key, usure_key in ((f"renf_bonus_force_{side}", f"renf_usure_force_{side}"),
+                                 (f"renf_bonus_def_{side}", f"renf_usure_def_{side}")):
+        bonus = st.get(bonus_key, 0) or 0
+        if bonus <= 0:
+            continue
+        usure = st.get(usure_key) or math.ceil(bonus * DAILY_RENF_USURE_PCT / 100)
+        if usure > 0:
+            n = max(n, math.ceil(bonus / usure))
+    return n
 
 
 def renforcement_bonus(total_eo_investi) -> float:
@@ -166,12 +180,12 @@ def _apply_hit(st, attack, defender, defender_action, crit_bypass=False):
                 dmg = 0
                 block_ok = True
         # Bonus de Renforcement de Défense PERSISTANT (s'use par Attaque, comme la Force) : soak à chaque
-        # défense tant qu'il est actif, uniquement côté joueur.
-        if dmg > 0 and defender == "j":
-            soak = int(round(st.get("renf_bonus_def_j", 0) or 0))
+        # défense tant qu'il est actif. Côté joueur (renf_bonus_def_j) ET côté PNJ supérieur (renf_bonus_def_p).
+        if dmg > 0:
+            soak = int(round(st.get(f"renf_bonus_def_{defender}", 0) or 0))
             if soak > 0:
                 dmg = max(0, dmg - soak)
-                def_used = def_used or True
+                def_used = True
         # §5 : renforcement défensif PONCTUEL — appliqué UNIQUEMENT s'il reste des dégâts (blocage insuffisant).
         if dmg > 0 and defender_action.get("def_reinforce", 0) > 0:
             amount = defender_action["def_reinforce"]
@@ -215,6 +229,20 @@ def resolve_exchange(st, aj, ap, gains=None):
             aj["damage"] = aj["damage"] * DAILY_CRIT_MULTIPLIER
             crit_text = "\n💥 **BLACK FLASH !** Le coup critique inflige **×10 dégâts**, imblocable !"
 
+    # §A7 : Black Flash du PNJ, UNIQUEMENT si strictement supérieur au joueur (st["pnj_superior"]), sur
+    # une attaque physique. Même progression (crit_next). Imblocable : ignore garde/Défense/blocage de sort.
+    pnj_crit = False
+    if st.get("pnj_superior") and ap.get("kind") == "attaquer":
+        ap = dict(ap)
+        chance_p = st.get("crit_chance_p", DAILY_CRIT_RESET_VALUE)
+        echecs_p = st.get("crit_echecs_p", 0)
+        hit_p = random.randint(1, 100) <= chance_p
+        st["crit_chance_p"], st["crit_echecs_p"] = crit_next(chance_p, hit_p, echecs_p)
+        if hit_p:
+            pnj_crit = True
+            ap["damage"] = ap["damage"] * DAILY_CRIT_MULTIPLIER
+            crit_text += f"\n💥 **BLACK FLASH de {npnj} !** ×10 dégâts, imblocable !"
+
     f_j = aj.get("force_actuelle", 0)
     f_p = ap.get("force_actuelle", 0)
 
@@ -223,12 +251,16 @@ def resolve_exchange(st, aj, ap, gains=None):
         entete = ("⚔️ **Choc frontal !**\n"
                   f"**{nj}** : **{f_j:,}** de Force\n"
                   f"**{npnj}** : **{f_p:,}** de Force\n\n").replace(",", " ")
-        if crit_reussi:  # le critique remporte AUTOMATIQUEMENT le clash
+        if crit_reussi:  # le critique du JOUEUR remporte AUTOMATIQUEMENT le clash
             st["pv_p"] -= aj["damage"]
             if gains is not None:
                 gains["force"] = gains.get("force", 0) + 1
             return (entete + f"🏆 **{nj}** pulvérise la garde et inflige **{aj['damage']:,}** dégâts à {npnj} !".replace(",", " ") + crit_text,
                     "green", True)
+        if pnj_crit:  # le Black Flash du PNJ supérieur remporte AUTOMATIQUEMENT le clash (imblocable)
+            st["pv_j"] -= ap["damage"]
+            return (entete + f"🏆 **{npnj}** foudroie {nj} et inflige **{ap['damage']:,}** dégâts !".replace(",", " ") + crit_text,
+                    "red", False)
         if f_j == f_p:
             return (entete + f"⚔️ **Clash égal !** Le choc s'annule, aucun dégât." + crit_text, "blue", False)
         if f_j > f_p:
@@ -264,7 +296,8 @@ def resolve_exchange(st, aj, ap, gains=None):
             parts.append(f"🛡️ **{npnj}** encaisse : l'attaque de {nj} est neutralisée.")
     if ap.get("attacking"):  # le PNJ attaque le joueur ; le joueur défend-il ?
         player_def = aj if aj.get("kind") == "defendre" else None
-        dealt, block_ok, def_used = _apply_hit(st, ap, "j", player_def)
+        # Black Flash du PNJ (pnj_crit) : crit_bypass=True -> imblocable (ignore garde/Défense/blocage sort).
+        dealt, block_ok, def_used = _apply_hit(st, ap, "j", player_def, crit_bypass=pnj_crit)
         if dealt <= 0 and player_def is not None:
             if gains is not None:
                 gains["endurance"] = gains.get("endurance", 0) + 1
