@@ -239,6 +239,19 @@ def try_transition(trade_id: int, from_status: str, to_status: str) -> bool:
         return cur.rowcount > 0
 
 
+def cancel_all_active_trades() -> int:
+    """Annule tout échange resté en cours (ni 'completed' ni 'cancelled').
+    Appelée au démarrage du bot : un échange repose sur des attentes en mémoire (wait_for, boutons)
+    qui NE survivent PAS à un redémarrage. Aucun objet ni argent n'est déplacé avant _execute_trade,
+    donc annuler ne demande aucun remboursement. Retourne le nombre d'échanges annulés."""
+    with db.get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE pending_trades SET status = 'cancelled' "
+            "WHERE status NOT IN ('completed', 'cancelled')"
+        )
+        return cur.rowcount
+
+
 # =====================================================================
 # VUES EN SESSION (callbacks internes)
 # =====================================================================
@@ -466,7 +479,13 @@ class Inventaire(commands.Cog):
         # Les boutons de l'inventaire ont un custom_id contenant character_id/user_id (inconnus à
         # l'avance) : bot.add_view() ne peut pas les enregistrer génériquement. La persistance est
         # assurée par le listener on_interaction ci-dessous (comme dans banque.py / depart.py).
-        pass
+
+        # Redémarrage = tous les échanges en cours sont perdus (leurs attentes vivaient en mémoire).
+        # On les annule en base, sinon get_active_trade_for_user() répondrait « déjà en plein
+        # échange » aux joueurs concernés indéfiniment.
+        n = cancel_all_active_trades()
+        if n:
+            print(f"[inventaire] {n} échange(s) en cours annulé(s) au démarrage.")
 
     # ---------- verrou de flux par utilisateur ----------
     def _acquire(self, *user_ids) -> bool:
@@ -1188,12 +1207,19 @@ class Inventaire(commands.Cog):
             return
 
         acquired = {proposer.id}
+        created = []  # id des échanges créés par CE flux
         try:
-            await self._run_trade(interaction, proposer, character_id, acquired)
+            await self._run_trade(interaction, proposer, character_id, acquired, created)
         finally:
             self._release(*acquired)
+            # Filet de sécurité : si le flux s'est arrêté (bug, exception, return oublié) sans
+            # que l'échange soit terminé ou annulé, on l'annule pour ne pas bloquer les joueurs.
+            for tid in created:
+                t = get_trade(tid)
+                if t and t["status"] not in ("completed", "cancelled"):
+                    update_trade(tid, status="cancelled")
 
-    async def _run_trade(self, interaction, proposer, character_id, acquired):
+    async def _run_trade(self, interaction, proposer, character_id, acquired, created):
         await interaction.response.send_message("🔁 Démarrage d'un échange…", ephemeral=True)
         channel = interaction.channel
 
@@ -1218,6 +1244,7 @@ class Inventaire(commands.Cog):
             acquired.add(target_user.id)
 
         trade_id = create_trade(proposer.id, character_id, target_user.id, channel.id)
+        created.append(trade_id)
 
         # Personnage de la cible (c'est la cible qui choisit son propre personnage).
         target_character_id = await self.select_character_await(
