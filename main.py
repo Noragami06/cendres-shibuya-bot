@@ -59,6 +59,7 @@ async def setup_hook():
     await bot.load_extension("cogs.xp")
     await bot.load_extension("cogs.recompense")
     await bot.load_extension("cogs.suggestion")
+    await bot.load_extension("cogs.site_login")
 
 
 @bot.event
